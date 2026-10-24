@@ -76,7 +76,12 @@ var enabledAt = 0;
 var itemKey = null;     // the item the current answer belongs to
 var body = null;        // its answer (null: none / not yet)
 var drawn = null;       // { slider, duration } last drawn, to redraw only on change
-var preview = null;     // { key, promise } the item's preview source, loaded on first hover
+var preview = null;     // the current item's entry in `items` (preview source, manifest, sheets)
+// Per-item state kept across item changes, page leaves and seeks for the page's lifetime, so a video
+// opened again (or a player blip mid-seek) reuses its markers, manifest and loaded sheet images.
+var items = new Map();  // key -> { key, promise, moment, sheets, warmed, body, bodyAt }
+var ITEMS_KEPT = 12;
+var BODY_TTL_MS = 10 * 60 * 1000;   // same as the server's marker cache
 var pop = null;         // { el, button, marker, hideTimer, pendingTimer, tries } the open popup
 var touchArmed = null;  // the marker button a first tap opened the popup for
 
@@ -124,6 +129,9 @@ function markersEnabled() {
 
 function fetchMarkers(key, retried) {
     get('JellyfinPlus/Markers/' + encodeURIComponent(key)).then(function (b) {
+        var e = entry(key);
+        e.body = b;
+        e.bodyAt = Date.now();
         if (itemKey !== key) { return; }
         body = b;
         drawn = null;
@@ -162,13 +170,31 @@ function hostOf(slider) {
  * Resolves to { kind:'stock', info, mediaSourceId } | { kind:'moment', manifest } | null.
  * Stock wins whenever the item has trickplay; the server answers moments "none" in that case too.
  */
+/* The item's cached entry, most recently used last; the oldest beyond ITEMS_KEPT is dropped. */
+function entry(key) {
+    var e = items.get(key);
+    if (e) {
+        items.delete(key);
+    } else {
+        e = { key: key, promise: null, moment: null, sheets: {}, warmed: false, body: null, bodyAt: 0 };
+    }
+    items.set(key, e);
+    while (items.size > ITEMS_KEPT) { items.delete(items.keys().next().value); }
+    return e;
+}
+
 function previewSource(key) {
-    if (preview && preview.key === key) { return preview.promise; }
-    var promise = stockSource(key).then(function (s) {
-        return s || null;
-    }, function () { return null; });
-    preview = { key: key, promise: promise, moment: null };
-    return promise;
+    preview = entry(key);
+    if (!preview.promise) {
+        var e = preview;
+        e.promise = stockSource(key).then(function (s) {
+            return s || null;
+        }, function () {
+            e.promise = null; // a failed lookup is asked again next time
+            return null;
+        });
+    }
+    return preview.promise;
 }
 
 function stockSource(key) {
@@ -195,11 +221,12 @@ function stockSource(key) {
 /* The moment manifest; 'pending' is asked again by the open popup, never cached. */
 function momentManifest(key) {
     if (!momentsOn) { return Promise.resolve(null); }
-    if (preview && preview.key === key && preview.moment) { return Promise.resolve(preview.moment); }
+    var e = entry(key);
+    if (e.moment) { return Promise.resolve(e.moment); }
     return get('JellyfinPlus/Markers/' + encodeURIComponent(key) + '/Moments').then(function (m) {
         if (!m || typeof m !== 'object') { return null; }
         if (m.status === 'ready' || m.status === 'none') {
-            if (preview && preview.key === key) { preview.moment = m; }
+            e.moment = m;
         }
         return m;
     }, function () { return null; });
@@ -336,9 +363,7 @@ function renderStrip(p, strip, key, src, times) {
 
 /* Sheet image loads for the current item, shared by the prewarm and every popup. */
 function sheetCache(key) {
-    if (!preview || preview.key !== key) { return {}; }
-    preview.sheets = preview.sheets || {};
-    return preview.sheets;
+    return entry(key).sheets;
 }
 
 /*
@@ -347,9 +372,9 @@ function sheetCache(key) {
  * strips will use, so the first hover shows frames at once. Stops when the item changes.
  */
 function prewarm(key, markers, duration) {
-    if (!preview || preview.key !== key) { previewSource(key); }
-    if (preview.warmed) { return; }
-    preview.warmed = true;
+    var e = entry(key);
+    if (e.warmed) { return; }
+    e.warmed = true;
     var tries = 0;
     var resolve = function () {
         return previewSource(key).then(function (src) {
@@ -389,7 +414,7 @@ function prewarm(key, markers, duration) {
 function loadImage(url) {
     return new Promise(function (resolve, reject) {
         var img = new Image();
-        img.onload = resolve;
+        img.onload = function () { resolve(img); }; // held by the item's sheet cache: stays decoded
         img.onerror = reject;
         img.src = url;
     });
@@ -477,12 +502,18 @@ function tick() {
         var pl = pm && typeof pm.currentItem === 'function' ? activePlayer(pm) : null;
         var item = pl ? pm.currentItem(pl) : null;
         var key = item && item.Id ? String(item.Id) : null;
+        if (!key) { return; } // a blip with no current item (seeking, restream): keep everything as is
         if (key !== itemKey) {
             itemKey = key;
-            body = null;
-            preview = null;
             clear();
-            if (key) { fetchMarkers(key, false); }
+            var e = entry(key);
+            preview = e;
+            if (e.body && Date.now() - e.bodyAt < BODY_TTL_MS) {
+                body = e.body; // seen this video before: draw from cache, no request
+            } else {
+                body = null;
+                fetchMarkers(key, false);
+            }
             return;
         }
         if (!body) { return; }
