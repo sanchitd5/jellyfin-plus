@@ -55,6 +55,7 @@
                     <button type="button" class="jpTab" role="tab" id="jpTab-levels" data-tab="levels" aria-controls="jpSec-levels" aria-selected="false">Levels</button>
                     <button type="button" class="jpTab" role="tab" id="jpTab-policy" data-tab="policy" aria-controls="jpSec-policy jpSec-capacity" aria-selected="false">Policy</button>
                     <button type="button" class="jpTab" role="tab" id="jpTab-files" data-tab="files" aria-controls="jpSec-files" aria-selected="false">Files</button>
+                    <button type="button" class="jpTab" role="tab" id="jpTab-integrations" data-tab="integrations" aria-controls="jpSec-markers" aria-selected="false">Integrations</button>
                     <button type="button" class="jpTab" role="tab" id="jpTab-library" data-tab="library" aria-controls="jpMaintenance jpTags" aria-selected="false">Library</button>
                 </div>
 
@@ -513,6 +514,20 @@
                     </div>
                 </section>
 
+                <section class="jpSec" id="jpSec-markers" role="tabpanel" aria-labelledby="jpTab-integrations" data-tab="integrations">
+                    <div class="jpHead"><h2 class="sectionTitle">Timeline markers</h2><span class="jpHint">External services that put markers on the seek bar</span></div>
+                    <div class="jpBody">
+                    <div class="inputContainer">
+                        <label class="textareaLabel" for="MarkerProviders">Marker providers (JSON)</label>
+                        <textarea is="emby-textarea" id="MarkerProviders" data-config="MarkerProviders" data-kind="json" data-default="[]" rows="10" spellcheck="false" style="font-family: monospace; width: 100%;"></textarea>
+                        <div class="fieldDescription" id="MarkerProvidersError" style="color: #ff6b6b;" hidden></div>
+                        <div class="fieldDescription">
+                        A JSON array of providers. For each played item whose path matches a provider, the server asks that provider's URL for markers and the player draws them on the seek bar; a click seeks just before one. The server makes every call, so players never need to reach these addresses. Empty (<code>[]</code>) turns markers off. The environment variable <code>JELLYFIN_PLUS_MARKER_PROVIDERS</code>, when set, replaces this list. Contract and mapping keys: <code>docs/architecture/TIMELINE_MARKERS.md</code>. Invalid JSON is not saved: the previous list stays.
+                    </div>
+                    </div>
+                    </div>
+                </section>
+
                 <div class="jpSave">
                     <button is="emby-button" type="submit" class="raised button-submit block emby-button">
                         <span>Save</span>
@@ -782,7 +797,7 @@
 
             // Every control carrying data-config is loaded and saved here, so a setting is markup-only:
             // data-config is the PluginConfiguration property, data-kind one of bool/int/float/text/
-            // path/select, data-default the value shown when the stored one is missing (it equals the
+            // path/select/json, data-default the value shown when the stored one is missing (it equals the
             // default in PluginConfiguration.cs). path differs from text only in that a blank stored
             // value also shows the default; a blank Encoder is meaningful (auto), a blank path is not.
             function configFields(page) {
@@ -803,6 +818,11 @@
                         if (name !== 'Upscaler') { el.value = v || def; }
                     } else if (kind === 'path') {
                         el.value = v || def;
+                    } else if (kind === 'json') {
+                        // Stored as JSON text; shown indented so it is editable.
+                        try { el.value = JSON.stringify(JSON.parse(v || def), null, 2); } catch (e) { el.value = v || def; }
+                        var errBox = page.querySelector('#' + el.id + 'Error');
+                        if (errBox) { errBox.hidden = true; }
                     } else {
                         el.value = v == null ? def : v;
                     }
@@ -823,6 +843,22 @@
                     } else if (kind === 'int' || kind === 'float') {
                         var n = kind === 'int' ? parseInt(el.value, 10) : parseFloat(el.value);
                         if (!isNaN(n)) { config[name] = n; }
+                    } else if (kind === 'json') {
+                        // Must parse as a JSON array; otherwise the stored value is kept and the error
+                        // shown under the field (the rest of the form still saves).
+                        var box = page.querySelector('#' + el.id + 'Error');
+                        var text = el.value.trim() || '[]';
+                        try {
+                            var parsed = JSON.parse(text);
+                            if (!Array.isArray(parsed)) { throw new Error('must be a JSON array [ ... ]'); }
+                            config[name] = JSON.stringify(parsed);
+                            if (box) { box.hidden = true; }
+                        } catch (err) {
+                            if (box) {
+                                box.textContent = 'Not saved, the previous value is kept: ' + err.message;
+                                box.hidden = false;
+                            }
+                        }
                     } else {
                         config[name] = el.value;
                     }

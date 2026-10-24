@@ -24,6 +24,7 @@ import { installPlayerBadge } from './controller/player-badge.js';
 import { installClientUpscale } from './controller/client-upscale.js';
 import { installClipUpNext } from './controller/clip-upnext.js';
 import { installPortraitOsd } from './view/portrait-osd.js';
+import { installTimelineMarkers } from './controller/timeline-markers.js';
 import { installDetailRelated } from './controller/detail-related.js';
 import { installPersonVideos } from './controller/person-videos.js';
 import { installBulkTags } from './controller/bulk-tags.js';
@@ -121,6 +122,9 @@ function feature(name, install) {
         feature('client upscale', installClientUpscale);
         feature('clip up next', installClipUpNext);
         feature('player touch osd', installPortraitOsd);
+        // Timeline markers from server-configured providers (GET /JellyfinPlus/Markers/{itemId});
+        // no requests while the server has none, nothing drawn on any failure.
+        feature('timeline markers', installTimelineMarkers);
         feature('detail related', installDetailRelated);
         feature('person videos', installPersonVideos);
         feature('bulk tags', installBulkTags);

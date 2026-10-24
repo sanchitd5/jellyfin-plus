@@ -26,6 +26,7 @@ applies it, and what was measured and rejected.
 | [RUNTIME_FILTER_CONTROL_DESIGN.md](architecture/RUNTIME_FILTER_CONTROL_DESIGN.md) | Runtime filter control (zmq/sendcmd), the alternative to the A/B swap |
 | [WEB_PANEL_DESIGN.md](architecture/WEB_PANEL_DESIGN.md) | The Enhance panel: data-driven levels, server versus client wording, `dlpp_rtcuda` / `vsr_rtcuda` |
 | [INTEGRATION_DESIGN.md](architecture/INTEGRATION_DESIGN.md) | Integrating `dlpp_rtcuda` and `vsr_rtcuda` into the plugin |
+| [TIMELINE_MARKERS.md](architecture/TIMELINE_MARKERS.md) | Timeline markers: the provider contract, mapping keys and env override for external apps |
 
 ## filters/ — one document per custom ffmpeg filter
 

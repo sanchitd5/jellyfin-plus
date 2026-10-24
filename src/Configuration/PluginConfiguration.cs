@@ -210,5 +210,12 @@ namespace Jellyfin.Plugin.Plus.Configuration
         /// not a network - see RTXVSR.md). Not shipped with this plugin.
         /// </summary>
         public string RtxVsrDllPath { get; set; } = "/usr/lib/jellyfin-ffmpeg-oidn/rtxvsr/dll/nvaivpx.dll";
+
+        /// <summary>
+        /// Timeline marker providers, as a JSON array (see MarkerProviders.cs and
+        /// docs/architecture/TIMELINE_MARKERS.md). The environment variable JELLYFIN_PLUS_MARKER_PROVIDERS,
+        /// when set, replaces it. Empty: no markers, and the client makes no marker requests.
+        /// </summary>
+        public string MarkerProviders { get; set; } = "[]";
     }
 }
