@@ -89,7 +89,7 @@ namespace Jellyfin.Plugin.Plus
         private readonly IMediaEncoder _encoder;
         private readonly IApplicationPaths _paths;
         private readonly ILogger<MomentSheets> _logger;
-        private readonly ConcurrentDictionary<string, Task> _inFlight = new ConcurrentDictionary<string, Task>(StringComparer.Ordinal);
+        private readonly ConcurrentDictionary<string, Lazy<Task>> _inFlight = new ConcurrentDictionary<string, Lazy<Task>>(StringComparer.Ordinal);
         private readonly ConcurrentDictionary<string, DateTime> _failed = new ConcurrentDictionary<string, DateTime>(StringComparer.Ordinal);
 
         public MomentSheets(IMediaEncoder encoder, IApplicationPaths paths, ILogger<MomentSheets> logger)
@@ -199,7 +199,8 @@ namespace Jellyfin.Plugin.Plus
                 _failed.TryRemove(key, out _);
             }
 
-            var task = _inFlight.GetOrAdd(key, k => Task.Run(() => GenerateAsync(k, mediaPath, itemDir, dir, times.ToList())));
+            // Lazy: GetOrAdd may run its factory twice under a race; only the stored Lazy ever starts.
+            var task = _inFlight.GetOrAdd(key, k => new Lazy<Task>(() => Task.Run(() => GenerateAsync(k, mediaPath, itemDir, dir, times.ToList())))).Value;
             try
             {
                 await task.WaitAsync(wait, requestToken).ConfigureAwait(false);
