@@ -30,6 +30,7 @@ import { installBulkTags } from './controller/bulk-tags.js';
 import { installDetailNav } from './controller/detail-nav.js';
 import { installDetailDownload } from './controller/detail-download.js';
 import { installDetailActions } from './view/detail-actions.js';
+import { installDetailTimeline } from './controller/detail-timeline.js';
 import { installTagAutocomplete } from './controller/tag-autocomplete.js';
 import { installSearchCensus } from './controller/search-census.js';
 import { installLibraryFilterHooks } from './controller/library-filters.js';
@@ -127,6 +128,8 @@ function feature(name, install) {
         feature('detail prev/next', installDetailNav);
         feature('detail download', installDetailDownload);
         feature('detail actions', installDetailActions);
+        // A row per person: their clips in date order, this one in the middle. Reads only.
+        feature('detail timeline', installDetailTimeline);
         // Bottom bar (P3): phone and portrait tablet only; reads html classes the modules above set.
         feature('bottom nav', installBottomNav);
         feature('tag autocomplete', installTagAutocomplete);

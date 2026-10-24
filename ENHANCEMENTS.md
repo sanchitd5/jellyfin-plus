@@ -75,6 +75,7 @@ setting, a control in the page, or "remove the plugin or script".
 | Play-all fixes | Client | Play all and Shuffle queue up to 1000 items; Home Videos folders queue videos | On, no switch |
 | Bulk tag add/remove, Edit tags | Client | Extra rows in the selection menu and the item menu (administrators) | On for administrators |
 | Previous / next on a details page | Client | Skip-back and skip-forward buttons step through the list the item was opened from | On, no switch (not on TV); only when the item is in the remembered list |
+| Person timeline on a video's page | Client | A row per person in the clip (up to 3): their videos in date order, the current one centred | On, no switch (not on TV); only for Video items with people |
 | Download button for videos | Client | The stock Download button shows on a video's page when the server allows downloading | On, no switch (not on TV) |
 | Tag autocomplete in the metadata editor | Client | The tag prompt suggests existing tags, accepts "a, b, c" as three tags and refuses duplicates | On, no switch (not on TV) |
 | Tag counts and count order on `/Items/Filters` | Server patch | `jpTagOrder=count` orders the tag list most-used first; `jpTagCounts=1` adds the counts in a header | Only when the request sends the parameter; counts only from the filter cache (section 7.5) |
@@ -569,6 +570,19 @@ a paged list gives the current page, the infinite and virtualised search results
 around the click (an evicted chunk is a gap), at most 1000 ids. At either end there is no button, and an
 item outside the list, or a page opened another way, gets none. The "More like this", cast, collections
 and additional-parts rows are never captured; a list of one card clears the stored list. TV untouched.
+
+**Person timeline** (`web/src/controller/detail-timeline.js`, `model/detail-timeline.js`, shared page
+watcher `controller/detail-page.js`). On a `Video` item's page, one "Timeline · <person>" row per
+person credited on the clip (first 3, de-duplicated), inserted before More Like This. Each row asks
+`/Users/{id}/Items?PersonIds=<person>&IncludeItemTypes=Video&Recursive=true` for ids and dates only
+(`EnableImages=false`, `EnableUserData=false`, at most 3000), orders them client-side by `PremiereDate`,
+else `DateCreated`, undated last (ties by sort name, then id), and takes up to 8 on each side of the
+current clip. Only that window is fetched again (`Ids=`) with card fields and drawn with the stock
+cardBuilder in an emby-scroller, the current card outlined and scrolled to the middle; the title shows
+"N of M" and links to the person. Both requests run as the viewing user, so access and parental limits
+are the server's own. A person whose only clip is this one, a clip outside the first 3000, a missing
+cardBuilder or a failed request gives no row. A click on a timeline card is captured by previous / next
+like any list. TV untouched.
 
 **Download button** (`web/src/controller/detail-download.js`). The stock template already carries a
 hidden `.btnDownload` and binds its click, but stock only shows it for Books. It is shown for a video
