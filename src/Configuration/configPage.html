@@ -525,6 +525,15 @@
                         A JSON array of providers. For each played item whose path matches a provider, the server asks that provider's URL for markers and the player draws them on the seek bar; a click seeks just before one. The server makes every call, so players never need to reach these addresses. Empty (<code>[]</code>) turns markers off. The environment variable <code>JELLYFIN_PLUS_MARKER_PROVIDERS</code>, when set, replaces this list. Contract and mapping keys: <code>docs/architecture/TIMELINE_MARKERS.md</code>. Invalid JSON is not saved: the previous list stays.
                     </div>
                     </div>
+                    <div class="checkboxContainer checkboxContainer-withDescription">
+                        <label class="emby-checkbox-label">
+                            <input is="emby-checkbox" type="checkbox" id="MarkerMoments" data-config="MarkerMoments" data-kind="bool" data-default="true" />
+                            <span>Moment previews</span>
+                        </label>
+                        <div class="fieldDescription checkboxFieldDescription">
+                        Hovering a marker shows frames from that moment. Videos with Jellyfin trickplay use it; for the others the server makes a few small frames at each marker (and 5 and 10 seconds either side) the first time someone hovers one, with the ffmpeg Jellyfin is configured with, at low priority. They are kept in Jellyfin's cache folder (at most 512 MB, oldest dropped first), never beside the video. Off: those videos show the marker's label only.
+                    </div>
+                    </div>
                     </div>
                 </section>
 

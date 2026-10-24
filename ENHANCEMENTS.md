@@ -844,6 +844,24 @@ position slider. Full contract for app authors: [docs/architecture/TIMELINE_MARK
   `kind` (`tip`, `chapter`, `highlight`; anything else neutral), sized by value relative to the largest,
   label in `title` only (never HTML); a click seeks to `max(0, offset - 3)`. Removed on item change and
   when the video page goes; nothing on the TV layout. Any failure leaves the stock player.
+- *Preview popup*: hovering or focusing a dot (touch: first tap or tap-and-hold; a second tap seeks)
+  opens a popup above the seek bar with `label · value unit` (textContent only; provider key
+  `valueUnit`, at most 24 characters, comes back as the marker's `unit`) and a strip of five frames:
+  the marker's own, highlighted, plus two either side 5 s apart (clamped to `[0, duration-1]`,
+  near-duplicates under 1 s collapsed). Clicking a frame seeks to its exact time. Frames come from the
+  item's stock trickplay (`Fields=Trickplay`, smallest width >= 200, `Videos/{id}/Trickplay/{w}/{n}.jpg`)
+  when it has any; otherwise from moment sheets (below). Loaded lazily on first hover, cached per item;
+  a sheet that fails to load hides only its own frames, and no source at all leaves label + value.
+- *Moment sheets* (`src/MomentSheets.cs`; setting `MarkerMoments`, default on, Integrations tab): for a
+  video with markers and no stock trickplay, `GET /JellyfinPlus/Markers/{itemId}/Moments` generates on
+  first ask 320x180 JPEG frames at the server's own marker times (never times from the request; marker
+  ±5/±10 s, at most 200 frames, highest-value markers kept first) with the ffmpeg Jellyfin is configured
+  with (`-ss` input seek, one process per frame, at most 2 at a time server-wide, below-normal priority,
+  30 s kill), tiled 10x10 into sheets plus a manifest with each tile's time. One generation per item;
+  it waits up to 8 s, then answers 202 `pending` and the client asks again. Failures are cached 10
+  minutes. Stored only under Jellyfin's cache path (`jellyfin-plus-moments/{itemId}/{hash}/`, hash of
+  item + file size/mtime + times), written to a temp dir and moved whole, least-recently-used sets
+  pruned above 512 MB. Never written beside the media; stock trickplay is never generated or touched.
 
 **Play-all fixes** (`web/src/controller/play-all.js`). Two playback-queue requests are rewritten.
 (1) Stock caps Play all and Shuffle at 300 items; a request with the playback signature
@@ -1356,8 +1374,10 @@ All under the Jellyfin API root. "Administrator" is the `RequiresElevation` poli
 | `POST /JellyfinPlus/FtsIndex/Rebuild?force=true` | Administrator | Rebuilds the search index in the background; 202 with the status JSON, 409 when a run is in flight or the index is off. |
 | `GET /JellyfinPlus/Search/Facets` | Any authenticated user | People, studios or tags credited on the items a search matches: `[{id, name, roles, count}]`, count descending then name. Parameters in section 9. 400 for a bad `kind` or no resolvable user; 403 if a non-administrator asks for another user's view; 404 for an unknown user or a `parentId` the user cannot see; an empty array when `searchTerm` is blank. Sets a `Server-Timing` header. |
 | `GET /JellyfinPlus/Library/Census[?userId=..]` | Any authenticated user | Which item kinds the user has: `{counts: {Movie: n, Person: n, ...}}`, absent kinds omitted. Library-resident kinds are counted under the libraries the user can open; kinds stored outside libraries (people, studios, genres, artists, playlists, collections, live TV) are counted library-wide, so they can overstate for a restricted user, never understate. Cached per user (5 minutes, dropped on item add or remove). 403 for another user's view unless administrator; 404 for an unknown user. |
-| `GET /JellyfinPlus/Markers/Enabled` | Any authenticated user | `{enabled}`: whether any timeline-marker provider is configured. The client makes no marker requests while false. |
-| `GET /JellyfinPlus/Markers/{itemId}` | Any authenticated user | `{markers: [{offsetSeconds, label, value?, kind?, source}]}` merged from every provider matching the item's path (section 5, [TIMELINE_MARKERS.md](docs/architecture/TIMELINE_MARKERS.md)). 404 when the item is missing or not visible to the user. Provider failures give an empty or partial list, never an error. |
+| `GET /JellyfinPlus/Markers/Enabled` | Any authenticated user | `{enabled, moments}`: whether any timeline-marker provider is configured, and whether moment sheets are on (`MarkerMoments`). The client makes no marker requests while `enabled` is false. |
+| `GET /JellyfinPlus/Markers/{itemId}/Moments` | Any authenticated user | Moment-sheet manifest `{status, version?, width, height, tileWidth, tileHeight, times}`: 200 `ready` (or `none`: off, no markers, stock trickplay exists, or a recent failure), 202 `pending` while generating. Times come from the server's own marker list. 404 when the item is missing or not visible. |
+| `GET /JellyfinPlus/Markers/{itemId}/Moments/{n}.jpg` | Any authenticated user | Sheet `n` of the ready set (`Cache-Control: private, max-age=86400`); 404 otherwise. |
+| `GET /JellyfinPlus/Markers/{itemId}` | Any authenticated user | `{markers: [{offsetSeconds, label, value?, unit?, kind?, source}]}` merged from every provider matching the item's path (section 5, [TIMELINE_MARKERS.md](docs/architecture/TIMELINE_MARKERS.md)). 404 when the item is missing or not visible to the user. Provider failures give an empty or partial list, never an error. |
 
 | `GET /JellyfinPlus/Tags[?q=..&order=count\|name&limit=100&offset=0]` | Administrator | Every stored tag spelling with its item count: `{total, offset, items: [{name, count, clean, variants}]}`. `limit` 1 to 500. Used by the config page. |
 | `POST /JellyfinPlus/Tags/Edit` | Administrator | `{op: rename\|merge\|delete, from: [..], to: "..", dryRun: true, expectChanged: n}` -> `{dryRun, committed, op, matchedItems, changedItems, lockedSkipped, notLoaded}`. `dryRun` defaults to true. 400 for a bad request or more than 20,000 items; 409 when another edit is running or `expectChanged` no longer matches (nothing written). Section 6. |

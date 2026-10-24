@@ -217,5 +217,12 @@ namespace Jellyfin.Plugin.Plus.Configuration
         /// when set, replaces it. Empty: no markers, and the client makes no marker requests.
         /// </summary>
         public string MarkerProviders { get; set; } = "[]";
+
+        /// <summary>
+        /// Moment previews: for a video with markers but no stock trickplay, the server makes small
+        /// preview frames at each marker and its neighbours, on first hover, into Jellyfin's cache
+        /// (never beside the media). Off: such videos show the marker label only.
+        /// </summary>
+        public bool MarkerMoments { get; set; } = true;
     }
 }

@@ -10,6 +10,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Library;
+using MediaBrowser.Controller.Trickplay;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
@@ -31,6 +32,10 @@ namespace Jellyfin.Plugin.Plus
         /// <summary>Gets or sets a value indicating whether at least one provider is enabled and valid.</summary>
         [JsonPropertyName("enabled")]
         public bool Enabled { get; set; }
+
+        /// <summary>Gets or sets a value indicating whether the server makes moment previews (setting MarkerMoments).</summary>
+        [JsonPropertyName("moments")]
+        public bool Moments { get; set; }
     }
 
     /// <summary>
@@ -39,8 +44,13 @@ namespace Jellyfin.Plugin.Plus
     /// provider hosts are never exposed to clients and an HTTPS-served Jellyfin never makes a
     /// mixed-content call.
     ///
-    ///   GET /JellyfinPlus/Markers/Enabled      -> { enabled }
-    ///   GET /JellyfinPlus/Markers/{itemId}     -> { markers: [{ offsetSeconds, label, value?, kind?, source }] }
+    ///   GET /JellyfinPlus/Markers/Enabled      -> { enabled, moments }
+    ///   GET /JellyfinPlus/Markers/{itemId}     -> { markers: [{ offsetSeconds, label, value?, unit?, kind?, source }] }
+    ///   GET /JellyfinPlus/Markers/{itemId}/Moments          -> MomentManifest (200 ready/none, 202 pending)
+    ///   GET /JellyfinPlus/Markers/{itemId}/Moments/{n}.jpg  -> sheet n of the ready set (404 otherwise)
+    ///
+    /// Moment previews (MomentSheets.cs) are for items without stock trickplay; their frame times are
+    /// derived here from this same merged marker list, never from the request.
     ///
     /// ACCESS. The item is looked up for the authenticated user, so an item the user cannot see is
     /// 404 exactly like a missing one; its path never leaves the server.
@@ -67,22 +77,137 @@ namespace Jellyfin.Plugin.Plus
         private readonly IUserManager _userManager;
         private readonly IHttpClientFactory _httpClientFactory;
         private readonly ILogger<MarkersController> _logger;
+        private readonly MomentSheets _moments;
+        private readonly ITrickplayManager _trickplay;
 
         /// <summary>Initializes a new instance of the <see cref="MarkersController"/> class.</summary>
-        public MarkersController(ILibraryManager libraryManager, IUserManager userManager, IHttpClientFactory httpClientFactory, ILogger<MarkersController> logger)
+        public MarkersController(ILibraryManager libraryManager, IUserManager userManager, IHttpClientFactory httpClientFactory, ILogger<MarkersController> logger, MomentSheets moments, ITrickplayManager trickplay)
         {
             _libraryManager = libraryManager;
             _userManager = userManager;
             _httpClientFactory = httpClientFactory;
             _logger = logger;
+            _moments = moments;
+            _trickplay = trickplay;
         }
+
+        private static bool MomentsOn => Plugin.Instance?.Configuration?.MarkerMoments ?? true;
 
         /// <summary>Gets whether any provider is configured.</summary>
         [HttpGet("Enabled")]
         [ProducesResponseType(StatusCodes.Status200OK)]
         public ActionResult<TimelineMarkersStatus> GetEnabled()
         {
-            return new TimelineMarkersStatus { Enabled = Providers().Count > 0 };
+            var enabled = Providers().Count > 0;
+            return new TimelineMarkersStatus { Enabled = enabled, Moments = enabled && MomentsOn };
+        }
+
+        /// <summary>
+        /// Gets the moment-preview manifest for an item. Waits briefly for a fresh generation, then
+        /// answers 202 "pending"; the client asks again. "none" when off, no markers, stock trickplay
+        /// exists, or generation failed recently.
+        /// </summary>
+        [HttpGet("{itemId:guid}/Moments")]
+        [ProducesResponseType(StatusCodes.Status200OK)]
+        [ProducesResponseType(StatusCodes.Status202Accepted)]
+        [ProducesResponseType(StatusCodes.Status404NotFound)]
+        public async Task<ActionResult<MomentManifest>> GetMoments([FromRoute] Guid itemId, CancellationToken cancellationToken)
+        {
+            var item = VisibleItem(itemId);
+            if (item == null)
+            {
+                return NotFound();
+            }
+
+            var times = await MomentTimesAsync(item, cancellationToken).ConfigureAwait(false);
+            if (times.Count == 0)
+            {
+                return new MomentManifest();
+            }
+
+            var m = await _moments.GetAsync(item.Id, item.Path, times, TimeSpan.FromSeconds(8), cancellationToken).ConfigureAwait(false);
+            if (m.Status == "pending")
+            {
+                return StatusCode(StatusCodes.Status202Accepted, m);
+            }
+
+            return m;
+        }
+
+        /// <summary>Gets one sheet of the item's ready moment-preview set.</summary>
+        [HttpGet("{itemId:guid}/Moments/{index:int}.jpg")]
+        [ProducesResponseType(StatusCodes.Status200OK)]
+        [ProducesResponseType(StatusCodes.Status404NotFound)]
+        public async Task<ActionResult> GetMomentSheet([FromRoute] Guid itemId, [FromRoute] int index, CancellationToken cancellationToken)
+        {
+            var item = VisibleItem(itemId);
+            if (item == null || index < 0 || index > 100)
+            {
+                return NotFound();
+            }
+
+            var times = await MomentTimesAsync(item, cancellationToken).ConfigureAwait(false);
+            var file = _moments.SheetPath(item.Id, item.Path, times, index);
+            if (file == null)
+            {
+                return NotFound();
+            }
+
+            Response.Headers["Cache-Control"] = "private, max-age=86400";
+            return PhysicalFile(file, "image/jpeg");
+        }
+
+        /// <summary>The frame times for an item, or none when moments are off or it has stock trickplay.</summary>
+        private async Task<List<double>> MomentTimesAsync(BaseItem item, CancellationToken cancellationToken)
+        {
+            if (!MomentsOn || item is not Video || item.RunTimeTicks is not long ticks || ticks <= 0)
+            {
+                return new List<double>();
+            }
+
+            try
+            {
+                var stock = await _trickplay.GetTrickplayResolutions(item.Id).ConfigureAwait(false);
+                if (stock != null && stock.Count > 0)
+                {
+                    return new List<double>(); // stock trickplay wins; the client uses it
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Moments: trickplay lookup failed for {Id}", item.Id);
+                return new List<double>();
+            }
+
+            var duration = ticks / (double)TimeSpan.TicksPerSecond;
+            var markers = await MergedAsync(item, cancellationToken).ConfigureAwait(false);
+            return MomentSheets.MomentTimes(markers, duration);
+        }
+
+        /// <summary>The item for the authenticated user, or null (missing and not visible look the same).</summary>
+        private BaseItem VisibleItem(Guid itemId)
+        {
+            if (!Guid.TryParse(User.FindFirst("Jellyfin-UserId")?.Value, out var userId) || userId == Guid.Empty)
+            {
+                return null;
+            }
+
+            var user = _userManager.GetUserById(userId);
+            return user == null || itemId == Guid.Empty ? null : _libraryManager.GetItemById<BaseItem>(itemId, user);
+        }
+
+        /// <summary>Markers from every matching provider, sorted by offset.</summary>
+        private async Task<List<TimelineMarker>> MergedAsync(BaseItem item, CancellationToken cancellationToken)
+        {
+            var providers = Providers().Where(p => MarkerProviders.Matches(p, item.Path)).ToList();
+            if (providers.Count == 0)
+            {
+                return new List<TimelineMarker>();
+            }
+
+            var duration = item.RunTimeTicks is long t && t > 0 ? t / (double)TimeSpan.TicksPerSecond : 0;
+            var lists = await Task.WhenAll(providers.Select(p => GetCachedAsync(p, item, duration, cancellationToken))).ConfigureAwait(false);
+            return lists.Where(l => l != null).SelectMany(l => l).OrderBy(m => m.OffsetSeconds).ToList();
         }
 
         /// <summary>Gets the markers for an item, merged across every matching provider.</summary>
@@ -91,29 +216,13 @@ namespace Jellyfin.Plugin.Plus
         [ProducesResponseType(StatusCodes.Status404NotFound)]
         public async Task<ActionResult<TimelineMarkers>> GetMarkers([FromRoute] Guid itemId, CancellationToken cancellationToken)
         {
-            if (!Guid.TryParse(User.FindFirst("Jellyfin-UserId")?.Value, out var userId) || userId == Guid.Empty)
-            {
-                return NotFound();
-            }
-
-            var user = _userManager.GetUserById(userId);
-            var item = user == null || itemId == Guid.Empty ? null : _libraryManager.GetItemById<BaseItem>(itemId, user);
+            var item = VisibleItem(itemId);
             if (item == null)
             {
                 return NotFound(); // missing or not visible to this user: the same answer
             }
 
-            var result = new TimelineMarkers();
-            var providers = Providers().Where(p => MarkerProviders.Matches(p, item.Path)).ToList();
-            if (providers.Count == 0)
-            {
-                return result;
-            }
-
-            var duration = item.RunTimeTicks is long t && t > 0 ? t / (double)TimeSpan.TicksPerSecond : 0;
-            var lists = await Task.WhenAll(providers.Select(p => GetCachedAsync(p, item, duration, cancellationToken))).ConfigureAwait(false);
-            result.Markers = lists.Where(l => l != null).SelectMany(l => l).OrderBy(m => m.OffsetSeconds).ToList();
-            return result;
+            return new TimelineMarkers { Markers = await MergedAsync(item, cancellationToken).ConfigureAwait(false) };
         }
 
         private IReadOnlyList<MarkerProvider> Providers()

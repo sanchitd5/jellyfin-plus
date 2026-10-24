@@ -53,6 +53,9 @@ namespace Jellyfin.Plugin.Plus
         /// <summary>Gets or sets a constant kind for every marker from this provider. Optional.</summary>
         public string Kind { get; set; }
 
+        /// <summary>Gets or sets plain text shown after every value from this provider, e.g. "tokens". Optional, at most 24 characters.</summary>
+        public string ValueUnit { get; set; }
+
         /// <summary>Gets or sets the dotted path to a boolean in the response; when present and not true, no markers. Optional.</summary>
         public string CoverageField { get; set; }
 
@@ -78,6 +81,11 @@ namespace Jellyfin.Plugin.Plus
         [JsonPropertyName("value")]
         [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
         public double? Value { get; set; }
+
+        /// <summary>Gets or sets the plain-text unit of <see cref="Value"/> (provider valueUnit). Omitted without a value.</summary>
+        [JsonPropertyName("unit")]
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        public string Unit { get; set; }
 
         /// <summary>Gets or sets an optional style key, [a-z0-9_-]{1,32}.</summary>
         [JsonPropertyName("kind")]
@@ -178,6 +186,11 @@ namespace Jellyfin.Plugin.Plus
                 p.ValueField = Blank(p.ValueField) ? "value" : p.ValueField;
                 p.KindField = Blank(p.KindField) ? "kind" : p.KindField;
                 p.Kind = CleanKind(p.Kind);
+                p.ValueUnit = Blank(p.ValueUnit) ? null : p.ValueUnit.Trim();
+                if (p.ValueUnit != null && p.ValueUnit.Length > 24)
+                {
+                    p.ValueUnit = p.ValueUnit.Substring(0, 24);
+                }
                 ok.Add(p);
             }
 
@@ -287,7 +300,7 @@ namespace Jellyfin.Plugin.Plus
                     kind = CleanKind(k.GetString());
                 }
 
-                list.Add(new TimelineMarker { OffsetSeconds = Math.Round(offset, 3), Label = label, Value = value, Kind = kind, Source = p.Id });
+                list.Add(new TimelineMarker { OffsetSeconds = Math.Round(offset, 3), Label = label, Value = value, Unit = value == null ? null : p.ValueUnit, Kind = kind, Source = p.Id });
             }
 
             return list;
