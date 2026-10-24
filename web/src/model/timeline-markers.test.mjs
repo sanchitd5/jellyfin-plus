@@ -1,6 +1,6 @@
 // Run: node web/src/model/timeline-markers.test.mjs   (no framework; exits non-zero on failure)
 import assert from 'node:assert/strict';
-import { timelineMarkers, markerLabel, seekTarget, stripTimes, pickTrickplay, stockTile, momentTile } from './timeline-markers.js';
+import { timelineMarkers, markerLabel, seekTarget, stripTimes, pickTrickplay, stockTile, momentTile, stripManifest, warmMarkers } from './timeline-markers.js';
 
 var passed = 0;
 function t(name, fn) {
@@ -126,6 +126,40 @@ t('momentTile: nearest listed time within 1 s, irregular times, missing frame ->
     assert.equal(momentTile(Object.assign({}, mf, { status: 'pending' }), 8), null);
     assert.equal(momentTile(null, 8), null);
     assert.equal(momentTile(Object.assign({}, mf, { times: 'x' }), 8), null);
+});
+
+t('markers carry their server index and value', function () {
+    var m = timelineMarkers(BODY, 1000);
+    assert.deepEqual(m.map(function (x) { return x.index; }), [1, 0, 2]);
+    assert.deepEqual(m.map(function (x) { return x.value; }), [20, 100, null]);
+    // A marker dropped for the player's duration keeps the others' server indexes.
+    assert.deepEqual(timelineMarkers(BODY, 600).map(function (x) { return x.index; }), [1, 0]);
+});
+
+t('stripManifest: one-row ready manifest from the header; junk -> null', function () {
+    var mf = stripManifest('{"width":320,"height":180,"times":[90,95,100,105,110]}');
+    assert.deepEqual(mf, { status: 'ready', width: 320, height: 180, tileWidth: 5, tileHeight: 1, times: [90, 95, 100, 105, 110] });
+    assert.deepEqual(momentTile(mf, 100), { sheet: 0, x: 640, y: 0, w: 320, h: 180, t: 100 });
+    assert.equal(momentTile(stripManifest('{"width":320,"height":180,"times":[0,3,8]}'), 13), null);
+    assert.equal(stripManifest(null), null);
+    assert.equal(stripManifest('not json'), null);
+    assert.equal(stripManifest('{"width":320,"height":180,"times":[]}'), null);
+    assert.equal(stripManifest('{"width":320,"height":180,"times":[1,2,3,4,5,6]}'), null);
+    assert.equal(stripManifest('{"width":0,"height":180,"times":[1]}'), null);
+    assert.equal(stripManifest('{"width":320,"height":180,"times":[1,"x"]}'), null);
+});
+
+t('strip for a marker maps every client strip time to a tile', function () {
+    var mf = stripManifest(JSON.stringify({ width: 320, height: 180, times: stripTimes(3, 1000).map(function (f) { return f.t; }) }));
+    stripTimes(3, 1000).forEach(function (f, i) { assert.equal(momentTile(mf, f.t).x, i * 320); });
+});
+
+t('warmMarkers: highest value first, valueless last, ties by offset, capped', function () {
+    var ms = [{ offset: 5, value: null }, { offset: 1, value: 3 }, { offset: 9, value: 7 }, { offset: 2, value: 3 }];
+    assert.deepEqual(warmMarkers(ms, 3).map(function (m) { return m.offset; }), [9, 1, 2]);
+    assert.deepEqual(warmMarkers(ms, 10).map(function (m) { return m.offset; }), [9, 1, 2, 5]);
+    assert.deepEqual(warmMarkers(null, 3), []);
+    assert.deepEqual(warmMarkers(ms, 0), []);
 });
 
 console.log(passed + ' passed');

@@ -29,7 +29,8 @@ function finite(n) {
 
 /*
  * Drawable markers for a body and a duration in seconds (the player's own). Returns [] for anything
- * unusable. Each: { offset, pct (0..100), kind ('neutral' when unknown), size ('s'|'m'|'l'), label }.
+ * unusable. Each: { index (position in body.markers), value (number|null), offset, pct (0..100),
+ * kind ('neutral' when unknown), size ('s'|'m'|'l'), label }.
  * Size is by value relative to the largest value in the list, so it works whatever the unit.
  */
 export function timelineMarkers(body, durationSeconds) {
@@ -44,7 +45,7 @@ export function timelineMarkers(body, durationSeconds) {
     });
 
     var out = [];
-    body.markers.forEach(function (m) {
+    body.markers.forEach(function (m, index) {
         if (!m || typeof m !== 'object' || !finite(m.offsetSeconds) || m.offsetSeconds < 0
             || m.offsetSeconds > durationSeconds) {
             return;
@@ -55,6 +56,8 @@ export function timelineMarkers(body, durationSeconds) {
         var kind = typeof m.kind === 'string' && KNOWN_KINDS.indexOf(m.kind) >= 0 ? m.kind : 'neutral';
         var rel = value != null && max > 0 ? value / max : 0;
         out.push({
+            index: index, // position in the server's list: names the marker in strip requests
+            value: value,
             offset: m.offsetSeconds,
             pct: Math.min(100, m.offsetSeconds / durationSeconds * 100),
             kind: kind,
@@ -159,6 +162,33 @@ export function momentTile(manifest, seconds) {
     var tile = tileAt(best, manifest.tileWidth, manifest.tileHeight, manifest.width, manifest.height);
     tile.t = manifest.times[best];
     return tile;
+}
+
+/*
+ * A one-marker strip's layout from its X-Moment-Strip header (JSON { width, height, times }), as a
+ * one-row ready manifest momentTile can read (sheet 0 is the strip image). null when unusable.
+ */
+export function stripManifest(header) {
+    var h;
+    try { h = typeof header === 'string' ? JSON.parse(header) : null; } catch (e) { return null; }
+    if (!h || typeof h !== 'object' || !finite(h.width) || h.width <= 0 || !finite(h.height) || h.height <= 0
+        || !Array.isArray(h.times) || !h.times.length || h.times.length > 2 * STRIP_NEIGHBOURS + 1
+        || !h.times.every(finite)) {
+        return null;
+    }
+    return { status: 'ready', width: h.width, height: h.height, tileWidth: h.times.length, tileHeight: 1, times: h.times.slice() };
+}
+
+/*
+ * The markers whose strips the playback-start prewarm fetches when there is no full set yet: the n
+ * with the highest value (valueless last), ties by offset.
+ */
+export function warmMarkers(markers, n) {
+    if (!Array.isArray(markers) || !(n > 0)) { return []; }
+    return markers.slice().sort(function (a, b) {
+        var av = finite(a.value) ? a.value : -Infinity, bv = finite(b.value) ? b.value : -Infinity;
+        return av !== bv ? bv - av : a.offset - b.offset;
+    }).slice(0, n);
 }
 
 function tileAt(n, cols, rows, w, h) {

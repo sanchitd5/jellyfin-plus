@@ -224,5 +224,12 @@ namespace Jellyfin.Plugin.Plus.Configuration
         /// (never beside the media). Off: such videos show the marker label only.
         /// </summary>
         public bool MarkerMoments { get; set; } = true;
+
+        /// <summary>
+        /// Precompute moment previews: a nightly scheduled task (03:00) and a queue for newly added
+        /// videos make them ahead of playback, one idle-priority ffmpeg at a time, pausing while anyone
+        /// transcodes. Off: made on demand only (first hover, or the player's prewarm at playback start).
+        /// </summary>
+        public bool MarkerMomentsPrecompute { get; set; } = true;
     }
 }

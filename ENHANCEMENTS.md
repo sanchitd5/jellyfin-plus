@@ -850,19 +850,47 @@ position slider. Full contract for app authors: [docs/architecture/TIMELINE_MARK
   the marker's own, highlighted, plus two either side 5 s apart (clamped to `[0, duration-1]`,
   near-duplicates under 1 s collapsed). Clicking a frame seeks to its exact time. Frames come from the
   item's stock trickplay (`Fields=Trickplay`, smallest width >= 200, `Videos/{id}/Trickplay/{w}/{n}.jpg`)
-  when it has any; otherwise from moment sheets (below). Prewarmed once per item when its markers are drawn at
-  playback start (moment generation driven to ready, every sheet the strips use loaded), cached per item;
-  a sheet that fails to load hides only its own frames, and no source at all leaves label + value.
-- *Moment sheets* (`src/MomentSheets.cs`; setting `MarkerMoments`, default on, Integrations tab): for a
-  video with markers and no stock trickplay, `GET /JellyfinPlus/Markers/{itemId}/Moments` generates on
-  first ask 320x180 JPEG frames at the server's own marker times (never times from the request; marker
-  ±5/±10 s, at most 200 frames, highest-value markers kept first) with the ffmpeg Jellyfin is configured
-  with (`-ss` input seek, one process per frame, at most 2 at a time server-wide, below-normal priority,
-  30 s kill), tiled 10x10 into sheets plus a manifest with each tile's time. One generation per item;
-  it waits up to 8 s, then answers 202 `pending` and the client asks again. Failures are cached 10
-  minutes. Stored only under Jellyfin's cache path (`jellyfin-plus-moments/{itemId}/{hash}/`, hash of
-  item + file size/mtime + times), written to a temp dir and moved whole, least-recently-used sets
-  pruned above 512 MB. Never written beside the media; stock trickplay is never generated or touched.
+  when it has any; otherwise from the ready moment set (below); otherwise, while the set is not ready,
+  from that one marker's runtime strip (label + value at once, frames when the strip lands). Prewarmed
+  once per item when its markers are drawn at playback start (with no ready set the 5 highest-value
+  markers' strips; moment generation driven to ready; every sheet the strips use loaded), cached per
+  item in the client's per-item LRU (`entry.strips[index]` for strips); a sheet that fails to load
+  hides only its own frames, and no source at all leaves label + value.
+- *Moment sheets* (`src/MomentSheets.cs`, `src/MarkerSource.cs`; setting `MarkerMoments`, default on,
+  Integrations tab): for a video with markers and no stock trickplay, `GET
+  /JellyfinPlus/Markers/{itemId}/Moments` (`no-store`) answers the set's manifest, generating on a
+  miss: 160x90 frames (one JPEG encode, `-q:v 10`) at the server's own marker times (never times from
+  the request; marker ±5/±10 s, at most 200 frames, highest-value markers kept first) with the ffmpeg
+  Jellyfin is configured with (`-ss` input seek, one process per frame, 30 s kill), tiled 10x10 into
+  sheets plus a manifest with each tile's time. One generation per set key whoever asks; a viewer's
+  request waits up to 8 s, then answers 202 `pending`. Failures are cached 10 minutes. Sheets
+  `.../Moments/{n}.jpg?v=<key>` are `private, max-age=31536000, immutable` (404 for a stale `v`).
+  Two lanes: viewers (2 ffmpeg, below-normal) and background (1 ffmpeg, idle, frame by frame, waiting
+  while a viewer's generation/strip runs or any session transcodes); a viewer joining a background
+  generation promotes it.
+- *Runtime strip*: `GET /JellyfinPlus/Markers/{itemId}/Moments/Marker/{i}.jpg?t=` - marker `i` of the
+  server's merged list (`t` must agree within 0.5 s, else the marker nearest `t`, else 404) as one JPEG
+  of its five frames side by side, from ONE ffmpeg process with five `-threads 2 -ss T -i file` inputs
+  and `hstack`; tile times in `X-Moment-Strip`. 409 + manifest when the full set is ready, 503 after
+  10 s or a recent failure. Live lane, de-duplicated per key, cached under the item (`strips/`,
+  `private, max-age=86400`). Measured on CT114: 390-770 ms per strip, 5-13 KB.
+- *Precompute* (`src/MomentPrecompute.cs`; setting `MarkerMomentsPrecompute`, default on): scheduled
+  task *Precompute marker previews* (category Jellyfin Plus, daily 03:00, runnable by hand) walks every
+  matching video without stock trickplay, fetches markers with no user (no route exposes that path;
+  provider calls at most 4/s, not cached for viewers) and makes the set in the background lane; plus a
+  bounded (2000), de-duplicated one-worker queue fed by `ItemAdded`/`ItemUpdated`, each item 2 minutes
+  after it arrived. Check index `precompute-index.json` (file key path+size+mtime, checked-at,
+  result): re-asked when the file changed, after 14 days, or every run while the item is under 2 days
+  old; provider failures record nothing. Off: on demand + client prewarm only.
+- *Storage: kept forever.* Jellyfin's **data** path, `jellyfin-plus-moments/{itemId}/{key}/` and
+  `strips/` (not the cache path, which Jellyfin's *Clean Cache Directory* task empties by age; the
+  first version's cache-path store is removed by the nightly run). Key: format version + item + file
+  size/mtime + times. No size cap, no LRU; only orphans go - an item's older sets when a newer set
+  replaces them, strips of a replaced file or superseded by the set, and sets of items removed, now with
+  stock trickplay, or without markers. ~1.26 KB a frame in a sheet; CT114 sample: ~13% of ~48,000
+  matching videos have markers, ~31 frames each, so ~250 MB in all (12 GB worst case). The nightly run
+  logs store size and counts. Never written beside the media; stock trickplay is never generated or
+  touched.
 
 **Play-all fixes** (`web/src/controller/play-all.js`). Two playback-queue requests are rewritten.
 (1) Stock caps Play all and Shuffle at 300 items; a request with the playback signature
@@ -1377,7 +1405,8 @@ All under the Jellyfin API root. "Administrator" is the `RequiresElevation` poli
 | `GET /JellyfinPlus/Library/Census[?userId=..]` | Any authenticated user | Which item kinds the user has: `{counts: {Movie: n, Person: n, ...}}`, absent kinds omitted. Library-resident kinds are counted under the libraries the user can open; kinds stored outside libraries (people, studios, genres, artists, playlists, collections, live TV) are counted library-wide, so they can overstate for a restricted user, never understate. Cached per user (5 minutes, dropped on item add or remove). 403 for another user's view unless administrator; 404 for an unknown user. |
 | `GET /JellyfinPlus/Markers/Enabled` | Any authenticated user | `{enabled, moments}`: whether any timeline-marker provider is configured, and whether moment sheets are on (`MarkerMoments`). The client makes no marker requests while `enabled` is false. |
 | `GET /JellyfinPlus/Markers/{itemId}/Moments` | Any authenticated user | Moment-sheet manifest `{status, version?, width, height, tileWidth, tileHeight, times}`: 200 `ready` (or `none`: off, no markers, stock trickplay exists, or a recent failure), 202 `pending` while generating. Times come from the server's own marker list. 404 when the item is missing or not visible. |
-| `GET /JellyfinPlus/Markers/{itemId}/Moments/{n}.jpg` | Any authenticated user | Sheet `n` of the ready set (`Cache-Control: private, max-age=86400`); 404 otherwise. |
+| `GET /JellyfinPlus/Markers/{itemId}/Moments/{n}.jpg?v=<version>` | Any authenticated user | Sheet `n` of the ready set; with `v` (the manifest version) `Cache-Control: private, max-age=31536000, immutable`, 404 when `v` is stale; 404 otherwise. |
+| `GET /JellyfinPlus/Markers/{itemId}/Moments/Marker/{index}.jpg?t=<offsetSeconds>` | Any authenticated user | One marker's five frames side by side, made on the spot (one ffmpeg, ~0.4-0.8 s) when the full set is not ready; tile times in header `X-Moment-Strip` `{width, height, times}`. `index` names a marker of the server's merged list (`t` must agree within 0.5 s, else nearest within 0.5 s); frame times never from the request. 409 + manifest when the set is ready, 404 when off / stock trickplay / no such marker / not visible, 503 when not made within 10 s. `private, max-age=86400`. |
 | `GET /JellyfinPlus/Markers/{itemId}` | Any authenticated user | `{markers: [{offsetSeconds, label, value?, unit?, kind?, source}]}` merged from every provider matching the item's path (section 5, [TIMELINE_MARKERS.md](docs/architecture/TIMELINE_MARKERS.md)). 404 when the item is missing or not visible to the user. Provider failures give an empty or partial list, never an error. |
 
 | `GET /JellyfinPlus/Tags[?q=..&order=count\|name&limit=100&offset=0]` | Administrator | Every stored tag spelling with its item count: `{total, offset, items: [{name, count, clean, variants}]}`. `limit` 1 to 500. Used by the config page. |

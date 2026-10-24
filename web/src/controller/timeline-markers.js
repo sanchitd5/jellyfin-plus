@@ -1,7 +1,7 @@
 import { state } from '../model/state.js';
 import { log } from '../lib/log.js';
 import { player, activePlayer } from './live-apply.js';
-import { timelineMarkers, seekTarget, stripTimes, pickTrickplay, stockTile, momentTile } from '../model/timeline-markers.js';
+import { timelineMarkers, seekTarget, stripTimes, pickTrickplay, stockTile, momentTile, stripManifest, warmMarkers } from '../model/timeline-markers.js';
 
 /*
  * TIMELINE MARKERS ON THE PLAYER'S SEEK BAR. External services configured on the server
@@ -14,10 +14,12 @@ import { timelineMarkers, seekTarget, stripTimes, pickTrickplay, stockTile, mome
  * the label + value (textContent only) and, when there is something to show, a strip of frames: the
  * marker's own frame, highlighted, with two either side 5 s apart. Clicking a frame seeks to its time.
  * Frames come from the item's stock Jellyfin trickplay when it has any (Videos/{id}/Trickplay/...),
- * otherwise from the plugin's moment sheets (GET /JellyfinPlus/Markers/{id}/Moments, generated on the
- * server on first ask, src/MomentSheets.cs). Prewarmed once per item when its markers are drawn
- * (generation driven to ready, the strips' sheets loaded), cached per item; no preview source, or a
- * sheet that fails to load, leaves the label alone.
+ * otherwise from the plugin's moment sheets (GET /JellyfinPlus/Markers/{id}/Moments, usually
+ * precomputed on the server, src/MomentPrecompute.cs), otherwise - not ready yet - from that one
+ * marker's strip made on the spot (GET .../Moments/Marker/{index}.jpg?t=, ~0.35 s server-side; tile
+ * times in X-Moment-Strip). Prewarmed once per item when its markers are drawn (the strips of the
+ * WARM_STRIPS highest-value markers, generation driven to ready, the sheets loaded), cached per item;
+ * no preview source, or an image that fails to load, leaves the label alone.
  *
  * ZERO REQUESTS WHEN OFF. GET /JellyfinPlus/Markers/Enabled is asked once (again 5 min after a
  * failure); while it says false no per-item request is made.
@@ -43,6 +45,7 @@ var THUMB_W = 128;              // px, each frame in the strip
 var HIDE_DELAY_MS = 250;        // grace to move from the marker into the popup
 var PENDING_RETRY_MS = 3000;    // moment sheets still generating: ask again while the popup is open
 var PENDING_TRIES = 20;
+var WARM_STRIPS = 5;            // marker strips fetched at playback start when the full set is not ready
 
 var L = '.' + LAYER_CLASS;
 var CSS = [
@@ -79,7 +82,7 @@ var drawn = null;       // { slider, duration } last drawn, to redraw only on ch
 var preview = null;     // the current item's entry in `items` (preview source, manifest, sheets)
 // Per-item state kept across item changes, page leaves and seeks for the page's lifetime, so a video
 // opened again (or a player blip mid-seek) reuses its markers, manifest and loaded sheet images.
-var items = new Map();  // key -> { key, promise, moment, sheets, warmed, body, bodyAt }
+var items = new Map();  // key -> { key, promise, moment, sheets, strips, warmed, body, bodyAt }
 var ITEMS_KEPT = 12;
 var BODY_TTL_MS = 10 * 60 * 1000;   // same as the server's marker cache
 var pop = null;         // { el, button, marker, hideTimer, pendingTimer, tries } the open popup
@@ -176,11 +179,58 @@ function entry(key) {
     if (e) {
         items.delete(key);
     } else {
-        e = { key: key, promise: null, moment: null, sheets: {}, warmed: false, body: null, bodyAt: 0 };
+        e = { key: key, promise: null, moment: null, sheets: {}, strips: {}, warmed: false, body: null, bodyAt: 0 };
     }
     items.set(key, e);
-    while (items.size > ITEMS_KEPT) { items.delete(items.keys().next().value); }
+    while (items.size > ITEMS_KEPT) {
+        var oldest = items.keys().next().value;
+        dropStrips(items.get(oldest));
+        items.delete(oldest);
+    }
     return e;
+}
+
+/* Frees an evicted item's strip images (object URLs). */
+function dropStrips(e) {
+    Object.keys(e && e.strips || {}).forEach(function (i) {
+        e.strips[i].then(function (s) {
+            if (s && s.kind === 'strip') { URL.revokeObjectURL(s.url); }
+        }, function () {});
+    });
+}
+
+/*
+ * One marker's strip, cached in the item's entry by server index. Resolves to
+ * { kind:'strip', manifest, url } (url: an object URL of the strip JPEG), { kind:'moment', manifest }
+ * when the server says the full set is ready (409), or null (failure: forgotten, asked again next time).
+ */
+function markerStrip(key, marker) {
+    var e = entry(key);
+    if (e.strips[marker.index]) { return e.strips[marker.index]; }
+    var c = client();
+    if (!c || typeof fetch !== 'function') { return Promise.resolve(null); }
+    var token = typeof c.accessToken === 'function' ? c.accessToken() : '';
+    var url = c.getUrl('JellyfinPlus/Markers/' + encodeURIComponent(key) + '/Moments/Marker/' + marker.index + '.jpg',
+        { ApiKey: token, t: marker.offset });
+    var p = fetch(url, { credentials: 'same-origin' }).then(function (res) {
+        if (res.status === 409) {
+            return res.json().then(function (m) {
+                if (!m || m.status !== 'ready') { return null; }
+                e.moment = m;
+                return { kind: 'moment', manifest: m };
+            });
+        }
+        var mf = res.ok ? stripManifest(res.headers.get('X-Moment-Strip')) : null;
+        if (!mf) { return null; }
+        return res.blob().then(function (b) {
+            return { kind: 'strip', manifest: mf, url: URL.createObjectURL(b) };
+        });
+    }).catch(function () { return null; }).then(function (s) {
+        if (!s && e.strips[marker.index] === p) { delete e.strips[marker.index]; }
+        return s;
+    });
+    e.strips[marker.index] = p;
+    return p;
 }
 
 function previewSource(key) {
@@ -239,6 +289,7 @@ function sheetUrl(key, src, sheet) {
         return c.getUrl('Videos/' + encodeURIComponent(key) + '/Trickplay/' + src.info.Width + '/' + sheet + '.jpg',
             { ApiKey: token, MediaSourceId: src.mediaSourceId });
     }
+    if (src.kind === 'strip') { return src.url; }
     return c.getUrl('JellyfinPlus/Markers/' + encodeURIComponent(key) + '/Moments/' + sheet + '.jpg',
         { ApiKey: token, v: src.manifest.version });
 }
@@ -306,18 +357,27 @@ function loadStrip(p, strip) {
     if (!key || !times.length) { return; }
     previewSource(key).then(function (src) {
         if (src) { return src; }
-        return momentManifest(key).then(function (m) {
-            if (m && m.status === 'pending' && pop === p && p.tries++ < PENDING_TRIES) {
-                p.pendingTimer = setTimeout(function () { if (pop === p) { loadStrip(p, strip); } }, PENDING_RETRY_MS);
-            }
-            return m && m.status === 'ready' ? { kind: 'moment', manifest: m } : null;
-        });
+        var e = entry(key);
+        if (e.moment && e.moment.status === 'ready') { return { kind: 'moment', manifest: e.moment }; }
+        // Full set not known ready: this marker's strip now (made on the spot, well under a second),
+        // never waiting on the manifest's long poll; the manifest path only if the strip fails.
+        var viaStrip = momentsOn && p.marker.index != null ? markerStrip(key, p.marker) : Promise.resolve(null);
+        return viaStrip.then(function (s) { return s || viaManifest(); });
     }).then(function (src) {
         if (!src || pop !== p || itemKey !== key) { return; }
         renderStrip(p, strip, key, src, times);
     }).catch(function (err) {
         log('timeline markers: preview unavailable', err);
     });
+
+    function viaManifest() {
+        return momentManifest(key).then(function (m) {
+            if (m && m.status === 'pending' && pop === p && p.tries++ < PENDING_TRIES) {
+                p.pendingTimer = setTimeout(function () { if (pop === p) { loadStrip(p, strip); } }, PENDING_RETRY_MS);
+            }
+            return m && m.status === 'ready' ? { kind: 'moment', manifest: m } : null;
+        });
+    }
 }
 
 function renderStrip(p, strip, key, src, times) {
@@ -368,13 +428,20 @@ function sheetCache(key) {
 
 /*
  * PREWARM. Once per item, as soon as its markers are drawn (playback start): resolve the preview
- * source, drive moment-sheet generation to "ready" in the background, and load every sheet the marker
+ * source; with no stock trickplay and no ready set, fetch the WARM_STRIPS strongest markers' strips;
+ * drive moment-sheet generation to "ready" in the background, and load every sheet the marker
  * strips will use, so the first hover shows frames at once. Stops when the item changes.
  */
 function prewarm(key, markers, duration) {
     var e = entry(key);
     if (e.warmed) { return; }
     e.warmed = true;
+    // No stock trickplay and no full set known: fetch the strongest markers' strips first (cheap,
+    // ~0.35 s each on the server), while the manifest poll below drives the full set.
+    previewSource(key).then(function (src) {
+        if (src || !momentsOn || (e.moment && e.moment.status === 'ready') || itemKey !== key) { return; }
+        warmMarkers(markers, WARM_STRIPS).forEach(function (m) { markerStrip(key, m); });
+    }).catch(function () {});
     var tries = 0;
     var resolve = function () {
         return previewSource(key).then(function (src) {

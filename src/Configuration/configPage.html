@@ -531,7 +531,16 @@
                             <span>Moment previews</span>
                         </label>
                         <div class="fieldDescription checkboxFieldDescription">
-                        Hovering a marker shows frames from that moment. Videos with Jellyfin trickplay use it; for the others the server makes a few small frames at each marker (and 5 and 10 seconds either side) the first time someone hovers one, with the ffmpeg Jellyfin is configured with, at low priority. They are kept in Jellyfin's cache folder (at most 512 MB, oldest dropped first), never beside the video. Off: those videos show the marker's label only.
+                        Hovering a marker shows frames from that moment. Videos with Jellyfin trickplay use it; for the others the server makes a few small frames at each marker (and 5 and 10 seconds either side) with the ffmpeg Jellyfin is configured with, at low priority. They are small (160 px, about 1.3 KB a frame) and kept for good in Jellyfin's data folder (<code>jellyfin-plus-moments</code>), never beside the video; only previews of removed or replaced videos are deleted. Until a video's full set exists, hovering a marker makes just that marker's frames on the spot (well under a second). Off: those videos show the marker's label only.
+                    </div>
+                    </div>
+                    <div class="checkboxContainer checkboxContainer-withDescription">
+                        <label class="emby-checkbox-label">
+                            <input is="emby-checkbox" type="checkbox" id="MarkerMomentsPrecompute" data-config="MarkerMomentsPrecompute" data-kind="bool" data-default="true" />
+                            <span>Precompute moment previews</span>
+                        </label>
+                        <div class="fieldDescription checkboxFieldDescription">
+                        Makes them ahead of playback: the scheduled task <em>Precompute marker previews</em> (Scheduled Tasks &gt; Jellyfin Plus, nightly at 03:00) and, for newly added videos, a queue a couple of minutes after they arrive. One ffmpeg at a time at idle priority, paused while anyone is transcoding or waiting for a preview; provider calls at most 4 a second. Unchanged videos checked in the last 14 days are skipped (videos from the last 2 days are asked again every night). Off: previews are made on demand only.
                     </div>
                     </div>
                     </div>
