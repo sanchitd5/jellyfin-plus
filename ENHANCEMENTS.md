@@ -850,7 +850,8 @@ position slider. Full contract for app authors: [docs/architecture/TIMELINE_MARK
   the marker's own, highlighted, plus two either side 5 s apart (clamped to `[0, duration-1]`,
   near-duplicates under 1 s collapsed). Clicking a frame seeks to its exact time. Frames come from the
   item's stock trickplay (`Fields=Trickplay`, smallest width >= 200, `Videos/{id}/Trickplay/{w}/{n}.jpg`)
-  when it has any; otherwise from moment sheets (below). Loaded lazily on first hover, cached per item;
+  when it has any; otherwise from moment sheets (below). Prewarmed once per item when its markers are drawn at
+  playback start (moment generation driven to ready, every sheet the strips use loaded), cached per item;
   a sheet that fails to load hides only its own frames, and no source at all leaves label + value.
 - *Moment sheets* (`src/MomentSheets.cs`; setting `MarkerMoments`, default on, Integrations tab): for a
   video with markers and no stock trickplay, `GET /JellyfinPlus/Markers/{itemId}/Moments` generates on

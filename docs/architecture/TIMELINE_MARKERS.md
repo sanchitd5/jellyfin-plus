@@ -121,7 +121,8 @@ the manifest lists them rather than giving an interval). The server takes the ti
 merged marker list**, never from the request: each marker plus ±5 and ±10 s, at most 200 frames
 (highest-value markers first). Frames are decoded with the ffmpeg Jellyfin is configured with
 (input-side seek, one process per frame, at most two at a time, below-normal priority, killed after
-30 s), on first ask; one generation per item, failures remembered for 10 minutes. Output lives only
+30 s), on first ask - which the web client makes at playback start, as soon as the item's markers are
+drawn, so sheets are ready before the first hover; one generation per item, failures remembered for 10 minutes. Output lives only
 under Jellyfin's cache path, `jellyfin-plus-moments/{itemId}/{key}/` (key: item, file size and
 mtime, times), least recently used sets pruned above 512 MB. Nothing is written beside the media,
 and stock trickplay is never generated. 404 for an item the user cannot see, as above.

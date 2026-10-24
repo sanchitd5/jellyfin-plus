@@ -15,8 +15,9 @@ import { timelineMarkers, seekTarget, stripTimes, pickTrickplay, stockTile, mome
  * marker's own frame, highlighted, with two either side 5 s apart. Clicking a frame seeks to its time.
  * Frames come from the item's stock Jellyfin trickplay when it has any (Videos/{id}/Trickplay/...),
  * otherwise from the plugin's moment sheets (GET /JellyfinPlus/Markers/{id}/Moments, generated on the
- * server on first ask, src/MomentSheets.cs). Loaded lazily on the first hover, cached per item; no
- * preview source, or a sheet that fails to load, leaves the label alone.
+ * server on first ask, src/MomentSheets.cs). Prewarmed once per item when its markers are drawn
+ * (generation driven to ready, the strips' sheets loaded), cached per item; no preview source, or a
+ * sheet that fails to load, leaves the label alone.
  *
  * ZERO REQUESTS WHEN OFF. GET /JellyfinPlus/Markers/Enabled is asked once (again 5 min after a
  * failure); while it says false no per-item request is made.
@@ -295,7 +296,7 @@ function loadStrip(p, strip) {
 function renderStrip(p, strip, key, src, times) {
     var cols = src.kind === 'stock' ? src.info.TileWidth : src.manifest.tileWidth;
     var rows = src.kind === 'stock' ? src.info.TileHeight : src.manifest.tileHeight;
-    var sheets = {};
+    var sheets = sheetCache(key);
     strip.textContent = '';
     times.forEach(function (ft) {
         var tile = src.kind === 'stock' ? stockTile(src.info, ft.t) : momentTile(src.manifest, ft.t);
@@ -331,6 +332,58 @@ function renderStrip(p, strip, key, src, times) {
         });
     });
     if (pop === p) { place(); }
+}
+
+/* Sheet image loads for the current item, shared by the prewarm and every popup. */
+function sheetCache(key) {
+    if (!preview || preview.key !== key) { return {}; }
+    preview.sheets = preview.sheets || {};
+    return preview.sheets;
+}
+
+/*
+ * PREWARM. Once per item, as soon as its markers are drawn (playback start): resolve the preview
+ * source, drive moment-sheet generation to "ready" in the background, and load every sheet the marker
+ * strips will use, so the first hover shows frames at once. Stops when the item changes.
+ */
+function prewarm(key, markers, duration) {
+    if (!preview || preview.key !== key) { previewSource(key); }
+    if (preview.warmed) { return; }
+    preview.warmed = true;
+    var tries = 0;
+    var resolve = function () {
+        return previewSource(key).then(function (src) {
+            if (src) { return src; }
+            return momentManifest(key).then(function (m) {
+                if (m && m.status === 'pending' && itemKey === key && tries++ < PENDING_TRIES) {
+                    return new Promise(function (r) { setTimeout(r, PENDING_RETRY_MS); }).then(function () {
+                        return itemKey === key ? resolve() : null;
+                    });
+                }
+                return m && m.status === 'ready' ? { kind: 'moment', manifest: m } : null;
+            });
+        });
+    };
+    resolve().then(function (src) {
+        if (!src || itemKey !== key) { return; }
+        var sheets = sheetCache(key);
+        var n = 0;
+        markers.forEach(function (m) {
+            stripTimes(m.offset, duration).forEach(function (ft) {
+                var tile = src.kind === 'stock' ? stockTile(src.info, ft.t) : momentTile(src.manifest, ft.t);
+                if (!tile) { return; }
+                var url = sheetUrl(key, src, tile.sheet);
+                if (!sheets[url]) {
+                    n++;
+                    sheets[url] = loadImage(url);
+                    sheets[url].catch(function () {}); // a failed sheet just hides its frames later
+                }
+            });
+        });
+        log('timeline markers: prewarmed ' + n + ' ' + src.kind + ' sheet(s)');
+    }).catch(function (err) {
+        log('timeline markers: prewarm failed', err);
+    });
 }
 
 function loadImage(url) {
@@ -407,6 +460,7 @@ function draw(slider, durationSeconds) {
 
     host.appendChild(layer);
     drawn = { slider: slider, duration: durationSeconds };
+    if (itemKey) { prewarm(itemKey, markers, durationSeconds); }
 }
 
 function tick() {
