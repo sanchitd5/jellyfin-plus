@@ -72,6 +72,7 @@ setting, a control in the page, or "remove the plugin or script".
 | Client-side upscaling | Client | When the stream is shown at 1.15x its decoded size or more, this browser upscales it on its own GPU (WebGL2: deblock + deband, then FSR 1 EASU + RCAS); the badge says "This device: ..." | Auto by default; Off / Auto / Always per device in Enhance > "On this device" (not on TV layout) |
 | Swipe volume and brightness | Client | Vertical swipe on the right half of the video changes volume, on the left half brightness | On, no switch (touch only, not on TV layout; volume off where the device ignores it) |
 | Clip Up Next | Client | "Next video in N s" card for queued clips | On, no switch |
+| Timeline markers | Both | Dots on the player's seek bar from external services ("providers"); hover shows the label, click seeks 3 s before | Off: no providers by default. Setting `MarkerProviders` (Integrations tab) or env `JELLYFIN_PLUS_MARKER_PROVIDERS` (not on TV layout; section 5) |
 | Play-all fixes | Client | Play all and Shuffle queue up to 1000 items; Home Videos folders queue videos | On, no switch |
 | Bulk tag add/remove, Edit tags | Client | Extra rows in the selection menu and the item menu (administrators) | On for administrators |
 | Previous / next on a details page | Client | Skip-back and skip-forward buttons step through the list the item was opened from | On, no switch (not on TV); only when the item is in the remembered list |
@@ -820,6 +821,30 @@ when 8 seconds remain ("Start now", "Hide"), for items of 20 seconds or longer. 
 stock playback manager still advances if the viewer's auto-play setting is on. It respects the
 viewer's "next video info" overlay setting.
 
+**Timeline markers** (`src/MarkerProviders.cs`, `src/MarkersController.cs`,
+`web/src/controller/timeline-markers.js`, `web/src/model/timeline-markers.js`). A generic integration:
+any external app can supply points for an item, and the player draws them as dots over the OSD
+position slider. Full contract for app authors: [docs/architecture/TIMELINE_MARKERS.md](docs/architecture/TIMELINE_MARKERS.md).
+- *Providers* are configuration only: a JSON array in the setting `MarkerProviders` (config page,
+  Integrations tab; invalid JSON is refused there and the previous value kept), replaced entirely by the
+  environment variable `JELLYFIN_PLUS_MARKER_PROVIDERS` when that is set (read at request time). Each
+  entry: `id`, `enabled`, `urlTemplate` (`{path}`, `{itemId}`, `{name}`, URL-encoded; never in the host),
+  path filter `pathPrefix` / `excludePrefixes` / `extensions`, response mapping `itemsField` (dotted,
+  default `markers`), `offsetField` (`offsetSeconds`), `labelField` (`label`), `valueField` (`value`),
+  `kindField` (`kind`), constant `kind`, optional `coverageField` (false means no markers),
+  `timeoutSeconds` (5, 1-30), `cacheMinutes` (10, 0-1440). Default `[]`: off.
+- *Server*: `GET /JellyfinPlus/Markers/{itemId}` resolves the item for the requesting user (404 when
+  missing or not visible, the same answer), asks every matching provider in parallel, validates each
+  answer (2 MiB cap, finite offsets in `[0, runtime]`, labels cut at 200, kinds `[a-z0-9_-]`) and
+  returns `{markers: [{offsetSeconds, label, value?, kind?, source}]}` sorted by offset. A failing
+  provider contributes nothing; upstream detail never reaches the client. Cached in memory per
+  provider and URL (`cacheMinutes`; failures 1 minute).
+- *Client*: asks `GET /JellyfinPlus/Markers/Enabled` once per page load and makes no per-item request
+  while it is false. Then one request per item (one retry after 30 s on a network error). Dots styled by
+  `kind` (`tip`, `chapter`, `highlight`; anything else neutral), sized by value relative to the largest,
+  label in `title` only (never HTML); a click seeks to `max(0, offset - 3)`. Removed on item change and
+  when the video page goes; nothing on the TV layout. Any failure leaves the stock player.
+
 **Play-all fixes** (`web/src/controller/play-all.js`). Two playback-queue requests are rewritten.
 (1) Stock caps Play all and Shuffle at 300 items; a request with the playback signature
 (`Fields` containing Chapters and MediaSources, `ExcludeLocationTypes=Virtual`,
@@ -1331,6 +1356,8 @@ All under the Jellyfin API root. "Administrator" is the `RequiresElevation` poli
 | `POST /JellyfinPlus/FtsIndex/Rebuild?force=true` | Administrator | Rebuilds the search index in the background; 202 with the status JSON, 409 when a run is in flight or the index is off. |
 | `GET /JellyfinPlus/Search/Facets` | Any authenticated user | People, studios or tags credited on the items a search matches: `[{id, name, roles, count}]`, count descending then name. Parameters in section 9. 400 for a bad `kind` or no resolvable user; 403 if a non-administrator asks for another user's view; 404 for an unknown user or a `parentId` the user cannot see; an empty array when `searchTerm` is blank. Sets a `Server-Timing` header. |
 | `GET /JellyfinPlus/Library/Census[?userId=..]` | Any authenticated user | Which item kinds the user has: `{counts: {Movie: n, Person: n, ...}}`, absent kinds omitted. Library-resident kinds are counted under the libraries the user can open; kinds stored outside libraries (people, studios, genres, artists, playlists, collections, live TV) are counted library-wide, so they can overstate for a restricted user, never understate. Cached per user (5 minutes, dropped on item add or remove). 403 for another user's view unless administrator; 404 for an unknown user. |
+| `GET /JellyfinPlus/Markers/Enabled` | Any authenticated user | `{enabled}`: whether any timeline-marker provider is configured. The client makes no marker requests while false. |
+| `GET /JellyfinPlus/Markers/{itemId}` | Any authenticated user | `{markers: [{offsetSeconds, label, value?, kind?, source}]}` merged from every provider matching the item's path (section 5, [TIMELINE_MARKERS.md](docs/architecture/TIMELINE_MARKERS.md)). 404 when the item is missing or not visible to the user. Provider failures give an empty or partial list, never an error. |
 
 | `GET /JellyfinPlus/Tags[?q=..&order=count\|name&limit=100&offset=0]` | Administrator | Every stored tag spelling with its item count: `{total, offset, items: [{name, count, clean, variants}]}`. `limit` 1 to 500. Used by the config page. |
 | `POST /JellyfinPlus/Tags/Edit` | Administrator | `{op: rename\|merge\|delete, from: [..], to: "..", dryRun: true, expectChanged: n}` -> `{dryRun, committed, op, matchedItems, changedItems, lockedSkipped, notLoaded}`. `dryRun` defaults to true. 400 for a bad request or more than 20,000 items; 409 when another edit is running or `expectChanged` no longer matches (nothing written). Section 6. |
