@@ -262,7 +262,11 @@ export function syncGroupSections(paper, ctx, getCtx, again) {
     usable.forEach(function (g, i) {
         keep[g.name] = true;
         var sec = byName[g.name];
-        if (!sec) {
+        // Restore the saved open state only on a fresh section: on a live one the user's own
+        // close mutates the popover before the async 'toggle' event updates ui, and a re-sync
+        // in that gap would see stale open=true and reopen it.
+        var fresh = !sec;
+        if (fresh) {
             sec = buildSection(g);
         }
 
@@ -270,7 +274,7 @@ export function syncGroupSections(paper, ctx, getCtx, again) {
             host.insertBefore(sec, host.children[i] || null);
         }
 
-        fillSection(sec, g, picks, true);
+        fillSection(sec, g, picks, fresh);
     });
     Object.keys(byName).forEach(function (n) {
         if (!keep[n]) {
