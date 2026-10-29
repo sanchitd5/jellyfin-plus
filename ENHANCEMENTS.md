@@ -557,7 +557,13 @@ instead. The rewrite matches only an Audiobook request carrying `personIds` or `
 
 **Poster zoom** (`web/src/view/image-zoom.js`). Tapping the details poster opens it full screen at
 full resolution (sizing parameters are stripped from the image URL). Tap to toggle fit/actual size;
-close with the X, the backdrop, or Escape.
+close with the X, the backdrop, or Escape. A screen-sized poster (maxHeight/maxWidth = screen bucket
+x dpr, quality 90) is prefetched at idle on each details visit (skipped on saveData / 2g) and shown
+at once on open; the original is fetched, decoded and swapped in only when zooming to actual size.
+
+**Detail fade** (`web/src/view/detail-fade.js`). CSS only: shortens the details backdrop fades
+(`.backdropImageFadeIn` 800ms, `#itemBackdrop.lazy-image-fadein` 500ms) to 120ms, scoped to a
+visible `#itemDetailPage`. Other pages keep the stock fade.
 
 **Previous / next** (`web/src/controller/detail-nav.js`, `model/detail-nav.js`, shared page watcher
 `controller/detail-page.js`). Stock has no "the list I came from". A click that opens an item from a

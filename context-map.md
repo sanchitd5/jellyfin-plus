@@ -123,7 +123,8 @@ esbuild) support natively.
 | `view/virtual-chunks.js` | `addChunk()`, `removeChunk()`, `estimateChunkHeight()`, `measureColumns()`, `stockCount()`, `addHead()` (row-aligned chunks; evicts card chunks more than three screens away and pins their height; DOM only) | `model/row-fill.js` |
 | `view/sheet.js` | `openSheet({title, content, footer, onClose, tiers, opener, flush})`, `closeSheet(reason)`, `sheetIsOpen()`, `sheetTier()`, `isBottomSheet(tiers)` (the shared modal: bottom sheet on phones, centred dialog otherwise; sets `html.jp-sheet-open`) | `lib/log.js`, `lib/dom.js` (`el`) |
 | `view/search-filter-sheet.js` | `installSearchFilterBar()` (the "Sort & filter" button, badge, active-filter chips and bottom sheet on `#searchPage`; the sheet shell is `view/sheet.js`) | `lib/log.js`, `lib/dom.js` (`el`), `view/sheet.js`, `controller/library-filters.js` (`normalize`, `WINDOW_SIZE`, `searchEntities`), `controller/search-filters.js`, `model/search-filters.js` |
-| `view/image-zoom.js` | `fullSizeUrl()`, `installImageZoom()` | `lib/log.js`, `lib/dom.js` (`el`) |
+| `view/image-zoom.js` | `fullSizeUrl()`, `installImageZoom()` | `lib/log.js`, `lib/dom.js` (`el`), `controller/detail-page.js` (`watchDetail`) |
+| `view/detail-fade.js` | `installDetailFade()` (CSS-only 120ms details backdrop fades) | `lib/log.js` |
 | `view/mobile-theme.js` | `installMobileTheme()` | `lib/log.js`, `model/theme-tokens.js` |
 | `model/theme-tokens.js` | `tierOf()`, `TIERS`, `contrast()`, `DARK`, `LIGHT`, `themeCss()`, `zoomableViewport()` (pure; `theme-tokens.test.mjs`) | none |
 | `view/library-filter-panel.js` | `installLibraryFilterPanel()` (the stock Filter popover: tag tools, extras, a right side pane on desktop / tablet, a bottom sheet on phones) | `lib/log.js`, `lib/dom.js` (`el`), `controller/library-filters.js`, `view/library-filter-groups.js`, `view/library-filter-date.js` |
