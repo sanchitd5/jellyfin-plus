@@ -1261,6 +1261,13 @@ item-level restriction; every library in scope must be one the user can open
 request is answered for the libraries the user can open, never wider than stock. Fail-soft: the first
 failure is logged once, stock serves, and a stale or missing cache requests a background rebuild.
 
+Rebuild concurrency: a library build runs its five read-only aggregates (tags, genres, years, ratings,
+genre entities) at most 4 at a time, each on its own `DbContext`/connection, then assembles the rows in
+the fixed order tags, genres, years, ratings, genre entities. The fingerprint is still taken before the
+aggregates and the write is still one connection and one transaction. Proved row-for-row identical (same
+sequence, same hash) to the serial path on a copy of the real DB. Any error in the concurrent path falls
+back to the serial path (`FilterCacheEngine.AggregateDegree = 1` forces it).
+
 Tag window: postfixes on `Jellyfin.Api.Controllers.FilterController.GetQueryFiltersLegacy` and
 `GetQueryFilters` (`FilterCachePatches.cs`), so they cover the cache-served and the stock path alike.
 Two optional query parameters: `jpTagLimit` (1 to 5000) and `jpTagQuery` (a substring, matched
