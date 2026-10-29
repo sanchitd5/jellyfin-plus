@@ -16,6 +16,7 @@ import { installSearchRecent } from './view/search-recent.js';
 import { installSearchSticky } from './view/search-sticky.js';
 import { installSearchPager } from './view/search-pager.js';
 import { installImageZoom } from './view/image-zoom.js';
+import { installDetailFade } from './view/detail-fade.js';
 import { installPlayAllFix } from './controller/play-all.js';
 import { installCardActions } from './view/card-actions.js';
 import { installPlayerGestures } from './controller/player-gestures.js';
@@ -134,6 +135,7 @@ function feature(name, install) {
         feature('detail actions', installDetailActions);
         // A row per person: their clips in date order, this one in the middle. Reads only.
         feature('detail timeline', installDetailTimeline);
+        feature('detail fade', installDetailFade);
         // Bottom bar (P3): phone and portrait tablet only; reads html classes the modules above set.
         feature('bottom nav', installBottomNav);
         feature('tag autocomplete', installTagAutocomplete);

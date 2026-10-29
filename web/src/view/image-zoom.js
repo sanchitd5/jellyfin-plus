@@ -1,5 +1,6 @@
 import { log } from '../lib/log.js';
 import { el } from '../lib/dom.js';
+import { watchDetail } from '../controller/detail-page.js';
 
 /*
  * TAP-TO-ZOOM ON THE ITEM DETAILS POSTER.
@@ -12,7 +13,10 @@ import { el } from '../lib/dom.js';
  *  - the image URL is read from that element (data-src, else the background-image) - found by
  *    shape in the DOM, never through a global ApiClient - and the sizing parameters cardBuilder
  *    adds (fillWidth/fillHeight/maxWidth/...) are dropped so the server sends the original;
- *  - the thumbnail already on screen shows at once, the full-size image replaces it when loaded;
+ *  - the best image already loaded shows at once: a screen-sized copy (prefetched at idle once
+ *    the poster is on screen, same URL as the later open so it is a cache hit) else the thumbnail;
+ *  - the ORIGINAL is fetched only when the user taps to actual size, decoded, then swapped in with
+ *    the viewport centre kept;
  *  - tap the image to toggle fit-to-screen / actual size (panning by scroll or drag); pinch-zoom
  *    is the browser's own;
  *  - close with the X button, a tap on the dark backdrop, or Escape.
@@ -76,6 +80,81 @@ export function fullSizeUrl(url) {
     }
 }
 
+// Same snapping idea as jellyfin-web's dom.getScreenWidth(): fixed buckets, so the URL repeats.
+var BUCKETS = [480, 720, 1280, 1440, 1920, 2560, 3840];
+
+function screenSizedUrl(url) {
+    try {
+        var long = Math.max(window.screen.width || 0, window.screen.height || 0, 1);
+        var bucket = BUCKETS.find(function (b) { return b >= long; }) || BUCKETS[BUCKETS.length - 1];
+        var px = String(Math.round(bucket * (window.devicePixelRatio || 1)));
+        var u = new URL(fullSizeUrl(url));
+        u.searchParams.set('maxHeight', px);
+        u.searchParams.set('maxWidth', px);
+        u.searchParams.set('quality', '90');
+        return u.toString();
+    } catch (e) {
+        return null;
+    }
+}
+
+// URL -> { done, img, promise }. Image objects are held so a load is not dropped mid-flight.
+var screenLoads = new Map();
+
+function loadImage(url, low) {
+    var existing = screenLoads.get(url);
+    if (existing) {
+        return existing.promise;
+    }
+
+    var entry = { done: false, img: new Image() };
+    entry.promise = new Promise(function (resolve) {
+        entry.img.onload = function () { entry.done = true; resolve(true); };
+        entry.img.onerror = function () { screenLoads.delete(url); resolve(false); };
+    });
+    if (low) {
+        entry.img.fetchPriority = 'low';
+    }
+
+    entry.img.src = url;
+    screenLoads.set(url, entry);
+    return entry.promise;
+}
+
+function slowLink() {
+    var c = navigator.connection;
+    return !!c && (c.saveData || /(^|-)2g$/.test(c.effectiveType || ''));
+}
+
+function whenIdle(fn) {
+    if (typeof window.requestIdleCallback === 'function') {
+        window.requestIdleCallback(fn, { timeout: 3000 });
+    } else {
+        setTimeout(fn, 1000);
+    }
+}
+
+var prefetchVisit = 0;
+
+// The poster is lazy-loaded after the page appears: look a few times, then give up quietly.
+function prefetchScreenSized(tries) {
+    var visit = prefetchVisit;
+    whenIdle(function () {
+        if (visit !== prefetchVisit) {
+            return;
+        }
+
+        var node = document.querySelector(POSTER + HAS_IMAGE);
+        var url = node && imageUrl(node);
+        var sized = url && screenSizedUrl(url);
+        if (sized) {
+            loadImage(sized, true);
+        } else if (tries > 0) {
+            setTimeout(function () { prefetchScreenSized(tries - 1); }, 400);
+        }
+    });
+}
+
 function close() {
     var overlay = document.getElementById(OVERLAY_ID);
     if (overlay) {
@@ -105,7 +184,43 @@ function toggleZoom(overlay, img, e) {
     if (zoomingIn) {
         overlay.scrollLeft = Math.max(0, img.naturalWidth * fx - overlay.clientWidth / 2);
         overlay.scrollTop = Math.max(0, img.naturalHeight * fy - overlay.clientHeight / 2);
+        swapToOriginal(overlay, img);
     }
+}
+
+// Actual size was asked for: only now fetch the original, decode it off-screen, swap it in
+// keeping the same point at the viewport centre. Any failure leaves the current image in place.
+function swapToOriginal(overlay, img) {
+    var full = overlay.__full;
+    if (!full || img.src === full || overlay.__fullPending) {
+        return;
+    }
+
+    overlay.__fullPending = true;
+    var loader = new Image();
+    loader.src = full;
+    var ready = typeof loader.decode === 'function'
+        ? loader.decode()
+        : new Promise(function (res, rej) { loader.onload = res; loader.onerror = rej; });
+    ready.then(function () {
+        overlay.__fullPending = false;
+        if (!img.isConnected) {
+            return;
+        }
+
+        var w = img.clientWidth || 1;
+        var h = img.clientHeight || 1;
+        var cx = (overlay.scrollLeft + overlay.clientWidth / 2) / w;
+        var cy = (overlay.scrollTop + overlay.clientHeight / 2) / h;
+        img.src = full;
+        if (overlay.classList.contains('zoomed')) {
+            overlay.scrollLeft = Math.max(0, img.naturalWidth * cx - overlay.clientWidth / 2);
+            overlay.scrollTop = Math.max(0, img.naturalHeight * cy - overlay.clientHeight / 2);
+        }
+    }, function (err) {
+        overlay.__fullPending = false;
+        log('image zoom: original failed to load', err);
+    });
 }
 
 function open(thumbUrl) {
@@ -118,7 +233,10 @@ function open(thumbUrl) {
 
     var img = el('img');
     img.alt = '';
-    img.src = thumbUrl;
+    // Best already-loaded image first: the screen-sized copy if the idle prefetch finished.
+    var sized = screenSizedUrl(thumbUrl);
+    var sizedEntry = sized && screenLoads.get(sized);
+    img.src = sizedEntry && sizedEntry.done ? sized : thumbUrl;
 
     var closeBtn = el('button', null, 'close');
     closeBtn.type = 'button';
@@ -128,16 +246,15 @@ function open(thumbUrl) {
     overlay.appendChild(closeBtn);
     document.body.appendChild(overlay);
 
-    // Full resolution in the background; swapped in only once it has actually loaded.
+    // Not loaded yet: fetch the screen-sized copy and swap it in. The original waits for zoom-in.
     var full = fullSizeUrl(thumbUrl);
-    if (full !== thumbUrl) {
-        var loader = new Image();
-        loader.onload = function () {
-            if (img.isConnected) {
-                img.src = full;
+    overlay.__full = full !== thumbUrl ? full : null;
+    if (sized && !(sizedEntry && sizedEntry.done)) {
+        loadImage(sized, false).then(function (ok) {
+            if (ok && img.isConnected && img.src !== full) {
+                img.src = sized;
             }
-        };
-        loader.src = full;
+        });
     }
 
     // Drag to pan while zoomed (mouse). Touch pans natively through the scrolling overlay.
@@ -207,6 +324,15 @@ export function installImageZoom() {
         // Leaving the page (back button, link) must not leave the overlay behind.
         window.addEventListener('hashchange', close);
         window.addEventListener('popstate', close);
+        // Screen-sized poster at idle on each details visit; never on a data-saving or 2g link.
+        watchDetail({
+            start: function () {
+                prefetchVisit++;
+                if (!slowLink()) {
+                    prefetchScreenSized(10);
+                }
+            }
+        });
         log('image zoom installed');
     } catch (err) {
         log('image zoom install failed', err);
