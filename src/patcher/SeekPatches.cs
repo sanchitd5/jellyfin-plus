@@ -23,10 +23,11 @@ namespace Jellyfin.Plugin.Plus.Patcher
     ///      WaitForExit return sooner.
     ///
     ///   2. The input modifier carries -analyzeduration 200M -probesize 1G (stock defaults), so the new
-    ///      ffmpeg reads deep into the file before the first frame: 0.6-1 s per seek. When the job starts
-    ///      mid-item on a local file in a container whose header describes its streams (mkv/mp4/webm/mov)
-    ///      and Jellyfin already probed the streams, GetInputModifier's result gets a 3 s / 10 MB probe.
-    ///      Never raised above what was configured. A first play from 0 keeps the stock values.
+    ///      ffmpeg reads deep into the file before the first frame: 0.6-1 s per seek, and the same on a
+    ///      first start. When the job reads a local file in a container whose header describes its
+    ///      streams (mkv/mp4/webm/mov) and Jellyfin already probed the streams, GetInputModifier's
+    ///      result gets a 3 s / 10 MB probe, wherever the job starts. Never raised above what was
+    ///      configured.
     ///
     /// A shorter first segment after a seek was considered and not done: the VOD playlist is a fixed
     /// grid of SegmentLength segments, so a shorter one would break segment numbering.
@@ -71,7 +72,7 @@ namespace Jellyfin.Plugin.Plus.Patcher
             }
 
             logger?.LogInformation(
-                "JellyfinPlus: seek patches: quick stop {Stop}, small probe on mid-item starts {Probe}",
+                "JellyfinPlus: seek patches: quick stop {Stop}, small probe on local starts {Probe}",
                 StopAvailable ? "on" : "unavailable",
                 ProbeAvailable ? "on" : "unavailable");
         }
@@ -138,7 +139,6 @@ namespace Jellyfin.Plugin.Plus.Patcher
         {
             var source = state.MediaSource;
             return state.IsInputVideo
-                   && (state.StartTimeTicks ?? 0) > 0
                    && source != null
                    && source.Protocol == MediaProtocol.File
                    && !source.IsInfiniteStream

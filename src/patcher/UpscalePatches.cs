@@ -204,6 +204,18 @@ namespace Jellyfin.Plugin.Plus.Patcher
                 logger?.LogWarning(ex, "JellyfinPlus: fast seek patches could not be installed; seeks use stock behaviour.");
             }
 
+            // Gzip for HLS variant playlists (multi-MB uncompressed for long items).
+            try
+            {
+                PlaylistGzipPatches.Apply(harmony, logger);
+                (PlaylistGzipPatches.Available ? applied : failed).Add("playlist gzip");
+            }
+            catch (Exception ex)
+            {
+                failed.Add("playlist gzip");
+                logger?.LogWarning(ex, "JellyfinPlus: playlist gzip could not be installed; playlists go out uncompressed.");
+            }
+
             // Tag search: SqlSearchProvider.SearchAsync also matches item tags. Own try/catch, and
             // ahead of the MediaInfoHelper block for the same early-return reason as the swap.
             try
