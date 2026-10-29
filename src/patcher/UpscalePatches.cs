@@ -404,25 +404,6 @@ namespace Jellyfin.Plugin.Plus.Patcher
                 logger?.LogWarning(ex, "JellyfinPlus: the scaled image decode patch could not be installed. Images are decoded at full size, as stock.");
             }
 
-            // Card image pre-render: records the shapes of grid-sized image requests (no behaviour change). Own try/catch.
-            try
-            {
-                CardPrerender.Apply(harmony, logger);
-                if (CardPrerender.Available)
-                {
-                    applied.Add("card image shapes");
-                }
-                else
-                {
-                    failed.Add("card image shapes (no pre-rendering)");
-                }
-            }
-            catch (Exception ex)
-            {
-                failed.Add("card image shapes (no pre-rendering)");
-                logger?.LogWarning(ex, "JellyfinPlus: the card image shape patch could not be installed. Image requests are unaffected.");
-            }
-
             // MediaInfoHelper lives in Jellyfin.Api, a different assembly from the core targets, and
             // is resolved BY NAME so that the patcher does not need a compile-time reference to a
             // web-API assembly it would then be version-pinned to.

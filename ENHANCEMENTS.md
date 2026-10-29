@@ -84,7 +84,6 @@ setting, a control in the page, or "remove the plugin or script".
 | Tag management (config page) | Server route + config page | Dashboard, Plugins, Jellyfin Plus: list tags with item counts, rename, merge, delete across items, with a dry run first | Administrators only; nothing is written without Apply (section 6) |
 | Folder covers link instead of copy | Server patch + scheduled tasks | A folder's generated cover is a symlink to the child image it shows, not a 2-3 MB copy of it in `metadata/library`; two tasks convert existing copies ("Jellyfin Plus: link folder images instead of copies", and a "(dry run)" that only counts) | On, no switch; falls back to the stock copy (section 7.9) |
 | Faster resize of large JPEGs | Server patch | Cold image resizes decode a big JPEG source at 1/2, 1/4 or 1/8 scale when the output is at least 2x smaller; same output size | On, no switch; falls back to the stock full decode, and switches itself off if an output size is ever wrong (section 7.10) |
-| Card image pre-render | Server patch + plugin services + scheduled task | Grid-card images are resized into Jellyfin's cache ahead of the first visit, at the sizes your browsers actually requested; the first screenful of a view is a cache hit | On, no switch; nothing runs until a card size has been requested 3 times. Starts in the background after each library scan; also the task "Jellyfin Plus: pre-render card images". Falls back to stock lazy resizing (section 7.11) |
 | Maintenance task buttons (config page) | Config page | Start "Scan people" and "Optimize database" from the plugin page | Administrators only; stock endpoints (section 6) |
 | Preference sync across devices | Client | Enhance panel choices and search paging choices follow the viewer to other browsers | On, no switch; falls back to localStorage alone if jellyfin-web's settings object is not found (section 6) |
 
@@ -1444,44 +1443,6 @@ cache, so it shows decode CPU only): maxWidth 720 52 -> 42 ms, width 400 31 -> 1
 31 -> 20 ms, fillWidth 720 62 -> 53 ms; maxWidth 1800 and 3780 unchanged. Output dimensions identical in
 every case. Not exercised: the live server, FUSE-backed sources, EXIF-rotated sources.
 
-### 7.11 Card image pre-render: `ImageProcessor.ProcessImage` (`CardPrerender.cs` in the patcher, `CardPrerender.cs` in the plugin)
-
-Stock resizes a card image when the card scrolls into view: a cold resize is about 0.1-0.25 s, a warm one
-(a file in `resized-images/`, named by an MD5 of the processing options) about 1 ms, so a first screenful of
-~30 cards over 6 connections arrives about a second late. This feature makes the first visit a warm one. It does
-not make any resize faster.
-
-- **Record.** A prefix on `Jellyfin.Drawing.ImageProcessor.ProcessImage(ImageProcessingOptions)` (installed in
-  `ApplyOptional`, own try/catch, name `card image shapes`) notes the *shape* of grid-sized requests: image
-  type (Primary, Thumb, Backdrop), image index, `width`/`height`/`maxWidth`/`maxHeight`/`fillWidth`/`fillHeight`,
-  quality, the output format list the `Accept` header produced, blur, background colour, foreground layer.
-  Kept only when at least one size is given and none exceeds 1000 px. Requests with a played percentage or an
-  unplayed count are per-item values and are not recorded. No item, path or user is stored. The request path does
-  one lock-free counter increment; a timer thread adds the counts to `JellyfinPlus_ImageSizes` every minute
-  (at most 512 distinct shapes). Any exception: logged once, request unaffected.
-- **Render.** The task takes shapes with at least 3 recorded requests, the 4 most requested per image type, and
-  for every item that has that image locally calls `IImageProcessor.ProcessImage` - the same method the
-  controller calls - with options built the way `ImageController` builds them. The cache file name is computed
-  inside `ProcessImage` from those options, so the entry written is the one a real request looks up, with no
-  second copy of the key function. An entry already present is a `File.Exists` hit inside `ProcessImage`. Items
-  whose image is not a local file are skipped (stock would download it). Two threads at `BelowNormal` priority
-  that wait up to ~1 s per item while a viewer is requesting images. Cancellable; progress reported; a summary
-  (`Rendered`, `Cached`, `Passthrough` = stock serves the original, `Failed`, `Ms`) is logged.
-- **Triggers.** `ILibraryPostScanTask` starts a background run and returns at once (a first run takes minutes to
-  an hour and must not hold the scan open); a second run while one is going is refused. Manual: the scheduled task
-  "Jellyfin Plus: pre-render card images" (Library category, no default trigger).
-- **Fail soft.** If `ProcessImage` cannot be resolved nothing is recorded and the task has no shapes to render.
-  The task uses only public stock API; deleting `resized-images/` or the table is always safe.
-- **Staleness.** The cache key contains the source path and the image's modified time, so a replaced image gets a
-  new entry on the next run. Old entries are never pruned by this feature (stock does not either).
-
-Harness (outside the repo): real 12.3 `ImageProcessor` with a fake encoder, the real prefix. Requests built as the
-controller builds them were recorded (4 card shapes recorded, a 1920 px backdrop and per-item requests ignored);
-options rebuilt from the recorded shapes landed on the same cache path as the stock request in both orders
-(stock first, then pre-render: no new encode; pre-render first, then stock: no new encode), and a different
-quality or `Accept` format list correctly missed. Not exercised: the live server, the real database flush and
-read (SQL checked in `sqlite3` only), thread-priority effect, the real task run.
-
 ## 8. Plugin HTTP routes
 
 All under the Jellyfin API root. "Administrator" is the `RequiresElevation` policy.
@@ -1605,7 +1566,6 @@ only, by Clip Up Next).
 |---|---|---|
 | Filter key cache | Two tables in Jellyfin's `jellyfin.db`: `JellyfinPlus_FilterKeys(LibraryId, Kind, ItemType, CleanValue, Value, ItemCount, RefId)` and `JellyfinPlus_FilterKeysMeta(LibraryId, Kind, BuiltAtUtc, SourceItemCount, KeyCount, Fingerprint)`. Created with `CREATE TABLE IF NOT EXISTS` by raw SQL; Jellyfin's own schema and migrations are never touched. One row per distinct key per library per item type. Kinds: tags, genres, years, ratings, genre entities. | Rebuild: `POST /JellyfinPlus/FilterCache/Rebuild` or the scheduled task. A forced rebuild deletes and rewrites each library's rows in one transaction, so readers see old or new rows, never a mix. Rows of libraries that no longer exist are removed on each rebuild. Nothing in the plugin drops the tables, including on uninstall. To remove them, stop Jellyfin, back up `jellyfin.db`, and drop both tables by hand (not exercised here; the engine recreates them on its next run). |
 | Search index | Three objects in `jellyfin.db`: virtual tables `JellyfinPlus_FtsNames`, `JellyfinPlus_FtsTags` (FTS5, trigram) and `JellyfinPlus_FtsMeta(Key, Value)`, holding the signature the index was built at. Created with `IF NOT EXISTS`; Jellyfin's schema is untouched. About 45 MB on an 80k-item library. | Rebuild: `POST /JellyfinPlus/FtsIndex/Rebuild` or the scheduled task. Safe to drop by hand with Jellyfin stopped (search falls back to the stock queries; the engine recreates and rebuilds it). The plugin drops nothing on uninstall; the only drop is the one-time rebuild of a `JellyfinPlus_FtsNames` that predates its `SortName` column (7.6). |
-| Card image shapes | One table in `jellyfin.db`: `JellyfinPlus_ImageSizes(ShapeKey, ImageType, ImageIndex, Width, Height, MaxWidth, MaxHeight, FillWidth, FillHeight, Quality, Formats, Blur, BackgroundColor, ForegroundLayer, Hits, LastSeenUtc)`, at most 512 rows, no item or user data. Created with `CREATE TABLE IF NOT EXISTS`. The rendered images are ordinary entries in Jellyfin's `resized-images` cache. | Safe to delete the rows or drop the table with Jellyfin stopped (shapes are re-learned; the task does nothing until a shape has 3 hits). The cache files can be deleted any time; they are re-made lazily or by the task. The plugin drops nothing on uninstall. |
 | Synced preferences | The viewer's own `DisplayPreferences` (display preferences id `usersettings`, client `emby`), as three `CustomPrefs` entries: `jellyfinPlus.prefs`, `jellyfinPlus.searchPageSize`, `jellyfinPlus.searchPaging`, each `{"t": ms, "v": value}`. Written through jellyfin-web's `userSettings.set`, so Jellyfin stores them in its `CustomItemDisplayPreferences` table (key length limit 64; ours are 27 or fewer). | Delete the entries by saving display preferences without them, or ignore them: nothing on the server reads them. Removing the plugin leaves them as inert strings. |
 | Plugin settings | XML at `plugins/configurations/Jellyfin.Plugin.Plus.xml` under Jellyfin's data directory (`/var/lib/jellyfin/plugins/configurations/` in the install scripts). On first start the constructor copies `Jellyfin.Plugin.GpuUpscale.xml` over if the new file is absent. | Edit on the dashboard page; changes are pushed to the patches live. Delete the file with Jellyfin stopped to return to the defaults in section 1. |
 | Shader cache | `ShaderCacheDirectory`, default `/var/cache/jellyfin/jellyfin-plus-shaders`: composed shader files named `<level>+<level>.glsl`, and a `plcache/` subdirectory where libplacebo keeps its compiled-shader scratch files. A composed file is rewritten if any input shader is newer. | Safe to delete the contents; composed files are rebuilt on demand and libplacebo recompiles, so the first sessions afterwards start slower (inferred from the code, not timed). |

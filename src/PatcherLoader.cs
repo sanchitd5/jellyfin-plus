@@ -179,62 +179,6 @@ namespace Jellyfin.Plugin.Plus
             }
         }
 
-        // ---- Card image pre-render. Degrades to "nothing to do" when the patcher is absent or older.
-
-        public static void CardPrerenderStart(IServiceProvider services, ILogger logger)
-        {
-            try
-            {
-                _host?.GetMethod("CardPrerenderStart")?.Invoke(null, new object[] { services, logger });
-            }
-            catch (Exception ex)
-            {
-                _logger?.LogWarning(ex, "JellyfinPlus: starting card image pre-render failed; image requests are unaffected.");
-            }
-        }
-
-        public static void CardPrerenderStop()
-        {
-            try
-            {
-                _host?.GetMethod("CardPrerenderStop")?.Invoke(null, null);
-            }
-            catch (Exception)
-            {
-                // shutting down
-            }
-        }
-
-        public static bool CardPrerenderStartBackground()
-        {
-            try
-            {
-                return _host?.GetMethod("CardPrerenderStartBackground")?.Invoke(null, null) is true;
-            }
-            catch (Exception)
-            {
-                return false;
-            }
-        }
-
-        public static Task<string> CardPrerenderRun(IProgress<double> progress, CancellationToken cancellationToken)
-        {
-            MethodInfo method = _host?.GetMethod("CardPrerenderRun");
-            if (method == null)
-            {
-                return Task.FromException<string>(new InvalidOperationException("Jellyfin Plus: the patcher is not loaded, so card images cannot be pre-rendered."));
-            }
-
-            try
-            {
-                return (Task<string>)method.Invoke(null, new object[] { progress, cancellationToken });
-            }
-            catch (TargetInvocationException ex)
-            {
-                return Task.FromException<string>(ex.InnerException ?? ex);
-            }
-        }
-
         public static Task FilterCacheRebuild(bool force, IProgress<double> progress, CancellationToken cancellationToken)
         {
             MethodInfo method = _host?.GetMethod("FilterCacheRebuild");
