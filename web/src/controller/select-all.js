@@ -36,6 +36,8 @@ import {
 
 var STYLE_ID = 'jellyfinPlusSelectAllStyle';
 var BANNER_CLASS = 'jpSelAll';
+// Id pages asked for at once while collecting (merged in page order).
+var PAGES_IN_FLIGHT = 3;
 
 var CSS = [
     '.selectionCommandsPanel .' + BANNER_CLASS + ' {'
@@ -230,19 +232,35 @@ export function startSelectAll(offer) {
 
     say('Collecting results: 0 of ' + countText(total) + '…', 'info', { label: 'Cancel', run: cancel });
 
-    var i = 0;
+    // Up to PAGES_IN_FLIGHT pages are asked for at once; their results are merged strictly in page
+    // order, so the ids, the dedupe and the "an empty page is the end" rule behave as with one at a time.
+    // Nothing new is launched once an empty page has been merged; pages already in flight are dropped.
+    var launched = 0;
+    var pending = [];
+    var ended = false;
+    function noop() { /* a dropped page's failure is nobody's */ }
+    function launch() {
+        var url = idsPageUrl(offer.url, starts[launched], PAGE);
+        launched++;
+        var p = Promise.resolve(client.ajax({ type: 'GET', url: url, dataType: 'json' }));
+        p.catch(noop);
+        pending.push(p);
+    }
+
     function next() {
         if (ext !== mine) {
             return Promise.resolve();
         }
 
-        if (i >= starts.length) {
+        while (!ended && pending.length < PAGES_IN_FLIGHT && launched < starts.length) {
+            launch();
+        }
+
+        if (!pending.length) {
             return Promise.resolve();
         }
 
-        var url = idsPageUrl(offer.url, starts[i], PAGE);
-        i++;
-        return Promise.resolve(client.ajax({ type: 'GET', url: url, dataType: 'json' })).then(function (body) {
+        return pending.shift().then(function (body) {
             if (ext !== mine) {
                 return undefined;
             }
@@ -258,7 +276,12 @@ export function startSelectAll(offer) {
             say('Collecting results: ' + countText(mine.ids.length) + ' of ' + countText(total) + '…', 'info',
                 { label: 'Cancel', run: cancel });
             // An empty page is the end of the list, whatever the count said.
-            return list.length ? next() : undefined;
+            if (!list.length) {
+                ended = true;
+                return undefined;
+            }
+
+            return next();
         });
     }
 

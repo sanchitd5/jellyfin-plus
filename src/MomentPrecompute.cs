@@ -14,6 +14,7 @@ using System.Threading.Tasks;
 using Jellyfin.Data.Enums;
 using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Library;
+using MediaBrowser.Controller.Session;
 using MediaBrowser.Model.Tasks;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -451,9 +452,24 @@ namespace Jellyfin.Plugin.Plus
         private readonly MomentPrecompute _precompute;
         private readonly MomentSheets _sheets;
         private readonly ILogger<MomentPrecomputeTask> _logger;
+        private readonly ISessionManager _sessions;
 
-        public MomentPrecomputeTask(ILibraryManager library, MomentPrecompute precompute, MomentSheets sheets, ILogger<MomentPrecomputeTask> logger)
+        /// <summary>Whether anyone is transcoding or playing; true when it cannot be told (stay at one).</summary>
+        private bool ViewerActive()
         {
+            try
+            {
+                return _sessions.Sessions.Any(s => s.TranscodingInfo != null || s.NowPlayingItem != null);
+            }
+            catch (Exception)
+            {
+                return true;
+            }
+        }
+
+        public MomentPrecomputeTask(ILibraryManager library, MomentPrecompute precompute, MomentSheets sheets, ISessionManager sessions, ILogger<MomentPrecomputeTask> logger)
+        {
+            _sessions = sessions;
             _library = library;
             _precompute = precompute;
             _sheets = sheets;
@@ -494,18 +510,51 @@ namespace Jellyfin.Plugin.Plus
             var total = ids.Count;
             try
             {
-                for (var i = 0; i < total; i++)
+                // Worker 1 always runs. Worker 2 takes an item only while nobody is transcoding or playing
+                // (checked before every item) and otherwise waits, so it is back to one the moment a viewer
+                // appears. The ffmpeg lane is unchanged (MomentSheets.BackgroundGate admits one at a time):
+                // the second worker overlaps the provider and library work of the items that need no ffmpeg.
+                var next = -1;
+                async Task WorkerAsync(bool second)
                 {
-                    cancellationToken.ThrowIfCancellationRequested();
-                    var outcome = _library.GetItemById(ids[i]) is Video v
-                        ? await _precompute.ProcessAsync(v, TimeSpan.Zero, cancellationToken).ConfigureAwait(false)
-                        : MomentPrecompute.Outcome.Skipped;
-                    counts[outcome] = counts.TryGetValue(outcome, out var c) ? c + 1 : 1;
-                    if (i % 50 == 0)
+                    while (true)
                     {
-                        progress.Report(99.0 * i / Math.Max(1, total));
+                        cancellationToken.ThrowIfCancellationRequested();
+                        if (second)
+                        {
+                            while (ViewerActive())
+                            {
+                                if (Volatile.Read(ref next) + 1 >= total)
+                                {
+                                    return;
+                                }
+
+                                await Task.Delay(TimeSpan.FromSeconds(5), cancellationToken).ConfigureAwait(false);
+                            }
+                        }
+
+                        var i = Interlocked.Increment(ref next);
+                        if (i >= total)
+                        {
+                            return;
+                        }
+
+                        var outcome = _library.GetItemById(ids[i]) is Video v
+                            ? await _precompute.ProcessAsync(v, TimeSpan.Zero, cancellationToken).ConfigureAwait(false)
+                            : MomentPrecompute.Outcome.Skipped;
+                        lock (counts)
+                        {
+                            counts[outcome] = counts.TryGetValue(outcome, out var c) ? c + 1 : 1;
+                        }
+
+                        if (i % 50 == 0)
+                        {
+                            progress.Report(99.0 * i / Math.Max(1, total));
+                        }
                     }
                 }
+
+                await Task.WhenAll(WorkerAsync(false), WorkerAsync(true)).ConfigureAwait(false);
 
                 var pruned = _precompute.PruneRemoved(id => _library.GetItemById(id) != null);
                 var store = _sheets.Housekeep();

@@ -737,7 +737,8 @@ on TV layouts.
 QOL_IDEAS #42; administrators only, because the only thing that reads it is the bulk tag flow). Stock
 "Select all" ticks the cards that are drawn. With cards ticked, the selection menu gains "Select all N
 results" under it when N is more than what is ticked. Choosing it re-asks the list's own query, page by
-page (200 at a time), for ids only and holds them; a banner under the selection bar reads "All N
+page (200 at a time, up to 3 pages in flight, merged in page order; nothing new is launched once an empty
+page is merged), for ids only and holds them; a banner under the selection bar reads "All N
 results selected for Add tags / Remove tags" with Clear. "Add tags" / "Remove tags" then run over all N
 (dialog note "All N results of this list") instead of the ticked cards, through the same careful
 per-item flow as section 6.
@@ -925,7 +926,11 @@ position slider. Full contract for app authors: [docs/architecture/TIMELINE_MARK
   bounded (2000), de-duplicated one-worker queue fed by `ItemAdded`/`ItemUpdated`, each item 2 minutes
   after it arrived. Check index `precompute-index.json` (file key path+size+mtime, checked-at,
   result): re-asked when the file changed, after 14 days, or every run while the item is under 2 days
-  old; provider failures record nothing. Off: on demand + client prewarm only.
+  old; provider failures record nothing. Off: on demand + client prewarm only. The nightly task runs a
+  second worker only while no session is transcoding or playing (checked before every item; it waits and
+  the task is back to one worker when a viewer appears; unknown session state counts as a viewer). The
+  ffmpeg lane is untouched (one idle-priority process at a time), so the second worker only overlaps
+  provider and library work of items that need no ffmpeg. The event queue stays one worker.
 - *Storage: kept forever.* Jellyfin's **data** path, `jellyfin-plus-moments/{itemId}/{key}/` and
   `strips/` (not the cache path, which Jellyfin's *Clean Cache Directory* task empties by age; the
   first version's cache-path store is removed by the nightly run). Key: format version + item + file
