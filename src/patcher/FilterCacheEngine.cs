@@ -472,7 +472,7 @@ namespace Jellyfin.Plugin.Plus.Patcher
 
         // ---------------------------------------------------------------- rebuild
 
-        private readonly record struct KeyRow(Kind Kind, string ItemType, string Clean, string Value, int Count, string RefId);
+        internal readonly record struct KeyRow(Kind Kind, string ItemType, string Clean, string Value, int Count, string RefId);
 
         /// <summary>
         /// Rebuilds the libraries whose fingerprint no longer matches what was cached (all of them when
@@ -565,51 +565,7 @@ namespace Jellyfin.Plugin.Plus.Patcher
             }
 
             var started = DateTime.UtcNow;
-            var items = _translate(db.BaseItems.AsNoTracking(), db, new InternalItemsQuery { TopParentIds = new[] { lib } });
-            var rows = new List<KeyRow>();
-
-            // One set-based aggregate per kind. Projected before grouping (see GetTagNames in stock: grouping
-            // over the ItemValue navigation makes EF resolve the aggregate per group, orders of magnitude slower).
-            ItemValuesRows(db, items, ItemValueType.Tags, Kind.Tag, rows);
-            var genreStart = rows.Count;
-            ItemValuesRows(db, items, ItemValueType.Genre, Kind.Genre, rows);
-
-            foreach (var g in items
-                .Where(e => e.ProductionYear != null && e.ProductionYear > 0)
-                .GroupBy(e => new { e.Type, e.ProductionYear })
-                .Select(g => new { g.Key.Type, g.Key.ProductionYear, N = g.Count() })
-                .ToList())
-            {
-                var y = g.ProductionYear.Value.ToString(CultureInfo.InvariantCulture);
-                rows.Add(new KeyRow(Kind.Year, g.Type, y, y, g.N, null));
-            }
-
-            foreach (var g in items
-                .Where(e => e.OfficialRating != null && e.OfficialRating != string.Empty)
-                .GroupBy(e => new { e.Type, e.OfficialRating })
-                .Select(g => new { g.Key.Type, g.Key.OfficialRating, N = g.Count() })
-                .ToList())
-            {
-                rows.Add(new KeyRow(Kind.Rating, g.Type, g.OfficialRating, g.OfficialRating, g.N, null));
-            }
-
-            // The Genre entity behind each genre value (Id + name), which /Items/Filters2 returns. Only values
-            // with an entity are listed, as stock does (it lists Genre items that have an item behind them).
-            var genreType = _lookup.BaseItemKindNames[BaseItemKind.Genre];
-            var entities = db.BaseItems
-                .AsNoTracking()
-                .Where(e => e.Type == genreType && e.CleanName != null)
-                .Select(e => new { e.Id, e.CleanName, e.Name })
-                .ToList()
-                .GroupBy(e => e.CleanName)
-                .ToDictionary(g => g.Key, g => g.OrderBy(x => x.Id).First());
-            for (var i = genreStart; i < rows.Count && rows[i].Kind == Kind.Genre; i++)
-            {
-                if (entities.TryGetValue(rows[i].Clean, out var ent))
-                {
-                    rows.Add(new KeyRow(Kind.GenreEntity, rows[i].ItemType, rows[i].Clean, ent.Name ?? rows[i].Value, rows[i].Count, Id(ent.Id)));
-                }
-            }
+            var rows = ComputeRows(lib, db);
 
             var sourceCount = int.Parse(libFp.Split('|')[0], CultureInfo.InvariantCulture);
             WriteLibrary(conn, lib, rows, sourceCount, libFp, genreFp);
@@ -621,6 +577,139 @@ namespace Jellyfin.Plugin.Plus.Patcher
                 rows.Count,
                 sourceCount);
             return true;
+        }
+
+        /// <summary>
+        /// Concurrent aggregates per library build. 4 is a ceiling, not a target: the five aggregates are read-only,
+        /// each runs on its own DbContext (so its own SQLite connection under WAL), and the build is a background job
+        /// that must not take every connection. 1 forces the serial path (harness, and the fallback below).
+        /// </summary>
+        internal static int AggregateDegree = 4;
+
+        /// <summary>
+        /// The key rows for one library, in the one order WriteLibrary and every reader depend on:
+        /// Tag, Genre, Year, Rating, then GenreEntity (derived from the Genre rows). The concurrent path returns
+        /// exactly what <see cref="ComputeRowsSerial"/> returns; any error in it falls back to the serial path.
+        /// </summary>
+        private static List<KeyRow> ComputeRows(Guid lib, JellyfinDbContext db)
+        {
+            if (AggregateDegree > 1)
+            {
+                try
+                {
+                    return ComputeRowsParallel(lib);
+                }
+                catch (Exception ex)
+                {
+                    _log?.LogDebug(ex, "JellyfinPlus: filter key cache: concurrent aggregates failed, running them one after another");
+                }
+            }
+
+            var items = _translate(db.BaseItems.AsNoTracking(), db, new InternalItemsQuery { TopParentIds = new[] { lib } });
+            return ComputeRowsSerial(db, items);
+        }
+
+        internal static List<KeyRow> ComputeRowsParallel(Guid lib)
+        {
+            List<KeyRow> tags = new(), genres = new(), years = new(), ratings = new();
+            Dictionary<string, (Guid Id, string Name)> entities = null;
+
+            // Each aggregate gets its own context and its own translated query: a DbContext is not thread-safe.
+            void Run(Action<JellyfinDbContext, IQueryable<BaseItemEntity>> work)
+            {
+                using var d = _factory.CreateDbContext();
+                work(d, _translate(d.BaseItems.AsNoTracking(), d, new InternalItemsQuery { TopParentIds = new[] { lib } }));
+            }
+
+            Parallel.Invoke(
+                new ParallelOptions { MaxDegreeOfParallelism = Math.Min(4, AggregateDegree) },
+                () => Run((d, it) => ItemValuesRows(d, it, ItemValueType.Tags, Kind.Tag, tags)),
+                () => Run((d, it) => ItemValuesRows(d, it, ItemValueType.Genre, Kind.Genre, genres)),
+                () => Run((d, it) => YearRows(it, years)),
+                () => Run((d, it) => RatingRows(it, ratings)),
+                () =>
+                {
+                    using var d = _factory.CreateDbContext();
+                    entities = GenreEntities(d);
+                });
+
+            var rows = new List<KeyRow>(tags.Count + genres.Count * 2 + years.Count + ratings.Count);
+            rows.AddRange(tags);
+            rows.AddRange(genres);
+            rows.AddRange(years);
+            rows.AddRange(ratings);
+            AddGenreEntityRows(rows, genres, entities);
+            return rows;
+        }
+
+        internal static List<KeyRow> ComputeRowsSerial(JellyfinDbContext db, IQueryable<BaseItemEntity> items)
+        {
+            List<KeyRow> tags = new(), genres = new(), years = new(), ratings = new();
+
+            // One set-based aggregate per kind. Projected before grouping (see GetTagNames in stock: grouping
+            // over the ItemValue navigation makes EF resolve the aggregate per group, orders of magnitude slower).
+            ItemValuesRows(db, items, ItemValueType.Tags, Kind.Tag, tags);
+            ItemValuesRows(db, items, ItemValueType.Genre, Kind.Genre, genres);
+            YearRows(items, years);
+            RatingRows(items, ratings);
+            var entities = GenreEntities(db);
+
+            var rows = new List<KeyRow>(tags);
+            rows.AddRange(genres);
+            rows.AddRange(years);
+            rows.AddRange(ratings);
+            AddGenreEntityRows(rows, genres, entities);
+            return rows;
+        }
+
+        private static void YearRows(IQueryable<BaseItemEntity> items, List<KeyRow> rows)
+        {
+            foreach (var g in items
+                .Where(e => e.ProductionYear != null && e.ProductionYear > 0)
+                .GroupBy(e => new { e.Type, e.ProductionYear })
+                .Select(g => new { g.Key.Type, g.Key.ProductionYear, N = g.Count() })
+                .ToList())
+            {
+                var y = g.ProductionYear.Value.ToString(CultureInfo.InvariantCulture);
+                rows.Add(new KeyRow(Kind.Year, g.Type, y, y, g.N, null));
+            }
+        }
+
+        private static void RatingRows(IQueryable<BaseItemEntity> items, List<KeyRow> rows)
+        {
+            foreach (var g in items
+                .Where(e => e.OfficialRating != null && e.OfficialRating != string.Empty)
+                .GroupBy(e => new { e.Type, e.OfficialRating })
+                .Select(g => new { g.Key.Type, g.Key.OfficialRating, N = g.Count() })
+                .ToList())
+            {
+                rows.Add(new KeyRow(Kind.Rating, g.Type, g.OfficialRating, g.OfficialRating, g.N, null));
+            }
+        }
+
+        /// <summary>The Genre entity behind each genre value (Id + name), keyed by clean name; the lowest Id wins a tie.</summary>
+        private static Dictionary<string, (Guid Id, string Name)> GenreEntities(JellyfinDbContext db)
+        {
+            var genreType = _lookup.BaseItemKindNames[BaseItemKind.Genre];
+            return db.BaseItems
+                .AsNoTracking()
+                .Where(e => e.Type == genreType && e.CleanName != null)
+                .Select(e => new { e.Id, e.CleanName, e.Name })
+                .ToList()
+                .GroupBy(e => e.CleanName)
+                .ToDictionary(g => g.Key, g => { var f = g.OrderBy(x => x.Id).First(); return (f.Id, f.Name); });
+        }
+
+        /// <summary>Which genre values have an entity is what /Items/Filters2 lists, as stock does.</summary>
+        private static void AddGenreEntityRows(List<KeyRow> rows, List<KeyRow> genres, Dictionary<string, (Guid Id, string Name)> entities)
+        {
+            foreach (var gr in genres)
+            {
+                if (entities.TryGetValue(gr.Clean, out var ent))
+                {
+                    rows.Add(new KeyRow(Kind.GenreEntity, gr.ItemType, gr.Clean, ent.Name ?? gr.Value, gr.Count, Id(ent.Id)));
+                }
+            }
         }
 
         private static void ItemValuesRows(JellyfinDbContext db, IQueryable<BaseItemEntity> items, ItemValueType type, Kind kind, List<KeyRow> rows)
