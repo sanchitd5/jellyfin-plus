@@ -57,7 +57,8 @@ function getWarmer() {
             var tok = c && typeof c.accessToken === 'function' ? c.accessToken() : '';
             var headers = { 'Content-Type': 'application/json' };
             if (tok) {
-                headers['X-Emby-Token'] = tok;
+                // Not X-Emby-Token: legacy auth headers are off by default (EnableLegacyAuthorization).
+                headers.Authorization = 'MediaBrowser Token="' + tok + '"';
             }
             return fetch(c && typeof c.getUrl === 'function' ? c.getUrl(WARM_PATH.slice(1)) : WARM_PATH, {
                 method: 'POST',
