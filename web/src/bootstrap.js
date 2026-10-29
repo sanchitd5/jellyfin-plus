@@ -47,6 +47,7 @@ import { installSelectAll } from './controller/select-all.js';
 import { installSelectMode } from './controller/select-mode.js';
 import { installPrefsSync } from './controller/prefs-sync.js';
 import { installImagePreload } from './controller/image-preload.js';
+import { installLinkProbe } from './controller/link-probe.js';
 import { installListRequests } from './controller/list-requests.js';
 import { installListSort } from './controller/list-sort.js';
 import { installThemeFallback } from './controller/theme-fallback.js';
@@ -79,6 +80,7 @@ function feature(name, install) {
         feature('brand', installBrand);
         // Before hookWebpack: it arms noteLazyLoader(), which the module wrapper calls as chunks evaluate.
         feature('image preload', installImagePreload);
+        feature('link probe', installLinkProbe);
         feature('theme fallback', installThemeFallback);
         hookWebpack();
         // Innermost on purpose: it must judge a search url AFTER network.js's markings have rewritten it.

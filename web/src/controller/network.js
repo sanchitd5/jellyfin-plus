@@ -7,6 +7,8 @@ import { markSearchFilters } from './search-filters.js';
 import { markSearchPaging, watchPagedXhr, watchPagedFetch } from './search-pager.js';
 import { suggestVideoUrl } from '../model/search-suggest.js';
 import { log } from '../lib/log.js';
+import { linkProfile } from './link-probe.js';
+import { slowBody, slowUrl } from '../model/link-profile.js';
 
 /* The search page's own markings, in order: the exclude box, Sort & filter, then paging (last, so
  * it can see which queries the filters cut down to a discarded one-item request). All of them
@@ -38,6 +40,20 @@ function markSuggestions(url) {
  */
 export function wireParams() {
     log('wireParams: start');
+    // Slow link (link-probe.js): every axis off, sent explicitly, whatever the panel holds - a
+    // missing axis makes the server fall back to its dashboard default and enhance anyway, and
+    // on a seek Jellyfin rebuilds the command from the segment request, so it must carry them too.
+    if (linkProfile().slow) {
+        var off = {};
+        ['upscale', 'deblur', 'denoise', 'sr', 'deblock', 'neural', 'game'].forEach(function (k) { off[k] = 'off'; });
+        if (state.swapFrom) {
+            off.swapfrom = state.swapFrom;
+        }
+
+        log('wireParams: end, slow link, all off');
+        return off;
+    }
+
     var e = effective();
     if (!e) {
         log('wireParams: end, effective() gave nothing, returning null');
@@ -306,7 +322,21 @@ function rewriteBody(bodyText) {
  * This is only done when the viewer actually asked for enhancement - otherwise direct play is
  * left alone, because forcing a transcode nobody asked for would burn GPU for nothing.
  */
+/* Rewrite PlaybackInfo when the viewer asked for enhancement OR the link is slow. */
+function wantsRewrite() {
+    return anyEnhancement() || linkProfile().slow;
+}
+
 function forceTranscodeUrl(url) {
+    var link = linkProfile();
+    if (url && link.slow) {
+        // Slow link: no direct play and a bitrate cap; no forced transcode for enhancement,
+        // since enhancement is off on this link (wireParams).
+        var slow = slowUrl(url, link.kbps);
+        log('forceTranscodeUrl: slow link, ' + url + ' -> ' + slow);
+        return slow;
+    }
+
     if (!url || !anyEnhancement()) {
         log('forceTranscodeUrl: start/end, nothing to do (no url or nothing enhancing)');
         return url;
@@ -327,6 +357,13 @@ function forceTranscodeUrl(url) {
 }
 
 function forceTranscodeBody(bodyText) {
+    var link = linkProfile();
+    if (link.slow) {
+        var slow = slowBody(bodyText, link.kbps);
+        log('forceTranscodeBody: slow link, body ' + (slow ? 'rewritten (no direct play, cap ' + link.kbps + ' kbps)' : 'unchanged'));
+        return slow;
+    }
+
     if (!anyEnhancement()) {
         return null;
     }
@@ -428,7 +465,7 @@ export function hookFetch() {
             }
         }
 
-        if (url && IS_PLAYBACK_INFO.test(url) && anyEnhancement()) {
+        if (url && IS_PLAYBACK_INFO.test(url) && wantsRewrite()) {
             log('hookFetch: matched PlaybackInfo request, forcing a transcode - ' + url);
             try {
                 var newUrl = forceTranscodeUrl(url);
@@ -556,7 +593,7 @@ export function hookXhr() {
                 }
             }
 
-            if (url && IS_PLAYBACK_INFO.test(url) && anyEnhancement()) {
+            if (url && IS_PLAYBACK_INFO.test(url) && wantsRewrite()) {
                 log('hookXhr.open: matched PlaybackInfo request - ' + url);
                 var forced = forceTranscodeUrl(url);
                 if (forced !== url) {
