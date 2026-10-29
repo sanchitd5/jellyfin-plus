@@ -1,7 +1,7 @@
 import { state } from '../model/state.js';
 import { log } from '../lib/log.js';
 import { player, activePlayer } from './live-apply.js';
-import { timelineMarkers, seekTarget, stripTimes, pickTrickplay, stockTile, momentTile, stripManifest, warmMarkers } from '../model/timeline-markers.js';
+import { timelineMarkers, seekTarget, stripTimes, pickTrickplay, stockTile, momentTile, stripManifest, warmMarkers, crossedMarkers, toastKinds, TOAST_PREF_KEY } from '../model/timeline-markers.js';
 
 /*
  * TIMELINE MARKERS ON THE PLAYER'S SEEK BAR. External services configured on the server
@@ -70,8 +70,77 @@ var CSS = [
         + ' background-color: #000; background-repeat: no-repeat; cursor: pointer; opacity: 0.75; flex: none; }',
     L + ' .jp-mthumb[data-centre] { border-color: #ffc107; opacity: 1; }',
     L + ' .jp-mthumb:hover, ' + L + ' .jp-mthumb:focus-visible { opacity: 1; outline: 1px solid #fff; }',
-    L + ' .jp-mpop-label { max-width: ' + (THUMB_W * 5 + 16) + 'px; overflow: hidden; text-overflow: ellipsis; text-align: center; }'
+    L + ' .jp-mpop-label { max-width: ' + (THUMB_W * 5 + 16) + 'px; overflow: hidden; text-overflow: ellipsis; text-align: center; }',
+    // Marker toasts over the video: top centre, clear of the notch, never take a tap or the wheel.
+    '.jp-mtoasts { position: fixed; top: calc(env(safe-area-inset-top, 0px) + 12px); left: 50%;'
+        + ' transform: translateX(-50%); z-index: 10000; display: flex; flex-direction: column; align-items: center;'
+        + ' gap: 6px; pointer-events: none; max-width: 90vw; }',
+    '.jp-mtoast { background: rgba(20,20,20,0.88); color: #fff; border-left: 4px solid #9e9e9e; border-radius: 6px;'
+        + ' padding: 8px 14px; font-size: 0.95em; line-height: 1.3; box-shadow: 0 2px 10px rgba(0,0,0,0.6);'
+        + ' max-width: 90vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;'
+        + ' transition: opacity 0.3s, transform 0.3s; opacity: 0; transform: translateY(-6px); }',
+    '.jp-mtoast[data-in] { opacity: 1; transform: none; }',
+    '.jp-mtoast[data-kind="tip"] { border-left-color: #ffb300; }',
+    '.jp-mtoast[data-kind="chapter"] { border-left-color: #64b5f6; }',
+    '.jp-mtoast[data-kind="highlight"] { border-left-color: #ec407a; }',
+    '@media (prefers-reduced-motion: reduce) { .jp-mtoast { transition: none; } }'
 ].join('\n');
+
+/* ---- marker toasts ------------------------------------------------------------------------- */
+
+var TOAST_MS = 4000;
+var TOASTS_MAX = 3;
+var lastPos = null;     // playback position at the previous tick (seconds), null after an item change/leave
+
+function toastSetting() {
+    try { return toastKinds(window.localStorage.getItem(TOAST_PREF_KEY)); } catch (e) { return null; }
+}
+
+function toastHost() {
+    var h = document.querySelector('.jp-mtoasts');
+    if (!h) {
+        h = document.createElement('div');
+        h.className = 'jp-mtoasts';
+        h.setAttribute('role', 'status');
+        h.setAttribute('aria-live', 'polite');
+        document.body.appendChild(h);
+    }
+    return h;
+}
+
+function clearToasts() {
+    var h = document.querySelector('.jp-mtoasts');
+    if (h) { h.remove(); }
+}
+
+function toast(m) {
+    var h = toastHost();
+    while (h.childNodes.length >= TOASTS_MAX) { h.removeChild(h.firstChild); }
+    var t = document.createElement('div');
+    t.className = 'jp-mtoast';
+    t.setAttribute('data-kind', m.kind);
+    t.textContent = m.label || (m.kind === 'neutral' ? 'Marker' : m.kind); // untrusted text: textContent only
+    h.appendChild(t);
+    requestAnimationFrame(function () { t.setAttribute('data-in', ''); });
+    setTimeout(function () {
+        t.removeAttribute('data-in');
+        setTimeout(function () { t.remove(); }, 350);
+    }, TOAST_MS);
+}
+
+/* Toast the markers passed since the previous tick (normal playback only; see crossedMarkers). */
+// Position from the playback manager (item time in ms, as live-apply and clip-upnext read it): the
+// <video> element's own clock restarts at 0 when a transcode resumes mid-item.
+function toastPassed(pm, pl, duration) {
+    var ms = typeof pm.currentTime === 'function' ? pm.currentTime(pl) : null;
+    var pos = typeof ms === 'number' && isFinite(ms) ? ms / 1000 : null;
+    var prev = lastPos;
+    lastPos = pos;
+    if (pos == null || prev == null) { return; } // paused: pos === prev, crossedMarkers passes nothing
+    var kinds = toastSetting();
+    if (kinds && !kinds.length) { return; }
+    crossedMarkers(timelineMarkers(body, duration), prev, pos, kinds).forEach(toast);
+}
 
 var enabled = null;     // null: not asked yet / asking; true/false: the server's answer
 var momentsOn = false;  // the server makes moment sheets (setting MarkerMoments)
@@ -560,7 +629,9 @@ function tick() {
         if (document.documentElement.classList.contains('layout-tv') || !onVideoPage()) {
             itemKey = null;
             body = null;
+            lastPos = null;
             clear();
+            clearToasts();
             return;
         }
         if (!markersEnabled()) { return; }
@@ -572,7 +643,9 @@ function tick() {
         if (!key) { return; } // a blip with no current item (seeking, restream): keep everything as is
         if (key !== itemKey) {
             itemKey = key;
+            lastPos = null;
             clear();
+            clearToasts();
             var e = entry(key);
             preview = e;
             if (e.body && Date.now() - e.bodyAt < BODY_TTL_MS) {
@@ -585,15 +658,18 @@ function tick() {
         }
         if (!body) { return; }
 
-        var slider = document.querySelector('#' + PAGE_ID + ' .osdPositionSlider');
-        if (!slider) { clear(); return; }
-
         var ticks = typeof pm.duration === 'function' ? pm.duration(pl) : 0;
         var duration = ticks > 0 ? ticks / TICKS_PER_SECOND : 0;
         if (!duration) {
             var v = document.querySelector('#' + PAGE_ID + ' video') || document.querySelector('video');
             duration = v && isFinite(v.duration) ? v.duration : 0;
         }
+
+        // Toasts run whether or not the OSD (and its slider) is showing.
+        try { toastPassed(pm, pl, duration); } catch (te) { lastPos = null; }
+
+        var slider = document.querySelector('#' + PAGE_ID + ' .osdPositionSlider');
+        if (!slider) { clear(); return; }
 
         var host = hostOf(slider);
         var layerGone = !host || !host.querySelector(L);

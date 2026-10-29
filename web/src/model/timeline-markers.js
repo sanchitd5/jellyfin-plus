@@ -196,3 +196,34 @@ function tileAt(n, cols, rows, w, h) {
     var i = n % per;
     return { sheet: Math.floor(n / per), x: (i % cols) * w, y: Math.floor(i / cols) * h, w: w, h: h };
 }
+
+/*
+ * Marker toasts: the markers the playhead passed between two position samples, of the kinds asked for
+ * (null = every kind). Provider-agnostic: a tip, a chapter, a highlight or any provider's neutral point;
+ * the text is the provider's own label/value/unit. Only normal playback counts - a jump backwards, or
+ * forwards by more than MAX_PLAY_STEP seconds (a seek, a resume), passes nothing, so seeking across a
+ * run of markers does not fire them all.
+ */
+export var MAX_PLAY_STEP = 3;
+export var TOAST_PREF_KEY = 'jellyfinPlus.markerToasts';
+
+export function crossedMarkers(markers, prev, cur, kinds) {
+    if (!Array.isArray(markers) || !finite(prev) || !finite(cur) || cur <= prev || cur - prev > MAX_PLAY_STEP) {
+        return [];
+    }
+    return markers.filter(function (m) {
+        return m && m.offset > prev && m.offset <= cur && (!kinds || kinds.indexOf(m.kind) >= 0);
+    });
+}
+
+/*
+ * The toast setting (localStorage TOAST_PREF_KEY): unset/empty = every kind; "off" = none; otherwise a
+ * comma list of kinds, e.g. "tip,highlight". Returns null (all), [] (off) or the list.
+ */
+export function toastKinds(raw) {
+    if (raw == null || String(raw).trim() === '') { return null; }
+    var s = String(raw).trim().toLowerCase();
+    if (s === 'off' || s === 'none' || s === 'false') { return []; }
+    var list = s.split(',').map(function (k) { return k.trim(); }).filter(Boolean);
+    return list.length ? list : null;
+}

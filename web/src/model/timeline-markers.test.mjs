@@ -1,6 +1,6 @@
 // Run: node web/src/model/timeline-markers.test.mjs   (no framework; exits non-zero on failure)
 import assert from 'node:assert/strict';
-import { timelineMarkers, markerLabel, seekTarget, stripTimes, pickTrickplay, stockTile, momentTile, stripManifest, warmMarkers } from './timeline-markers.js';
+import { timelineMarkers, markerLabel, seekTarget, stripTimes, pickTrickplay, stockTile, momentTile, stripManifest, warmMarkers, crossedMarkers, toastKinds } from './timeline-markers.js';
 
 var passed = 0;
 function t(name, fn) {
@@ -160,6 +160,32 @@ t('warmMarkers: highest value first, valueless last, ties by offset, capped', fu
     assert.deepEqual(warmMarkers(ms, 10).map(function (m) { return m.offset; }), [9, 1, 2, 5]);
     assert.deepEqual(warmMarkers(null, 3), []);
     assert.deepEqual(warmMarkers(ms, 0), []);
+});
+
+t('crossedMarkers: markers passed in normal playback, filtered by kind', function () {
+    var ms = [
+        { offset: 10, kind: 'tip', label: 'a' },
+        { offset: 11, kind: 'chapter', label: 'c' },
+        { offset: 12, kind: 'neutral', label: 'n' },
+        { offset: 50, kind: 'tip', label: 'z' }
+    ];
+    var labels = function (a) { return a.map(function (m) { return m.label; }); };
+    assert.deepEqual(labels(crossedMarkers(ms, 9, 10, null)), ['a']);              // offset inclusive
+    assert.deepEqual(labels(crossedMarkers(ms, 10, 12.5, null)), ['c', 'n']);      // prev exclusive, every kind
+    assert.deepEqual(labels(crossedMarkers(ms, 9, 12, ['tip'])), ['a']);           // kind filter
+    assert.deepEqual(crossedMarkers(ms, 9, 12, []), []);                           // off
+    assert.deepEqual(crossedMarkers(ms, 9, 40, null), []);                         // seek forward
+    assert.deepEqual(crossedMarkers(ms, 13, 9.5, null), []);                       // seek back
+    assert.deepEqual(crossedMarkers(ms, 12, 12, null), []);                        // paused
+    assert.deepEqual(crossedMarkers(null, 0, 1, null), []);
+    assert.deepEqual(crossedMarkers(ms, NaN, 1, null), []);
+});
+
+t('toastKinds: unset = all, off = none, list = those kinds', function () {
+    assert.equal(toastKinds(null), null);
+    assert.equal(toastKinds('  '), null);
+    assert.deepEqual(toastKinds('off'), []);
+    assert.deepEqual(toastKinds('Tip, highlight ,'), ['tip', 'highlight']);
 });
 
 console.log(passed + ' passed');

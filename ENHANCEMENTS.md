@@ -934,6 +934,14 @@ position slider. Full contract for app authors: [docs/architecture/TIMELINE_MARK
   and `hstack`; tile times in `X-Moment-Strip`. 409 + manifest when the full set is ready, 503 after
   10 s or a recent failure. Live lane, de-duplicated per key, cached under the item (`strips/`,
   `private, max-age=86400`). Measured on CT114: 390-770 ms per strip, 5-13 KB.
+- *Marker toasts* (client, `controller/timeline-markers.js` + `crossedMarkers`/`toastKinds` in
+  `model/timeline-markers.js`): while a video plays, each marker the playhead passes shows a toast at the
+  top of the video for 4 s (at most 3 stacked), with the provider's own text (`label · value unit`), its
+  border coloured by `kind`. Any provider, any kind: nothing is tip-specific. Normal playback only: a jump
+  back, or forward by more than 3 s (seek, resume), fires nothing. Position comes from the playback
+  manager (item time), not the `<video>` clock, so a transcode resumed mid-item still lines up. Uses the
+  markers already fetched for the timeline: no extra request. localStorage `jellyfinPlus.markerToasts`:
+  unset = every kind, `off` = none, or a comma list of kinds (`tip,highlight`). TV layout untouched.
 - *Precompute* (`src/MomentPrecompute.cs`; setting `MarkerMomentsPrecompute`, default on): scheduled
   task *Precompute marker previews* (category Jellyfin Plus, daily 03:00, runnable by hand) walks every
   matching video without stock trickplay, fetches markers with no user (no route exposes that path;
