@@ -184,6 +184,26 @@ namespace Jellyfin.Plugin.Plus.Patcher
                 logger?.LogWarning(ex, "JellyfinPlus: the A/B live-apply swap patches could not be installed. Live-apply still works, via today's tear-down-and-restart.");
             }
 
+            // Faster seeks: quick ffmpeg stop + small probe on mid-item starts. Own try/catch, ahead
+            // of the MediaInfoHelper block for the same early-return reason as the swap.
+            try
+            {
+                SeekPatches.Apply(harmony, logger);
+                if (SeekPatches.StopAvailable || SeekPatches.ProbeAvailable)
+                {
+                    applied.Add("fast seek");
+                }
+                else
+                {
+                    failed.Add("fast seek");
+                }
+            }
+            catch (Exception ex)
+            {
+                failed.Add("fast seek");
+                logger?.LogWarning(ex, "JellyfinPlus: fast seek patches could not be installed; seeks use stock behaviour.");
+            }
+
             // Tag search: SqlSearchProvider.SearchAsync also matches item tags. Own try/catch, and
             // ahead of the MediaInfoHelper block for the same early-return reason as the swap.
             try
