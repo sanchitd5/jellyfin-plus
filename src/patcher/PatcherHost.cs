@@ -67,6 +67,21 @@ namespace Jellyfin.Plugin.Plus.Patcher
         /// <summary>Per-library state of the cache (built at, key counts, dirty) and the run in flight, as JSON.</summary>
         public static string FilterCacheStatusJson() => FilterCacheEngine.StatusJson();
 
+        // ---- Card image pre-render (CardPrerender): shape recording is a Harmony prefix; these resolve the
+        // services, create the table, and run the task.
+
+        public static void CardPrerenderStart(object serviceProvider, object logger)
+            => CardPrerender.Start((IServiceProvider)serviceProvider, logger as ILogger);
+
+        public static void CardPrerenderStop() => CardPrerender.Stop();
+
+        /// <summary>Starts a pre-render without waiting. False when not ready or one is already running.</summary>
+        public static bool CardPrerenderStartBackground() => CardPrerender.StartBackground();
+
+        /// <summary>Pre-renders the missing card images and completes with a JSON summary.</summary>
+        public static Task<string> CardPrerenderRun(object progress, CancellationToken cancellationToken)
+            => CardPrerender.RunAsync(progress as IProgress<double>, cancellationToken);
+
         /// <summary>
         /// Replaces folder-cover copies with links to the identical child image (nothing written when
         /// <paramref name="dryRun"/>). Completes with a JSON summary; faults if the write guard is absent.
