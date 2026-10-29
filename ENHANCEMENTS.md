@@ -625,6 +625,11 @@ about 0.3 s per image the first time a size is requested (it resizes, then cache
   and each URL is fetched once per page load. The server resizes ahead of need, and the browser caches
   the result, since tagged image URLs are served `max-age=31536000, immutable`. When stock's own fill
   arrives, it hits the cache.
+- **Backdrop look-ahead** (`model/backdrop-url.js`, `controller/card-data.js`): the card-data lookup also
+  asks for `EnableImageTypes=Backdrop,Primary&ImageTypeLimit=1` and keeps the tags; a mouse entering a
+  card, or a touch card held on screen 300 ms (max 6 per scroll settle), fetches the exact details-page
+  backdrop URL (stock's `getScaledImageUrl`, own -> parent -> Primary on the header path) through the
+  same queue (hover at normal priority). Skipped on data-saver / 2g / TV. Off: `jellyfinPlus.backdropPreload` = `off`.
 - **No unloading:** a loaded image is no longer emptied when it scrolls out of range. Only elements
   actually showing an image are kept; genre rows, which use the same loader for other content, behave
   exactly as stock.
@@ -1483,6 +1488,7 @@ keys once.
 | `jellyfinPlus.cardBadges` | `off` switches the card badges off (read at load; never written by the script) | `controller/card-data.js`, `view/card-badges.js` |
 | `jellyfinPlus.mobileTheme` | `off` returns every visual change to stock and sets `html.jp-theme-off`; `light` forces the light scheme (read at load; never written by the script) | `view/mobile-theme.js` |
 | `jellyfinPlus.imagePreload` | `off` switches the image look-ahead off (read at load; never written by the script) | `controller/image-preload.js` |
+| `jellyfinPlus.backdropPreload` | `off` switches the details-page backdrop look-ahead off (read per use; never written) | `controller/image-preload.js`, `controller/card-data.js` |
 | `jellyfinPlus.quickTags` | JSON `[{n: name, t: [tags]} \| {n: name, p: prefix}]`: the viewer's quick tag groups. Synced | `model/quick-tags.js`, `controller/quick-tags.js` |
 | `jellyfinPlus.quickTagsAuto` | JSON `{h: [ids], r: {id: name}}`: suggested groups the viewer hid or renamed. Synced | same |
 | `jellyfinPlus.libFilterNames` | JSON map of studio and person ids to names, up to 400, for the library filter chips | `controller/library-filters.js` |
