@@ -32,7 +32,7 @@ namespace Jellyfin.Plugin.Plus.Patcher
     ///   2. SkiaEncoder.Decode, prefix. For the one decode of the input path, it reads the header,
     ///      works out the final size exactly as stock does (ImageHelper.GetNewImageSize on the full,
     ///      orientation-corrected size), and picks the largest of 1/8, 1/4, 1/2 whose decoded size is
-    ///      still at least 2x the final size in both dimensions. It then decodes at that scale into a
+    ///      still at least the final size in both dimensions (never an upscale). It then decodes at that scale into a
     ///      bitmap of the same kind stock builds. Any doubt (not a JPEG, animated, no gain, options
     ///      that would make stock return the original file, a failed decode) returns to stock.
     ///
@@ -45,14 +45,17 @@ namespace Jellyfin.Plugin.Plus.Patcher
     ///
     /// Orientation, crop, fill, blur, layers, indicators, sharpening and the output encoder are stock's
     /// and untouched. Output pixels differ slightly (the DCT scaling is a box filter ahead of stock's
-    /// bilinear+mipmap downscale); the 2x margin keeps that invisible. Output dimensions are identical.
+    /// bilinear+mipmap downscale). The DCT scaling is an area average, a downscale in its own right,
+    /// and stock's resize still runs from at least the target size. A 2x margin was tried first and
+    /// left the common card (990 px from a 3840 source: 1920 &lt; 1980) on the full decode.
+    /// Output dimensions are identical.
     ///
     /// Fail-soft: every prefix catches and returns to stock; each patch is installed independently
     /// and the context is only ever opened by patch 1, installed last, so a partial install is inert.
     /// </summary>
     internal static class ScaledDecodePatches
     {
-        private const int Margin = 2;
+        private const int Margin = 1;
         private static readonly int[] Denominators = { 8, 4, 2 };
 
         [ThreadStatic]
@@ -116,7 +119,7 @@ namespace Jellyfin.Plugin.Plus.Patcher
                 finalizer: new HarmonyMethod(typeof(ScaledDecodePatches).GetMethod(nameof(EncodeFinalizer), Flags)));
             Available = true;
 
-            logger?.LogInformation("JellyfinPlus: patched SkiaEncoder (large JPEG sources are decoded at 1/2, 1/4 or 1/8 scale when the resized output stays 2x smaller)");
+            logger?.LogInformation("JellyfinPlus: patched SkiaEncoder (large JPEG sources are decoded at 1/2, 1/4 or 1/8 scale when the decoded size still covers the output)");
         }
 
         private static MethodInfo FindEncode(Type skia)
