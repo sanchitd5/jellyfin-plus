@@ -427,10 +427,20 @@ answer and ids (FNV-1a, never `GetHashCode`), whatever the row order.
   can see; the plan is capped at the cache size (300), no-parent scopes first, and logs once when truncated.
   Each is computed as that user through the route's own `SmartTagsCore.ComputeAsync`
   (`InternalItemsQuery(user)`) and stored under the route's key, so the route hits the cache and no entry is
-  ever shared across access digests. Computations run one at a time (a lock shared with stale-hit
-  refreshes), 2 s apart, at most 40 per cycle, and a cycle is skipped, and an unfinished one stops, while
+  ever shared across access digests. Computations run concurrently within the CPU budget (see
+  **CPU budget** below): up to max(1, budget/2) at once, shared with stale-hit refreshes through one dynamic gate
+  (viewer-triggered computations never queue and are subtracted from the limit; the same key still never runs twice
+  at once), no pause when idle, a 2 s pause only when the budget is 1; at most 40 per cycle, and a cycle is skipped, and an unfinished one stops, while
   `ILibraryManager.IsScanRunning`. A cycle that computed anything logs
   `smart tag precompute cycle computed N entries in M ms`. Cold cost it removes: about 5 s per entry.
+- **CPU budget** (`src/CpuBudget.cs`; also gates the image warm batch). Background work may use the container's
+  cores minus the cores playback uses now, never below 1. Container cores: `Environment.ProcessorCount` and
+  `/sys/fs/cgroup/cpu.max` (quota/period rounded up), the smaller. Playback cores: one sampler every 2 s reads
+  `/proc/<pid>/{comm,stat}` for every process whose name contains `ffmpeg` (all of them, including any the plugin
+  starts itself: the safe direction), sums utime+stime deltas over the interval at 100 ticks/s and rounds up (a
+  process seen for the first time counts as one core until it has a delta). No `/proc`: container cores minus 2 per
+  active transcode (`ISessionManager`). Callers only read a cached integer. Logged once at info at startup
+  (`CPU budget: N cores, playback uses M`) and once a minute at debug. Fail soft: a sampler error keeps the last reading.
 - **Cost** (profiling copy, 47,621 videos, 2.03M item-tag rows): load 0.86-0.92 s warm DB (1.8 s first),
   algorithm 55-180 ms; a cached answer under 1 ms, about 6 KB of JSON. `Server-Timing: tagcats`.
 - **Client.** Fetched once per library scope (from the hash's `parentId`/`topParentId`), cached 10 minutes,
@@ -641,8 +651,8 @@ about 0.3 s per image the first time a size is requested (it resizes, then cache
   path from `127.0.0.1:<local port><PathBase>` with `Accept: image/webp,*/*` (the cache key browsers produce),
   headers only. It answers once the whole batch is cached (at most 8 s; the rest finishes in the background),
   and the client releases those URLs to the browser only then, so the browser fetch is a cache hit rather
-  than a second encode of the same image. One POST in flight per page. Concurrency is one static gate of
-  max(2, cores/2) shared by every caller; a per-URL in-flight task is shared, so a second caller for the
+  than a second encode of the same image. One POST in flight per page. Concurrency is one static dynamic gate whose
+  limit is the CPU budget (below), shared by every caller; a per-URL in-flight task is shared, so a second caller for the
   same URL waits on the first encode; pending is capped at 256. Fail soft: errors are logged at debug only; a non-2xx
   (404 on an older server) stops posting for the page session and the browser fetch proceeds unchanged.
   Skipped on data-saver / 2g, TV layout, and with `jellyfinPlus.imagePreload` = `off`.

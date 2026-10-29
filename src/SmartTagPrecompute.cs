@@ -11,6 +11,7 @@ using MediaBrowser.Controller;
 using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.Plugins;
+using MediaBrowser.Controller.Session;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -36,8 +37,9 @@ namespace Jellyfin.Plugin.Plus
     /// then every cycle, it computes the entries that are missing or due for every enabled user, for the no-parent
     /// scope and for each library that user can see. Each entry is computed as its own user through the route's
     /// <see cref="SmartTagsCore.ComputeAsync"/> and stored under the route's key (user + access digest + parent),
-    /// so an entry is never shared across access digests. One computation at a time, with a pause between them
-    /// (the server transcodes on the same box); a cycle is skipped while a library scan runs and bounded by
+    /// so an entry is never shared across access digests. Computations run concurrently within the CPU budget
+    /// (<see cref="CpuBudget"/>: up to half of it, no pause when idle, a 2 s pause when only one core is free
+    /// because the server transcodes on the same box); a cycle is skipped while a library scan runs and bounded by
     /// <see cref="MaxPerCycle"/>.
     /// </summary>
     public sealed class SmartTagPrecomputeService : IHostedService, IDisposable
@@ -56,41 +58,90 @@ namespace Jellyfin.Plugin.Plus
         private int _truncatedLogged;
 
         public SmartTagPrecomputeService(
-            ILibraryManager libraryManager, IUserManager userManager, IDbContextFactory<JellyfinDbContext> dbFactory, ILogger<SmartTagPrecomputeService> logger)
+            ILibraryManager libraryManager, IUserManager userManager, IDbContextFactory<JellyfinDbContext> dbFactory, ILogger<SmartTagPrecomputeService> logger, ISessionManager sessions)
         {
+            // only read when /proc cannot be
+            CpuBudget.TranscodeCount = () => sessions.Sessions.Count(s => s.TranscodingInfo != null);
             _libraryManager = libraryManager;
             _userManager = userManager;
             _dbFactory = dbFactory;
             _logger = logger;
         }
 
-        /// <summary>One cycle: warm the entries that are missing or due, serially, paused, bounded. Returns (computed, ms).</summary>
+        /// <summary>
+        /// One cycle: warm the entries that are missing or due, bounded. Up to <paramref name="degree"/> run at once (null: one);
+        /// <paramref name="pause"/> is waited after each start (zero when the box is idle). Returns (computed, ms).
+        /// </summary>
         internal static async Task<(int Computed, long Ms)> RunCycleAsync(
-            IEnumerable<SmartTagWork> work, int cap, TimeSpan pause, Func<bool> scanRunning, CancellationToken ct)
+            IEnumerable<SmartTagWork> work, int cap, Func<TimeSpan> pause, Func<bool> scanRunning, Func<int> degree, CancellationToken ct)
         {
             var clock = Stopwatch.StartNew();
             var computed = 0;
             var tried = 0;
-            foreach (var w in work)
+            var running = new HashSet<Task<bool>>();
+
+            void Reap()
             {
-                ct.ThrowIfCancellationRequested();
-                if (SmartTagCache.Lookup(w.Key, SmartTagCache.Generation, out _, out var due) && !due)
+                foreach (var t in running.Where(r => r.IsCompleted).ToList())
                 {
-                    continue; // warm
+                    running.Remove(t);
+                    if (t.Status == TaskStatus.RanToCompletion && t.Result)
+                    {
+                        computed++;
+                    }
+                }
+            }
+
+            try
+            {
+                foreach (var w in work)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    if (SmartTagCache.Lookup(w.Key, SmartTagCache.Generation, out _, out var due) && !due)
+                    {
+                        continue; // warm
+                    }
+
+                    // Room first: the limit is re-read, so a transcode starting mid-cycle narrows the next start.
+                    while (running.Count >= Math.Max(1, degree?.Invoke() ?? 1))
+                    {
+                        await Task.WhenAny(running).ConfigureAwait(false);
+                        Reap();
+                    }
+
+                    if (tried >= cap || scanRunning())
+                    {
+                        break; // the rest waits for the next cycle
+                    }
+
+                    tried++;
+                    // Task.Run: the SQLite provider's "async" calls complete synchronously, so without it a computation
+                    // would run to the end on this thread and nothing could overlap.
+                    var key = w.Key;
+                    var compute = w.Compute;
+                    running.Add(Task.Run(() => SmartTagCache.RefreshAsync(key, compute, ct), CancellationToken.None));
+                    Reap();
+
+                    var p = pause();
+                    if (p > TimeSpan.Zero)
+                    {
+                        await Task.Delay(p, ct).ConfigureAwait(false);
+                    }
+                }
+            }
+            finally
+            {
+                // started computations are finished (or cancelled with ct) before the cycle reports
+                try
+                {
+                    await Task.WhenAll(running).ConfigureAwait(false);
+                }
+                catch (Exception)
+                {
+                    // RefreshAsync reports failure as false; only cancellation lands here
                 }
 
-                if (tried >= cap || scanRunning())
-                {
-                    break; // the rest waits for the next cycle
-                }
-
-                tried++;
-                if (await SmartTagCache.RefreshAsync(w.Key, w.Compute, ct).ConfigureAwait(false))
-                {
-                    computed++;
-                }
-
-                await Task.Delay(pause, ct).ConfigureAwait(false);
+                Reap();
             }
 
             return (computed, clock.ElapsedMilliseconds);
@@ -158,6 +209,7 @@ namespace Jellyfin.Plugin.Plus
         public Task StartAsync(CancellationToken cancellationToken)
         {
             SmartTagCache.EnsureSubscribed(_libraryManager);
+            CpuBudget.Start(_logger);
             _loop = Task.Run(() => LoopAsync(_stop.Token), CancellationToken.None);
             return Task.CompletedTask;
         }
@@ -190,7 +242,8 @@ namespace Jellyfin.Plugin.Plus
                     {
                         if (!_libraryManager.IsScanRunning)
                         {
-                            var (computed, ms) = await RunCycleAsync(Plan(), MaxPerCycle, Pause, () => _libraryManager.IsScanRunning, ct).ConfigureAwait(false);
+                            var (computed, ms) = await RunCycleAsync(
+                                Plan(), MaxPerCycle, () => CpuBudget.Cores <= 1 ? Pause : TimeSpan.Zero, () => _libraryManager.IsScanRunning, () => CpuBudget.BackgroundDegree, ct).ConfigureAwait(false);
                             if (computed > 0)
                             {
                                 _logger.LogInformation("JellyfinPlus: smart tag precompute cycle computed {Computed} entries in {Ms} ms.", computed, ms);

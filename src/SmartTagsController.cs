@@ -114,8 +114,18 @@ namespace Jellyfin.Plugin.Plus
                     return Ok(cached);
                 }
 
-                var (cats, idsMs) = await SmartTagsCore.ComputeAsync(_libraryManager, _dbFactory, user, parent, cancellationToken).ConfigureAwait(false);
+                Interlocked.Increment(ref SmartTagCache.Interactive);
+                (List<SmartTagCategory> cats, long idsMs) computed;
+                try
+                {
+                    computed = await SmartTagsCore.ComputeAsync(_libraryManager, _dbFactory, user, parent, cancellationToken).ConfigureAwait(false);
+                }
+                finally
+                {
+                    Interlocked.Decrement(ref SmartTagCache.Interactive);
+                }
 
+                var (cats, idsMs) = computed;
                 SmartTagCache.Put(key, gen, cats);
                 Response.Headers["Server-Timing"] = "tagcats;dur=" + clock.ElapsedMilliseconds.ToString(CultureInfo.InvariantCulture)
                     + ", tagcats-ids;dur=" + idsMs.ToString(CultureInfo.InvariantCulture);
@@ -339,8 +349,15 @@ namespace Jellyfin.Plugin.Plus
         /// <summary>Clock in ms; replaceable so the harness can age entries.</summary>
         internal static Func<long> Now = () => Environment.TickCount64;
 
-        /// <summary>Background computations run one at a time, whoever asked (the precompute loop or a stale hit).</summary>
-        internal static readonly SemaphoreSlim ComputeLock = new SemaphoreSlim(1, 1);
+        /// <summary>Viewer-triggered computations running now; they never queue, and they take their cores out of the background limit.</summary>
+        internal static int Interactive;
+
+        /// <summary>
+        /// Background computations (the precompute loop or a stale hit): up to max(1, budget / 2) at once, never more than
+        /// the budget minus the viewer-triggered ones. The same key still never runs twice at once (see <see cref="GateFor"/>).
+        /// </summary>
+        internal static readonly DynamicGate ComputeLock = new DynamicGate(
+            () => Math.Max(1, Math.Min(CpuBudget.BackgroundDegree, CpuBudget.Cores - Volatile.Read(ref Interactive))));
 
         private static readonly object Gate = new object();
         private static readonly Dictionary<string, (long Gen, long Ticks, List<SmartTagCategory> Rows)> Map = new Dictionary<string, (long, long, List<SmartTagCategory>)>(StringComparer.Ordinal);
@@ -439,7 +456,7 @@ namespace Jellyfin.Plugin.Plus
 
         /// <summary>
         /// Recomputes one key in the background. Skips when another computation of the key is running or the entry
-        /// is no longer due; computations from every caller run one at a time (<see cref="ComputeLock"/>).
+        /// is no longer due; computations from every caller share the <see cref="ComputeLock"/> budget.
         /// </summary>
         internal static async Task<bool> RefreshAsync(string key, Func<CancellationToken, Task<(List<SmartTagCategory> Cats, long IdsMs)>> compute, CancellationToken ct)
         {

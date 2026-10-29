@@ -140,6 +140,12 @@ esbuild) support natively.
 | `view/player-hud.js` | `ensureHudStyle()`, `applyBrightness()`, `showSeekHint()`, `showHoldPill()`, `hideHoldPill()`, `showLevelBar()`, `hideLevelBar()` (the gesture overlays and the page rules they need) | `lib/dom.js` (`el`) |
 | `view/bulk-tags-dialog.js` | `showTagDialog()` | `lib/dom.js` (`el`), `lib/log.js` |
 
+## Server (C#)
+
+| file | exports |
+|---|---|
+| `src/CpuBudget.cs` | `CpuBudget` (`Cores`, `PlaybackCores`, `BackgroundDegree`, pure `ContainerCores`/`PlaybackCoresFor`/`Budget`/`ParseStatTicks`; one 2 s /proc sampler of ffmpeg CPU), `DynamicGate` (async gate whose limit is re-read on every acquire/release) |
+
 ## Entry point
 
 | module | exports | imports |

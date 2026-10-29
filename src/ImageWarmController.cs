@@ -33,8 +33,8 @@ namespace Jellyfin.Plugin.Plus
             RegexOptions.Compiled | RegexOptions.CultureInvariant,
             TimeSpan.FromMilliseconds(100));
 
-        // Shared by every caller, so warming can never take more than half the cores from live requests.
-        private static readonly SemaphoreSlim Gate = new SemaphoreSlim(Math.Max(2, Environment.ProcessorCount / 2));
+        // Shared by every caller; the limit is the CPU budget (container cores minus what playback uses now), re-read on every acquire.
+        private static readonly DynamicGate Gate = new DynamicGate(() => CpuBudget.Cores);
         // Shared in-flight work, so a second caller for the same URL waits on the first encode instead of
         // starting another one (stock does not dedupe identical concurrent resizes).
         private static readonly ConcurrentDictionary<string, Task> InFlight = new ConcurrentDictionary<string, Task>();
