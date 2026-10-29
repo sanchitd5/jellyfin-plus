@@ -385,6 +385,25 @@ namespace Jellyfin.Plugin.Plus.Patcher
                 logger?.LogWarning(ex, "JellyfinPlus: the folder image link patch could not be installed. Folder images are copied, as stock.");
             }
 
+            // Large JPEG sources decoded at reduced scale before a big downsize. Own try/catch.
+            try
+            {
+                ScaledDecodePatches.Apply(harmony, logger);
+                if (ScaledDecodePatches.Available)
+                {
+                    applied.Add("scaled image decode");
+                }
+                else
+                {
+                    failed.Add("scaled image decode (sources are decoded at full size, as stock)");
+                }
+            }
+            catch (Exception ex)
+            {
+                failed.Add("scaled image decode (sources are decoded at full size, as stock)");
+                logger?.LogWarning(ex, "JellyfinPlus: the scaled image decode patch could not be installed. Images are decoded at full size, as stock.");
+            }
+
             // MediaInfoHelper lives in Jellyfin.Api, a different assembly from the core targets, and
             // is resolved BY NAME so that the patcher does not need a compile-time reference to a
             // web-API assembly it would then be version-pinned to.

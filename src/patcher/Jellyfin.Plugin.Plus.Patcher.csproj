@@ -59,6 +59,11 @@
       <HintPath>$(JellyfinBin)/Microsoft.EntityFrameworkCore.Relational.dll</HintPath>
       <Private>false</Private>
     </Reference>
+    <!-- Scaled JPEG decode (ScaledDecodePatches.cs): SKCodec/SKBitmap, the assembly Jellyfin.Drawing.Skia uses. -->
+    <Reference Include="SkiaSharp">
+      <HintPath>$(JellyfinBin)/SkiaSharp.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
     <Reference Include="Microsoft.EntityFrameworkCore.Abstractions">
       <HintPath>$(JellyfinBin)/Microsoft.EntityFrameworkCore.Abstractions.dll</HintPath>
       <Private>false</Private>
