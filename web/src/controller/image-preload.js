@@ -1,6 +1,6 @@
 import { log } from '../lib/log.js';
 import { isLazyLoaderClass, isImageUrl, enabled, createQueue, PRELOAD_MARGIN } from '../model/image-preload.js';
-import { backdropEnabled, slowConnection, stockBackdropUrl } from '../model/backdrop-url.js';
+import { backdropEnabled, slowConnection, stockBackdropUrl, isRealBackdrop } from '../model/backdrop-url.js';
 import { apiClient, cardInfo, onCardInfo, onCardWatch, watchCard } from './card-data.js';
 
 /*
@@ -182,13 +182,15 @@ export function installImagePreload() {
 
 /*
  * Details-page backdrop look-ahead (URL maths in model/backdrop-url.js). A card the pointer enters, or
- * a card held on screen for BD_DWELL_MS on a touch screen (at most BD_CAP per scroll settle), has the
- * backdrop stock will ask for on its details page fetched early through the same queue. Item data
+ * a card held on screen for BD_DWELL_MS on a touch screen (at most BD_CAP per scroll settle, and only
+ * items with a real backdrop: never the Primary fallback), has the backdrop stock will ask for on its
+ * details page fetched early through the same queue. Hover prefetches the single hovered card,
+ * Primary fallback included. Item data
  * (tags) comes from card-data.js. Off: localStorage jellyfinPlus.backdropPreload = off, data-saver or
  * a 2g link, TV layout.
  */
 var BD_DWELL_MS = 300;
-var BD_CAP = 6;
+var BD_CAP = 2;
 var BD_SETTLE_MS = 400;
 var budget = BD_CAP;
 var settleTimer = null;
@@ -223,6 +225,10 @@ function prefetchBackdrop(card, hover) {
     if (!cardInfo(id)) {
         awaiting.set(id, { card: card, hover: hover });
         watchCard(card);
+        return;
+    }
+    // Touch dwell is speculative and most cards are never opened: skip the large Primary fallback.
+    if (!hover && !isRealBackdrop(cardInfo(id).img)) {
         return;
     }
     var url = backdropUrlFor(id);

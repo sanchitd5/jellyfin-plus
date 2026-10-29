@@ -627,9 +627,11 @@ about 0.3 s per image the first time a size is requested (it resizes, then cache
   arrives, it hits the cache.
 - **Backdrop look-ahead** (`model/backdrop-url.js`, `controller/card-data.js`): the card-data lookup also
   asks for `EnableImageTypes=Backdrop,Primary&ImageTypeLimit=1` and keeps the tags; a mouse entering a
-  card, or a touch card held on screen 300 ms (max 6 per scroll settle), fetches the exact details-page
+  card, or a touch card held on screen 300 ms (max 2 per scroll settle), fetches the exact details-page
   backdrop URL (stock's `getScaledImageUrl`, own -> parent -> Primary on the header path) through the
-  same queue (hover at normal priority). Skipped on data-saver / 2g / TV. Off: `jellyfinPlus.backdropPreload` = `off`.
+  same queue (hover at normal priority). Touch dwell prefetches only items with a real own or parent
+  backdrop; the Primary-fallback URL (screen width x DPR at q90, large, mostly never opened) is fetched on
+  mouse hover only, for the single hovered card. Skipped on data-saver / 2g / TV. Off: `jellyfinPlus.backdropPreload` = `off`.
 - **No unloading:** a loaded image is no longer emptied when it scrolls out of range. Only elements
   actually showing an image are kept; genre rows, which use the same loader for other content, behave
   exactly as stock.

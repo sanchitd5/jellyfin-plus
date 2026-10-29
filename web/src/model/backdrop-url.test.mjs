@@ -1,6 +1,6 @@
 // Run: node web/src/model/backdrop-url.test.mjs   (no framework; exits non-zero on failure)
 import assert from 'node:assert/strict';
-import { stockBackdropUrl, screenWidth, backdropFields, backdropEnabled, slowConnection, BACKDROP_PREF_KEY } from './backdrop-url.js';
+import { stockBackdropUrl, screenWidth, backdropFields, backdropEnabled, slowConnection, isRealBackdrop, BACKDROP_PREF_KEY } from './backdrop-url.js';
 
 function t(name, fn) {
     try { fn(); console.log('ok   ' + name); } catch (e) { console.log('FAIL ' + name + '\n' + e.message); process.exitCode = 1; }
@@ -55,6 +55,13 @@ t('odd input yields empty string', function () {
     assert.equal(stockBackdropUrl(own, desk, null), '');
     assert.equal(backdropFields({}), null);
     assert.deepEqual(backdropFields({ Id: 'z', BackdropImageTags: [1, 'ok'] }).BackdropImageTags, ['ok']);
+});
+t('isRealBackdrop: own or parent backdrop only, never the Primary fallback', function () {
+    assert.equal(isRealBackdrop(own), true);
+    assert.equal(isRealBackdrop(ep), true);
+    assert.equal(isRealBackdrop(backdropFields({ Id: 'e', ParentBackdropImageTags: ['t'] })), false);
+    assert.equal(isRealBackdrop(bare), false);
+    assert.equal(isRealBackdrop(null), false);
 });
 t('switches', function () {
     assert.equal(backdropEnabled({ getItem: function (k) { return k === BACKDROP_PREF_KEY ? 'off' : null; } }), false);

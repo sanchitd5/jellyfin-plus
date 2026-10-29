@@ -116,3 +116,12 @@ export function stockBackdropUrl(item, env, getScaledImageUrl) {
     }
     return '';
 }
+
+/*
+ * True when the item (or its parent) carries a real Backdrop image, i.e. stockBackdropUrl is not the
+ * large Primary fallback. Touch dwell prefetches only these; the fallback is fetched on hover only.
+ */
+export function isRealBackdrop(item) {
+    return !!item && (item.BackdropImageTags.length > 0
+        || (!!item.ParentBackdropItemId && item.ParentBackdropImageTags.length > 0));
+}
