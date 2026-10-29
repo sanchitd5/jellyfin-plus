@@ -83,14 +83,23 @@ export function fullSizeUrl(url) {
 // Same snapping idea as jellyfin-web's dom.getScreenWidth(): fixed buckets, so the URL repeats.
 var BUCKETS = [480, 720, 1280, 1440, 1920, 2560, 3840];
 
+// Fit-to-screen view only: the overlay is the viewport, so size each axis to it. DPR is capped at
+// 1.5 - a cold server resize grows with output pixels (~0.5 s at 1280, ~2 s at 3840), and the
+// actual-size tap fetches the original anyway (served untouched, no resize).
+var MAX_DPR = 1.5;
+
+function bucketOf(px) {
+    return BUCKETS.find(function (b) { return b >= px; }) || BUCKETS[BUCKETS.length - 1];
+}
+
 function screenSizedUrl(url) {
     try {
-        var long = Math.max(window.screen.width || 0, window.screen.height || 0, 1);
-        var bucket = BUCKETS.find(function (b) { return b >= long; }) || BUCKETS[BUCKETS.length - 1];
-        var px = String(Math.round(bucket * (window.devicePixelRatio || 1)));
+        var dpr = Math.min(window.devicePixelRatio || 1, MAX_DPR);
+        var w = bucketOf(Math.max(window.innerWidth || 0, 1) * dpr);
+        var h = bucketOf(Math.max(window.innerHeight || 0, 1) * dpr);
         var u = new URL(fullSizeUrl(url));
-        u.searchParams.set('maxHeight', px);
-        u.searchParams.set('maxWidth', px);
+        u.searchParams.set('maxHeight', String(h));
+        u.searchParams.set('maxWidth', String(w));
         u.searchParams.set('quality', '90');
         return u.toString();
     } catch (e) {
