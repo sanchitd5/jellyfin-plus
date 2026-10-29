@@ -1,6 +1,6 @@
 // Run: node web/src/model/image-preload.test.mjs   (no framework; exits non-zero on failure)
 import assert from 'node:assert/strict';
-import { isLazyLoaderClass, isImageUrl, enabled, createQueue, PREF_KEY } from './image-preload.js';
+import { isLazyLoaderClass, isImageUrl, enabled, createQueue, createWarmer, warmPath, WARM_MAX, PREF_KEY } from './image-preload.js';
 
 var passed = 0;
 var pending = [];
@@ -85,6 +85,56 @@ t('a failing load frees its slot', async function () {
     await tick();
     assert.equal(n, 2);
     assert.equal(q.stats().running, 0);
+});
+
+var GUID = '0123456789abcdef0123456789abcdef';
+var O = 'http://h:8096/';
+
+t('warmPath keeps only same-origin image paths with a plain query', function () {
+    assert.equal(warmPath('http://h:8096/Items/' + GUID + '/Images/Primary?fillWidth=300&tag=a_b-c.d', O),
+        '/Items/' + GUID + '/Images/Primary?fillWidth=300&tag=a_b-c.d');
+    assert.equal(warmPath('/jf/Items/' + GUID + '/Images/Backdrop/0?maxWidth=9&quality=90', O),
+        '/Items/' + GUID + '/Images/Backdrop/0?maxWidth=9&quality=90');
+    assert.equal(warmPath('http://evil/Items/' + GUID + '/Images/Primary?a=1', O), '');
+    assert.equal(warmPath('/Items/' + GUID + '/Images/Primary', O), '');
+    assert.equal(warmPath('/Items/' + GUID + '/Images/Primary?a=1&b=x;y', O), '');
+    assert.equal(warmPath('/Items/' + GUID + '/Images/Primary?a=' + 'x'.repeat(401), O), '');
+    assert.equal(warmPath('/Items/zz/Images/Primary?a=1', O), '');
+    assert.equal(warmPath('/Users/u/Items?a=1', O), '');
+});
+
+t('warmer batches nearest-first, caps, sends once, then releases to done', async function () {
+    var sends = [];
+    var doneUrls = [];
+    var tasks = [];
+    var w = createWarmer(function (p) { sends.push(p); return Promise.resolve(); },
+        function (u) { doneUrls.push.apply(doneUrls, u); }, 100, function (fn) { tasks.push(fn); });
+    for (var i = 0; i < WARM_MAX + 2; i++) {
+        assert.equal(w.add('u' + i, 'p' + i, 1000 - i), true);
+    }
+    assert.equal(w.add('u0', 'p0', 1), false);   // already sent/pending: caller fetches it itself
+    assert.equal(tasks.length, 1);                // one timer for the window
+    tasks[0]();
+    await tick();
+    await tick();
+    assert.equal(sends.length, 1);
+    assert.equal(sends[0].length, WARM_MAX);
+    assert.equal(sends[0][0], 'p' + (WARM_MAX + 1));   // smallest distance first
+    assert.equal(doneUrls.length, WARM_MAX + 2);       // overflow released straight away
+});
+
+t('a failed post stops warming and still releases the urls', async function () {
+    var doneUrls = [];
+    var tasks = [];
+    var w = createWarmer(function () { return Promise.reject(new Error('404')); },
+        function (u) { doneUrls.push.apply(doneUrls, u); }, 100, function (fn) { tasks.push(fn); });
+    w.add('a', 'pa', 1);
+    tasks[0]();
+    await tick();
+    await tick();
+    assert.deepEqual(doneUrls, ['a']);
+    assert.equal(w.isDead(), true);
+    assert.equal(w.add('b', 'pb', 1), false);
 });
 
 Promise.all(pending).then(function () { console.log(passed + ' passed'); });
