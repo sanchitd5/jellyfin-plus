@@ -35,7 +35,13 @@ namespace Jellyfin.Plugin.Plus
 
         // Shared by every caller, so warming can never take more than half the cores from live requests.
         private static readonly SemaphoreSlim Gate = new SemaphoreSlim(Math.Max(2, Environment.ProcessorCount / 2));
-        private static readonly ConcurrentDictionary<string, byte> InFlight = new ConcurrentDictionary<string, byte>();
+        // Shared in-flight work, so a second caller for the same URL waits on the first encode instead of
+        // starting another one (stock does not dedupe identical concurrent resizes).
+        private static readonly ConcurrentDictionary<string, Task> InFlight = new ConcurrentDictionary<string, Task>();
+
+        // The POST answers when its batch is cached, so the browser's own fetch that follows is a cache hit.
+        // Capped: a slow batch answers anyway and the remaining resizes finish in the background.
+        private static readonly TimeSpan MaxWait = TimeSpan.FromSeconds(8);
         private static readonly HttpClient Http = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
 
         private readonly ILogger<ImageWarmController> _log;
@@ -46,13 +52,13 @@ namespace Jellyfin.Plugin.Plus
             _log = log;
         }
 
-        /// <summary>Queues image URLs to be resized and cached. Returns 202 at once; the work is best effort.</summary>
+        /// <summary>Resizes and caches image URLs, answering once they are cached (at most 8 s). Best effort.</summary>
         /// <param name="body">Relative image paths.</param>
-        /// <returns>202 with the number queued, or 400 when any entry is not an image path.</returns>
+        /// <returns>200 with the number queued, or 400 when any entry is not an image path.</returns>
         [HttpPost("Images/Warm")]
-        [ProducesResponseType(StatusCodes.Status202Accepted)]
+        [ProducesResponseType(StatusCodes.Status200OK)]
         [ProducesResponseType(StatusCodes.Status400BadRequest)]
-        public IActionResult Warm([FromBody] WarmRequest body)
+        public async Task<IActionResult> Warm([FromBody] WarmRequest body)
         {
             var urls = body?.Urls;
             if (urls == null || urls.Count == 0 || urls.Count > MaxUrls)
@@ -70,25 +76,53 @@ namespace Jellyfin.Plugin.Plus
 
             var prefix = "http://127.0.0.1:" + HttpContext.Connection.LocalPort + Request.PathBase.Value;
             var queued = 0;
+            var waits = new List<Task>(urls.Count);
             foreach (var u in urls)
             {
+                if (InFlight.TryGetValue(u, out var running))
+                {
+                    waits.Add(running);
+                    continue;
+                }
+
                 if (InFlight.Count >= MaxPending)
                 {
                     break;
                 }
 
-                if (!InFlight.TryAdd(u, 0))
+                // Not started under the request's token: a closed tab must not abandon a half-done batch.
+                var key = u;
+                var full = prefix + u;
+                var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                if (!InFlight.TryAdd(key, gate.Task))
                 {
+                    if (InFlight.TryGetValue(key, out running))
+                    {
+                        waits.Add(running);
+                    }
+
                     continue;
                 }
 
                 queued++;
-                var key = u;
-                var full = prefix + u;
-                _ = Task.Run(() => FetchAsync(key, full));
+                waits.Add(gate.Task);
+                _ = Task.Run(async () =>
+                {
+                    await FetchAsync(key, full).ConfigureAwait(false);
+                    gate.TrySetResult();
+                });
             }
 
-            return Accepted(new { queued });
+            try
+            {
+                await Task.WhenAll(waits).WaitAsync(MaxWait, HttpContext.RequestAborted).ConfigureAwait(false);
+            }
+            catch (Exception)
+            {
+                // timed out or the browser went away: the resizes carry on, the answer goes out now
+            }
+
+            return Ok(new { queued });
         }
 
         internal static bool IsAllowed(string url)

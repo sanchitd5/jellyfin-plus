@@ -633,10 +633,13 @@ about 0.3 s per image the first time a size is requested (it resizes, then cache
   stock's own 50% zone the client first posts `{"urls":[...]}` (relative `/Items/<guid>/Images/<Type>[/<n>]?<query>`
   paths, nearest first, debounced 100 ms, max 48 per request), then runs its normal browser fetch so the
   bytes land in the browser cache. The server accepts only that exact shape (query `[A-Za-z0-9=&%._-]`,
-  <= 400 chars; anything else is a 400, so no SSRF or arbitrary paths), answers 202 at once, and fetches each
+  <= 400 chars; anything else is a 400, so no SSRF or arbitrary paths) and fetches each
   path from `127.0.0.1:<local port><PathBase>` with `Accept: image/webp,*/*` (the cache key browsers produce),
-  headers only. Concurrency is one static gate of max(2, cores/2) shared by every caller, a per-URL
-  in-flight set dedupes and caps pending at 256. Fail soft: errors are logged at debug only; a non-2xx
+  headers only. It answers once the whole batch is cached (at most 8 s; the rest finishes in the background),
+  and the client releases those URLs to the browser only then, so the browser fetch is a cache hit rather
+  than a second encode of the same image. One POST in flight per page. Concurrency is one static gate of
+  max(2, cores/2) shared by every caller; a per-URL in-flight task is shared, so a second caller for the
+  same URL waits on the first encode; pending is capped at 256. Fail soft: errors are logged at debug only; a non-2xx
   (404 on an older server) stops posting for the page session and the browser fetch proceeds unchanged.
   Skipped on data-saver / 2g, TV layout, and with `jellyfinPlus.imagePreload` = `off`.
 - **Backdrop look-ahead** (`model/backdrop-url.js`, `controller/card-data.js`): the card-data lookup also

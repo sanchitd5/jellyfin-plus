@@ -131,9 +131,13 @@ export function createWarmer(send, done, delay, schedule) {
     var sent = new Set();
     var timer = false;
     var dead = false;
+    var busy = false; // one POST at a time: it holds one of the browser's 6 connections until warmed
 
     function flush() {
         timer = false;
+        if (busy) {
+            return; // re-flushed when the current POST settles
+        }
         var items = Array.from(pending.values()).sort(function (a, b) { return a.d - b.d; });
         pending.clear();
         var batch = items.slice(0, WARM_MAX);
@@ -145,9 +149,22 @@ export function createWarmer(send, done, delay, schedule) {
             return;
         }
         var urls = batch.map(function (x) { return x.url; });
+        busy = true;
         Promise.resolve().then(function () { return send(batch.map(function (x) { return x.path; })); })
             .catch(function () { dead = true; })
-            .then(function () { done(urls); });
+            .then(function () {
+                busy = false;
+                done(urls);
+                if (pending.size) {
+                    if (dead) {
+                        var left = Array.from(pending.values()).map(function (x) { return x.url; });
+                        pending.clear();
+                        done(left);
+                    } else {
+                        flush();
+                    }
+                }
+            });
     }
 
     return {
