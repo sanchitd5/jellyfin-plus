@@ -82,6 +82,7 @@ setting, a control in the page, or "remove the plugin or script".
 | Tag counts and count order on `/Items/Filters` | Server patch | `jpTagOrder=count` orders the tag list most-used first; `jpTagCounts=1` adds the counts in a header | Only when the request sends the parameter; counts only from the filter cache (section 7.5) |
 | Tag management (config page) | Server route + config page | Dashboard, Plugins, Jellyfin Plus: list tags with item counts, rename, merge, delete across items, with a dry run first | Administrators only; nothing is written without Apply (section 6) |
 | Folder covers link instead of copy | Server patch + scheduled tasks | A folder's generated cover is a symlink to the child image it shows, not a 2-3 MB copy of it in `metadata/library`; two tasks convert existing copies ("Jellyfin Plus: link folder images instead of copies", and a "(dry run)" that only counts) | On, no switch; falls back to the stock copy (section 7.9) |
+| Faster resize of large JPEGs | Server patch | Cold image resizes decode a big JPEG source at 1/2, 1/4 or 1/8 scale when the output is at least 2x smaller; same output size | On, no switch; falls back to the stock full decode, and switches itself off if an output size is ever wrong (section 7.10) |
 | Maintenance task buttons (config page) | Config page | Start "Scan people" and "Optimize database" from the plugin page | Administrators only; stock endpoints (section 6) |
 | Preference sync across devices | Client | Enhance panel choices and search paging choices follow the viewer to other browsers | On, no switch; falls back to localStorage alone if jellyfin-web's settings object is not found (section 6) |
 
@@ -1387,6 +1388,32 @@ real `FolderImageProvider`, `ImageSaver`, `ManagedFileSystem` and `SkiaEncoder` 
   whose size or last byte differs. The dry run writes nothing. A re-run is a no-op.
 
 Not exercised: a live server, the real library query (`GetItemList`/`GetItemIds` were faked), and FUSE.
+
+### 7.10 Scaled JPEG decode: `SkiaEncoder.EncodeImage` / `Decode`, `ImageHelper.GetNewImageSize` (`ScaledDecodePatches.cs`)
+
+Optional "scaled image decode". Stock 12.3 `SkiaEncoder.EncodeImage` decodes the whole source
+(`GetBitmap` -> `Decode`) and only then resizes, so a 720 px poster from a 3840x4602 JPEG pays the full
+decode. For a `.jpg`/`.jpeg` source (ASCII path) the patch decodes at 1/2, 1/4 or 1/8 scale instead, taking
+the largest reduction whose decoded size is still at least 2x the final size in both dimensions. Nothing is
+reduced when the output is more than half the source, so full-width requests are unchanged.
+
+- `EncodeImage` prefix opens a thread-static context; its finalizer closes it and checks the written file has
+  exactly the dimensions stock would have produced.
+- `Decode` prefix does the reduced decode (`SKCodec.GetScaledDimensions` + `GetPixels`) for the one decode of
+  the input path, into the same kind of bitmap stock builds, with stock's origin result. Not a JPEG, animated,
+  no gain, options that make stock return the original, or any failure: stock decode.
+- `ImageHelper.GetNewImageSize` prefix hands the full source size to the size calculation, so the output size
+  is stock's, not that of the reduced bitmap.
+
+Orientation, fill, blur, layers and the encoder are stock's. Output pixels differ slightly (DCT scaling is a
+box filter ahead of stock's downscale). **Fail soft:** a wrong output size (for example the JIT inlined
+`GetNewImageSize`), or an exception after a reduced decode, deletes the output, switches the feature off for the
+process, logs a warning and re-runs the encode the stock way once.
+
+Measured (local harness, real 12.3 `SkiaEncoder`, synthetic 3840x4602 JPEG on an M-series Mac, warm file
+cache, so it shows decode CPU only): maxWidth 720 52 -> 42 ms, width 400 31 -> 19 ms, blur + maxWidth 300
+31 -> 20 ms, fillWidth 720 62 -> 53 ms; maxWidth 1800 and 3780 unchanged. Output dimensions identical in
+every case. Not exercised: the live server, FUSE-backed sources, EXIF-rotated sources.
 
 ## 8. Plugin HTTP routes
 
