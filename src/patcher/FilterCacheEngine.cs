@@ -49,7 +49,7 @@ namespace Jellyfin.Plugin.Plus.Patcher
     /// with TopParentIds = [library] and nothing else, so the "countable item" rules (alternate versions
     /// hidden behind their primary, owned non-extras excluded) are stock's own, not a copy.
     /// </summary>
-    internal static class FilterCacheEngine
+    internal static partial class FilterCacheEngine
     {
         internal const string KeysTable = "JellyfinPlus_FilterKeys";
         internal const string MetaTable = "JellyfinPlus_FilterKeysMeta";
@@ -327,6 +327,7 @@ namespace Jellyfin.Plugin.Plus.Patcher
             Exec(conn, null, "CREATE TABLE IF NOT EXISTS " + MetaTable + " ("
                 + "LibraryId TEXT NOT NULL, Kind INTEGER NOT NULL, BuiltAtUtc TEXT NOT NULL, SourceItemCount INTEGER NOT NULL, "
                 + "KeyCount INTEGER NOT NULL, Fingerprint TEXT NOT NULL, PRIMARY KEY (LibraryId, Kind)) WITHOUT ROWID");
+            EnsureIncrSchema(conn);
             _schemaReady = true;
         }
 
@@ -554,6 +555,8 @@ namespace Jellyfin.Plugin.Plus.Patcher
 
             // The fingerprint is taken BEFORE the aggregates: a change racing the build leaves the stored
             // fingerprint older than the data, so the next check calls it stale and rebuilds. Safe direction.
+            // The incremental watermark is read before the fingerprint for the same reason.
+            var watermark = IncrementalEnabled ? ReadWatermark(conn, lib) : null;
             var libFp = Fingerprints(db, new[] { lib })[lib];
             var genreFp = GenreFingerprint(db);
             var stored = ReadMeta(conn, new[] { lib });
@@ -564,12 +567,24 @@ namespace Jellyfin.Plugin.Plus.Patcher
                 return false;
             }
 
+            if (!force && IncrementalEnabled && TryIncremental(db, conn, lib, name, libFp, genreFp, watermark))
+            {
+                return true;
+            }
+
             var started = DateTime.UtcNow;
-            var rows = ComputeRows(lib, db);
+            List<KeyRow> rows = null;
+            IncrInfo incr = null;
+            if (!(IncrementalEnabled && FullFromItems(db, conn, lib, watermark, genreFp, out rows, out incr)))
+            {
+                rows = ComputeRows(lib, db);
+            }
 
             var sourceCount = int.Parse(libFp.Split('|')[0], CultureInfo.InvariantCulture);
-            WriteLibrary(conn, lib, rows, sourceCount, libFp, genreFp);
+            WriteLibrary(conn, lib, rows, sourceCount, libFp, genreFp, incr);
             InvalidateFingerprints();
+            LastMode = "full";
+            Count("rebuild-full");
             _log?.LogInformation(
                 "JellyfinPlus: filter key cache: library '{Library}' rebuilt in {Ms} ms ({Keys} keys from {Items} items)",
                 name,
@@ -728,7 +743,7 @@ namespace Jellyfin.Plugin.Plus.Patcher
             }
         }
 
-        private static void WriteLibrary(DbConnection conn, Guid lib, List<KeyRow> rows, int sourceCount, string libFp, string genreFp)
+        private static void WriteLibrary(DbConnection conn, Guid lib, List<KeyRow> rows, int sourceCount, string libFp, string genreFp, IncrInfo incr)
         {
             // Raw ADO bypasses Jellyfin's own write-retry policy, so a busy database is retried here.
             for (var attempt = 0; ; attempt++)
@@ -768,6 +783,21 @@ namespace Jellyfin.Plugin.Plus.Patcher
                     }
 
                     var now = DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture);
+                    Exec(conn, tx, "DELETE FROM " + IncrTable + " WHERE LibraryId = @l", ("@l", lid));
+                    if (incr != null)
+                    {
+                        Exec(
+                            conn,
+                            tx,
+                            "INSERT INTO " + IncrTable + " (LibraryId, Watermark, GenreFp, FullAtUtc, MetaBuiltAt, Types) VALUES (@l, @w, @g, @f, @b, @t)",
+                            ("@l", lid),
+                            ("@w", incr.Watermark),
+                            ("@g", incr.GenreFp),
+                            ("@f", now),
+                            ("@b", now),
+                            ("@t", incr.Types));
+                    }
+
                     foreach (var k in _allKinds)
                     {
                         Exec(
@@ -816,6 +846,11 @@ namespace Jellyfin.Plugin.Plus.Patcher
             {
                 Exec(conn, null, "DELETE FROM " + KeysTable + " WHERE LibraryId = @l", ("@l", gone));
                 Exec(conn, null, "DELETE FROM " + MetaTable + " WHERE LibraryId = @l", ("@l", gone));
+                Exec(conn, null, "DELETE FROM " + IncrTable + " WHERE LibraryId = @l", ("@l", gone));
+                if (Guid.TryParse(gone, out var goneId))
+                {
+                    Exec(conn, null, "DELETE FROM " + ItemTable + " WHERE LibraryId = @l", ("@l", goneId.ToByteArray()));
+                }
             }
         }
 
@@ -1046,6 +1081,7 @@ namespace Jellyfin.Plugin.Plus.Patcher
             {
                 ["Ready"] = Ready,
                 ["State"] = _runState,
+                ["LastMode"] = LastMode,
                 ["CurrentLibrary"] = _currentLibrary,
                 ["LibraryIndex"] = _libraryIndex,
                 ["LibraryCount"] = _libraryTotal,
