@@ -627,6 +627,18 @@ about 0.3 s per image the first time a size is requested (it resizes, then cache
   and each URL is fetched once per page load. The server resizes ahead of need, and the browser caches
   the result, since tagged image URLs are served `max-age=31536000, immutable`. When stock's own fill
   arrives, it hits the cache.
+- **Server warm batch** (`src/ImageWarmController.cs`, `POST /JellyfinPlus/Images/Warm`, `[Authorize]`).
+  Stock encodes one image per request, does not dedupe identical concurrent requests, and a browser has
+  6 connections per host, so a cold screenful of ~30 cards takes ~2 s. For look-ahead cards *beyond*
+  stock's own 50% zone the client first posts `{"urls":[...]}` (relative `/Items/<guid>/Images/<Type>[/<n>]?<query>`
+  paths, nearest first, debounced 100 ms, max 48 per request), then runs its normal browser fetch so the
+  bytes land in the browser cache. The server accepts only that exact shape (query `[A-Za-z0-9=&%._-]`,
+  <= 400 chars; anything else is a 400, so no SSRF or arbitrary paths), answers 202 at once, and fetches each
+  path from `127.0.0.1:<local port><PathBase>` with `Accept: image/webp,*/*` (the cache key browsers produce),
+  headers only. Concurrency is one static gate of max(2, cores/2) shared by every caller, a per-URL
+  in-flight set dedupes and caps pending at 256. Fail soft: errors are logged at debug only; a non-2xx
+  (404 on an older server) stops posting for the page session and the browser fetch proceeds unchanged.
+  Skipped on data-saver / 2g, TV layout, and with `jellyfinPlus.imagePreload` = `off`.
 - **Backdrop look-ahead** (`model/backdrop-url.js`, `controller/card-data.js`): the card-data lookup also
   asks for `EnableImageTypes=Backdrop,Primary&ImageTypeLimit=1` and keeps the tags; a mouse entering a
   card, or a touch card held on screen 300 ms (max 2 per scroll settle), fetches the exact details-page

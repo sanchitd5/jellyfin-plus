@@ -93,3 +93,80 @@ export function createQueue(load, max, remember) {
         }
     };
 }
+
+/*
+ * Server warm batch (POST /JellyfinPlus/Images/Warm). The server resizes the look-ahead URLs with
+ * bounded parallelism before the browser's own 6 connections ask for them. The route only accepts a
+ * relative `/Items/<guid>/Images/<Type>[/<n>]?<query>` path (its own PathBase is prepended), so a
+ * URL that does not fit is simply not warmed.
+ */
+export var WARM_MAX = 48;
+export var WARM_DELAY_MS = 100;
+export var WARM_PATH = '/JellyfinPlus/Images/Warm';
+
+/* The path to send for `url`, or '' when it is not same-origin or not the shape the route accepts. */
+export function warmPath(url, origin) {
+    try {
+        var u = new URL(url, origin);
+        if (u.origin !== new URL(origin).origin) {
+            return '';
+        }
+        var m = /(\/Items\/(?:[0-9a-fA-F]{32}|[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})\/Images\/[A-Za-z]{3,24}(?:\/[0-9]{1,3})?)$/.exec(u.pathname);
+        var q = u.search.slice(1);
+        return m && q && q.length <= 400 && /^[A-Za-z0-9=&%._-]+$/.test(q) ? m[1] + '?' + q : '';
+    } catch (e) {
+        return '';
+    }
+}
+
+/*
+ * Collects (url, distance) pairs for `delay` ms, then calls `send(paths)` once with at most WARM_MAX of
+ * them, nearest first, and `done(urls)` when that settles (success or not) so the caller can start the
+ * browser fetch. Each path is sent once. A rejected send (404 on an older server) stops all posting:
+ * later URLs go straight to `done`. `schedule` is setTimeout, injectable for tests.
+ */
+export function createWarmer(send, done, delay, schedule) {
+    schedule = schedule || setTimeout;
+    var pending = new Map();   // path -> { url, d }
+    var sent = new Set();
+    var timer = false;
+    var dead = false;
+
+    function flush() {
+        timer = false;
+        var items = Array.from(pending.values()).sort(function (a, b) { return a.d - b.d; });
+        pending.clear();
+        var batch = items.slice(0, WARM_MAX);
+        var rest = items.slice(WARM_MAX);
+        if (rest.length) {
+            done(rest.map(function (x) { return x.url; }));
+        }
+        if (!batch.length) {
+            return;
+        }
+        var urls = batch.map(function (x) { return x.url; });
+        Promise.resolve().then(function () { return send(batch.map(function (x) { return x.path; })); })
+            .catch(function () { dead = true; })
+            .then(function () { done(urls); });
+    }
+
+    return {
+        /* True when the URL was taken (the caller must wait for `done`); false means fetch it now. */
+        add: function (url, path, d) {
+            if (dead || !path || sent.has(path)) {
+                return false;
+            }
+            if (sent.size > REMEMBER) {
+                sent.clear();
+            }
+            sent.add(path);
+            pending.set(path, { url: url, path: path, d: d });
+            if (!timer) {
+                timer = true;
+                schedule(flush, typeof delay === 'number' ? delay : WARM_DELAY_MS);
+            }
+            return true;
+        },
+        isDead: function () { return dead; }
+    };
+}

@@ -1,5 +1,5 @@
 import { log } from '../lib/log.js';
-import { isLazyLoaderClass, isImageUrl, enabled, createQueue, PRELOAD_MARGIN } from '../model/image-preload.js';
+import { isLazyLoaderClass, isImageUrl, enabled, createQueue, createWarmer, warmPath, WARM_PATH, PRELOAD_MARGIN } from '../model/image-preload.js';
 import { backdropEnabled, slowConnection, stockBackdropUrl, isRealBackdrop } from '../model/backdrop-url.js';
 import { apiClient, cardInfo, onCardInfo, onCardWatch, watchCard } from './card-data.js';
 
@@ -18,6 +18,7 @@ import { apiClient, cardInfo, onCardInfo, onCardWatch, watchCard } from './card-
  */
 
 var queue = null;
+var warmer = null;
 var hot = new Set();   // backdrop URLs a pointer is hovering: fetched at normal priority
 
 function getQueue() {
@@ -41,11 +42,49 @@ function getQueue() {
     return queue;
 }
 
+/* True when stock's own observer (rootMargin 50%) is already fetching this card: never warm those. */
+function inStockZone(r) {
+    var w = window.innerWidth;
+    var h = window.innerHeight;
+    return r.bottom > -h / 2 && r.top < h * 1.5 && r.right > -w / 2 && r.left < w * 1.5;
+}
+
+/* One POST per debounce window asks the server to resize the batch; the browser fetch follows it. */
+function getWarmer() {
+    if (!warmer) {
+        warmer = createWarmer(function (paths) {
+            var c = apiClient();
+            var tok = c && typeof c.accessToken === 'function' ? c.accessToken() : '';
+            var headers = { 'Content-Type': 'application/json' };
+            if (tok) {
+                headers['X-Emby-Token'] = tok;
+            }
+            return fetch(c && typeof c.getUrl === 'function' ? c.getUrl(WARM_PATH.slice(1)) : WARM_PATH, {
+                method: 'POST',
+                headers: headers,
+                body: JSON.stringify({ urls: paths })
+            }).then(function (res) {
+                if (!res.ok) {
+                    throw new Error('warm ' + res.status);
+                }
+            });
+        }, function (urls) {
+            var q = getQueue();
+            urls.forEach(function (u) { q.add(u, 0); });
+        });
+    }
+    return warmer;
+}
+
 function showsImage(el) {
     if (!el || el.getAttribute('data-src')) {
         return false;
     }
     return el.tagName === 'IMG' ? !!el.getAttribute('src') : /url\(/.test(el.style.backgroundImage || '');
+}
+
+function warmAllowed() {
+    return !slowConnection(navigator.connection) && !!apiClient();
 }
 
 function onAhead(entries) {
@@ -59,14 +98,22 @@ function onAhead(entries) {
         }
         if (entry.isIntersecting) {
             var r = entry.boundingClientRect;
-            batch.push({ url: url, d: Math.abs(r.top + r.height / 2 - mid) });
+            batch.push({ url: url, d: Math.abs(r.top + r.height / 2 - mid), stock: inStockZone(r) });
         } else {
             q.drop(url);
         }
     });
     // One observer callback delivers a whole screenful; the queue starts loads as they arrive, so
     // hand it the batch nearest-first or the first free slots go to whatever the DOM listed first.
-    batch.sort(function (a, b) { return a.d - b.d; }).forEach(function (x) { q.add(x.url, x.d); });
+    // Cards beyond stock's zone go to the server in one batch first (the browser fetch follows it).
+    // Slow links, data-saver and a server without the route skip it and fetch directly.
+    var w = warmAllowed() ? getWarmer() : null;
+    batch.sort(function (a, b) { return a.d - b.d; }).forEach(function (x) {
+        var path = w && !x.stock ? warmPath(x.url, window.location.href) : '';
+        if (!path || !w.add(x.url, path, x.d)) {
+            q.add(x.url, x.d);
+        }
+    });
 }
 
 function patch(Cls) {
