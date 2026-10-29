@@ -1,5 +1,7 @@
 import { log } from '../lib/log.js';
 import { isLazyLoaderClass, isImageUrl, enabled, createQueue, PRELOAD_MARGIN } from '../model/image-preload.js';
+import { backdropEnabled, slowConnection, stockBackdropUrl, isRealBackdrop } from '../model/backdrop-url.js';
+import { apiClient, cardInfo, onCardInfo, onCardWatch, watchCard } from './card-data.js';
 
 /*
  * Smoother card images (see model/image-preload.js for the why and the measurements).
@@ -16,6 +18,7 @@ import { isLazyLoaderClass, isImageUrl, enabled, createQueue, PRELOAD_MARGIN } f
  */
 
 var queue = null;
+var hot = new Set();   // backdrop URLs a pointer is hovering: fetched at normal priority
 
 function getQueue() {
     if (!queue) {
@@ -25,7 +28,7 @@ function getQueue() {
                 var timer = setTimeout(resolve, 15000);
                 img.decoding = 'async';
                 if ('fetchPriority' in img) {
-                    img.fetchPriority = 'low';
+                    img.fetchPriority = hot.has(url) ? 'auto' : 'low';
                 }
                 img.onload = img.onerror = function () {
                     clearTimeout(timer);
@@ -170,4 +173,130 @@ export function installImagePreload() {
         return;
     }
     active = true;
+    try {
+        installBackdropPrefetch();
+    } catch (err) {
+        log('backdrop preload: install failed', err);
+    }
+}
+
+/*
+ * Details-page backdrop look-ahead (URL maths in model/backdrop-url.js). A card the pointer enters, or
+ * a card held on screen for BD_DWELL_MS on a touch screen (at most BD_CAP per scroll settle, and only
+ * items with a real backdrop: never the Primary fallback), has the backdrop stock will ask for on its
+ * details page fetched early through the same queue. Hover prefetches the single hovered card,
+ * Primary fallback included. Item data
+ * (tags) comes from card-data.js. Off: localStorage jellyfinPlus.backdropPreload = off, data-saver or
+ * a 2g link, TV layout.
+ */
+var BD_DWELL_MS = 300;
+var BD_CAP = 2;
+var BD_SETTLE_MS = 400;
+var budget = BD_CAP;
+var settleTimer = null;
+var requested = new Set();
+var awaiting = new Map();   // card id -> { card, hover } still waiting for its item record
+var dwell = new Map();      // card -> timer
+
+function backdropUrlFor(id) {
+    var info = cardInfo(id);
+    var c = apiClient();
+    if (!info || !info.img || !c || typeof c.getScaledImageUrl !== 'function') {
+        return '';
+    }
+    var root = document.documentElement;
+    return stockBackdropUrl(info.img, {
+        innerWidth: window.innerWidth,
+        innerHeight: window.innerHeight,
+        mobileLayout: root.classList.contains('layout-mobile')
+    }, c.getScaledImageUrl.bind(c)) || '';
+}
+
+function backdropAllowed() {
+    return backdropEnabled(window.localStorage) && !slowConnection(navigator.connection)
+        && !document.documentElement.classList.contains('layout-tv');
+}
+
+function prefetchBackdrop(card, hover) {
+    var id = card.getAttribute('data-id');
+    if (!id || !backdropAllowed()) {
+        return;
+    }
+    if (!cardInfo(id)) {
+        awaiting.set(id, { card: card, hover: hover });
+        watchCard(card);
+        return;
+    }
+    // Touch dwell is speculative and most cards are never opened: skip the large Primary fallback.
+    if (!hover && !isRealBackdrop(cardInfo(id).img)) {
+        return;
+    }
+    var url = backdropUrlFor(id);
+    if (!url || !isImageUrl(url)) {
+        return;
+    }
+    if (hover) {
+        hot.add(url);
+    } else if (requested.has(url)) {
+        return;
+    } else if (budget <= 0) {
+        return;
+    } else {
+        budget--;
+    }
+    if (requested.size > 500) {
+        requested.clear();
+    }
+    requested.add(url);
+    getQueue().add(url, hover ? -1 : 0);
+}
+
+function installBackdropPrefetch() {
+    document.addEventListener('pointerover', function (e) {
+        try {
+            if (e.pointerType !== 'mouse') {
+                return;
+            }
+            var card = e.target && e.target.closest && e.target.closest('.card[data-id]');
+            if (card && !card.contains(e.relatedTarget)) {
+                prefetchBackdrop(card, true);
+            }
+        } catch (err) {
+            log('backdrop preload: hover failed', err);
+        }
+    }, true);
+
+    window.addEventListener('scroll', function () {
+        clearTimeout(settleTimer);
+        settleTimer = setTimeout(function () { budget = BD_CAP; }, BD_SETTLE_MS);
+    }, { capture: true, passive: true });
+
+    onCardInfo(function (id) {
+        var w = awaiting.get(id);
+        if (w) {
+            awaiting.delete(id);
+            prefetchBackdrop(w.card, w.hover);
+        }
+    });
+
+    if (typeof IntersectionObserver !== 'function' || !window.matchMedia
+        || !window.matchMedia('(pointer: coarse)').matches) {
+        return;
+    }
+    var io = new IntersectionObserver(function (entries) {
+        entries.forEach(function (en) {
+            var card = en.target;
+            clearTimeout(dwell.get(card));
+            dwell.delete(card);
+            if (en.isIntersecting) {
+                dwell.set(card, setTimeout(function () {
+                    dwell.delete(card);
+                    prefetchBackdrop(card, false);
+                }, BD_DWELL_MS));
+            } else {
+                awaiting.delete(card.getAttribute('data-id'));
+            }
+        });
+    }, { threshold: 0.6 });
+    onCardWatch(function (card) { io.observe(card); });
 }

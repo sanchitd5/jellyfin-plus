@@ -1,5 +1,6 @@
 import { log } from '../lib/log.js';
 import { badgeInfo } from '../model/card-badges.js';
+import { backdropFields, backdropEnabled } from '../model/backdrop-url.js';
 
 /*
  * PER-CARD DATA, LOOKED UP LAZILY (shared by view/card-actions.js and view/card-badges.js).
@@ -15,6 +16,9 @@ import { badgeInfo } from '../model/card-badges.js';
  * (model/card-badges.js badgeInfo) and cached for the page's lifetime, so a card that is redrawn
  * (virtualised chunks, React re-render) costs nothing.
  *
+ * When backdrop look-ahead is on (model/backdrop-url.js) the same query also brings the image tags
+ * (EnableImageTypes=Backdrop,Primary, one each) and the record keeps `img` for the backdrop URL.
+ *
  * Badges can be switched off by setting localStorage `jellyfinPlus.cardBadges` to `off`; the lookup
  * then asks for no extra Fields (the favourite hearts still need it).
  */
@@ -28,6 +32,7 @@ var cache = new Map();
 var pending = new Set();
 var timer = null;
 var listeners = [];
+var watchListeners = [];
 var observer = null;
 var watched = new WeakSet();
 
@@ -59,6 +64,11 @@ export function cardInfo(id) {
     return cache.get(id) || null;
 }
 
+/* fn(card) runs once for every card handed to watchCard. */
+export function onCardWatch(fn) {
+    watchListeners.push(fn);
+}
+
 /* fn(id, info) runs when a lookup brings a record for an item. */
 export function onCardInfo(fn) {
     listeners.push(fn);
@@ -81,16 +91,21 @@ function flush() {
 
     var ids = Array.from(pending).filter(function (id) { return !cache.has(id); });
     pending.clear();
+    var withImages = backdropEnabled(window.localStorage);
     var fields = badgesEnabled() ? 'Tags,Width,Height' : undefined;
     for (var i = 0; i < ids.length; i += LOOKUP_BATCH) {
         var chunk = ids.slice(i, i + LOOKUP_BATCH);
         try {
             var query = {
                 Ids: chunk.join(','),
-                EnableImages: false,
+                EnableImages: withImages,
                 EnableTotalRecordCount: false,
                 Limit: chunk.length
             };
+            if (withImages) {
+                query.EnableImageTypes = 'Backdrop,Primary';
+                query.ImageTypeLimit = 1;
+            }
             if (fields) {
                 query.Fields = fields;
             }
@@ -100,6 +115,10 @@ function flush() {
                     var info = it && it.Id && !cache.has(it.Id) ? badgeInfo(it) : null;
                     if (!info) {
                         return;
+                    }
+
+                    if (withImages) {
+                        info.img = backdropFields(it);
                     }
 
                     remember(it.Id, info);
@@ -137,6 +156,13 @@ export function watchCard(card) {
     }
 
     watched.add(card);
+    watchListeners.forEach(function (fn) {
+        try {
+            fn(card);
+        } catch (err) {
+            log('card data: watch listener failed', err);
+        }
+    });
     if (typeof IntersectionObserver === 'undefined') {
         want(id);
         return;
