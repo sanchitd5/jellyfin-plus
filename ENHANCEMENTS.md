@@ -623,10 +623,14 @@ about 0.3 s per image the first time a size is requested (it resizes, then cache
 (found by shape, one level into module exports, because the class sits on the default-export object
 `{LazyLoader, lazyChildren}`; the same in the 12.1 and 12.3 builds). For each loader:
 - **Look-ahead pass:** a second observer, 250% of the viewport wide, requests the cards' own `data-src`
-  image URLs early. The requests are low priority, at most 4 in flight, nearest to the viewport first,
+  image URLs early. The requests are low priority, at most 6 in flight (the browser's HTTP/1.1
+  per-host limit), nearest to the viewport first,
   and each URL is fetched once per page load. The server resizes ahead of need, and the browser caches
   the result, since tagged image URLs are served `max-age=31536000, immutable`. When stock's own fill
   arrives, it hits the cache.
+- **Card fade:** card images (`.cardImageContainer.lazy-image-fadein`) fade in over at most 100 ms
+  instead of stock's 500 ms (a CSS rule, `jellyfinPlusCardFadeStyle`). Off with the same
+  `jellyfinPlus.imagePreload` switch.
 - **Backdrop look-ahead** (`model/backdrop-url.js`, `controller/card-data.js`): the card-data lookup also
   asks for `EnableImageTypes=Backdrop,Primary&ImageTypeLimit=1` and keeps the tags; a mouse entering a
   card, or a touch card held on screen 300 ms (max 2 per scroll settle), fetches the exact details-page

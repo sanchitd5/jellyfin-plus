@@ -174,10 +174,32 @@ export function installImagePreload() {
     }
     active = true;
     try {
+        installCardFade();
+    } catch (err) {
+        log('card fade: install failed', err);
+    }
+    try {
         installBackdropPrefetch();
     } catch (err) {
         log('backdrop preload: install failed', err);
     }
+}
+
+/*
+ * Card images fade in over 0.5 s unless the user turned on stock's fast fade-in (0.1 s,
+ * images/style.scss .lazy-image-fadein / -fast). With the look-ahead the image is usually cached by
+ * the time the card shows, so a long fade is pure delay: cap it at 100 ms on card images only.
+ */
+var CARD_FADE_STYLE_ID = 'jellyfinPlusCardFadeStyle';
+
+function installCardFade() {
+    if (document.getElementById(CARD_FADE_STYLE_ID)) {
+        return;
+    }
+    var style = document.createElement('style');
+    style.id = CARD_FADE_STYLE_ID;
+    style.textContent = '.cardImageContainer.lazy-image-fadein { animation-duration: 0.1s !important; }';
+    (document.head || document.documentElement).appendChild(style);
 }
 
 /*

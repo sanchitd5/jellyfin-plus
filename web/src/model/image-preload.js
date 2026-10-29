@@ -13,7 +13,9 @@
  */
 
 export var PRELOAD_MARGIN = '250%';
-export var MAX_IN_FLIGHT = 4;
+// 6 = the browser's HTTP/1.1 connection limit per host (CT114 serves no HTTP/2): more only queues
+// in the browser, fewer leaves a fast scroll outrunning the look-ahead.
+export var MAX_IN_FLIGHT = 6;
 export var REMEMBER = 4000;
 export var PREF_KEY = 'jellyfinPlus.imagePreload';
 
