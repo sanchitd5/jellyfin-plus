@@ -34,12 +34,18 @@ t('desktop: no Primary fallback', function () {
     assert.equal(stockBackdropUrl(bare, desk, fake), '');
 });
 t('phone: own, parent, then Primary', function () {
-    assert.equal(stockBackdropUrl(own, phone, fake), 'U/a/Backdrop/?tag=t1&w=1440');
-    assert.equal(stockBackdropUrl(ep, phone, fake), 'U/s/Backdrop/?tag=st&w=1440');
+    assert.equal(stockBackdropUrl(own, phone, fake), 'U/a/Backdrop/0?tag=t1&w=1440');
+    assert.equal(stockBackdropUrl(ep, phone, fake), 'U/s/Backdrop/0?tag=st&w=1440');
     assert.equal(stockBackdropUrl(bare, phone, fake), 'U/b/Primary/?tag=p&w=1440');
 });
-t('narrow non-mobile window takes the header path', function () {
-    assert.equal(stockBackdropUrl(bare, { innerWidth: 900, innerHeight: 600, mobileLayout: false }, fake), 'U/b/Primary/?tag=p&w=720');
+t('narrow non-mobile window shows no backdrop (stock clearBackdrop)', function () {
+    assert.equal(stockBackdropUrl(own, { innerWidth: 900, innerHeight: 600, mobileLayout: false }, fake), '');
+});
+t('option key order matches stock (apiclient serialises in insertion order)', function () {
+    var keys = function (id, o) { return Object.keys(o).join(','); };
+    assert.equal(stockBackdropUrl(own, desk, keys), 'type,tag,maxWidth,index');
+    assert.equal(stockBackdropUrl(own, phone, keys), 'type,index,tag,maxWidth');
+    assert.equal(stockBackdropUrl(bare, phone, keys), 'type,tag,maxWidth');
 });
 t('people and books get no header backdrop', function () {
     assert.equal(stockBackdropUrl(backdropFields({ Id: 'p', Type: 'Person', ImageTags: { Primary: 'x' } }), phone, fake), '');

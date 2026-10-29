@@ -93,20 +93,26 @@ export function stockBackdropUrl(item, env, getScaledImageUrl) {
         return '';
     }
 
-    // Header path (backdropImage.ts getItemBackdropImageUrl): own, parent, then Primary. People and
-    // books have no header backdrop. The option objects below are a reconstruction (unverified).
+    // itemDetails reloadFromItem: the header backdrop renders only on the mobile layout; a narrow
+    // desktop window gets clearBackdrop() and no backdrop at all.
+    if (!env.mobileLayout) {
+        return '';
+    }
+    // Header path (backdropImage.ts getItemBackdropImageUrl, release-12.z): own, parent, then Primary,
+    // options spread last ({ maxWidth }). People and books have no header backdrop.
     if (item.Type === 'Person' || item.Type === 'Book') {
         return '';
     }
     if (item.BackdropImageTags.length) {
-        return getScaledImageUrl(item.Id, { maxWidth: maxWidth, type: 'Backdrop', tag: item.BackdropImageTags[0] });
+        return getScaledImageUrl(item.Id,
+            { type: 'Backdrop', index: 0, tag: item.BackdropImageTags[0], maxWidth: maxWidth });
     }
     if (item.ParentBackdropItemId && item.ParentBackdropImageTags.length) {
         return getScaledImageUrl(item.ParentBackdropItemId,
-            { maxWidth: maxWidth, type: 'Backdrop', tag: item.ParentBackdropImageTags[0] });
+            { type: 'Backdrop', index: 0, tag: item.ParentBackdropImageTags[0], maxWidth: maxWidth });
     }
     if (item.PrimaryTag) {
-        return getScaledImageUrl(item.Id, { maxWidth: maxWidth, type: 'Primary', tag: item.PrimaryTag });
+        return getScaledImageUrl(item.Id, { type: 'Primary', tag: item.PrimaryTag, maxWidth: maxWidth });
     }
     return '';
 }
