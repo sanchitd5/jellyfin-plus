@@ -534,6 +534,11 @@ about 47 000 items and 12 000 tags. The cache stores the keys in two tables insi
   by-name item kinds (people, genres, studios, music artists); and any query field the code does not
   know (it compares every settable `InternalItemsQuery` property against a default, so a new Jellyfin
   field defaults to stock). The reason is counted in `Outcomes` on the status endpoint.
+- A library change is applied incrementally, not by re-aggregating the whole library (section 7.5): the
+  full rebuild also records which keys each item contributes to, and a later change re-derives only the
+  changed and removed items and recomputes only the keys they touch. Anything unexpected falls back to
+  the full rebuild, which also runs at least once a day. Same rows as a full build, proved on a copy of
+  the real database.
 - There is no setting to turn the cache off. If the patch cannot install, or a rebuild fails, stock
   serves the lists.
 
@@ -1268,6 +1273,39 @@ aggregates and the write is still one connection and one transaction. Proved row
 sequence, same hash) to the serial path on a copy of the real DB. Any error in the concurrent path falls
 back to the serial path (`FilterCacheEngine.AggregateDegree = 1` forces it).
 
+Incremental update (`FilterCacheIncremental.cs`): on a 72k-item library the library changes all day
+(recordings come and go), so most rebuilds were full re-aggregations of an almost unchanged library.
+The full rebuild now also streams one row per (item, key) into `JellyfinPlus_FilterItemKeys` (Kind 0 is
+a "present" row for every item the TranslateQuery filter admits) and records the state in
+`JellyfinPlus_FilterIncr` (watermark = newest `DateLastSaved` read before the fingerprint, Genre
+fingerprint, the time of the full build, the key rows' `BuiltAtUtc`, the item-type list). A stale
+library is then updated like this, in one transaction:
+
+- the delta is the set difference between the filter's current item ids and the stored "present" rows
+  (adds and removals, independent of any date, also catching an item whose type changed), plus items
+  with `DateLastSaved >= watermark`;
+- the changed items' old rows are deleted, their new rows are derived by the same join the full build
+  streams, and for each touched key count and `MIN(Value)` are recomputed from the item rows and the key
+  row written or deleted (genre keys also refresh their Genre-entity row); meta rows get the new
+  counts and fingerprint and the watermark advances in the same transaction;
+- fallback to the full rebuild (nothing written first) when: forced, no Incr row, the Genre-entity
+  fingerprint changed, the Incr row does not match the stored key rows (another writer rebuilt them),
+  more than 2000 items changed/removed (`FilterCacheEngine.MaxDelta`), the last full build is older than
+  24 hours (`FullSelfHeal`), or anything throws. `FilterCacheEngine.IncrementalEnabled = false` forces the
+  full path.
+- the full build derives the key rows from the item rows it just streamed (one grouped scan: distinct
+  items per key, `MIN(Value)`), in the same row order as before, instead of the five EF aggregates. That
+  made it faster (about 8 s against 12 to 13 s on the 72k-item copy) and exact: EF's grouped
+  `COUNT(DISTINCT)` over the ItemValuesMap join, run by the SQLite 3.46.1 in e_sqlite3 2.1.10, returned
+  1057 where the true distinct count of one tag was 1058 (SQLite 3.54, or the same SQL with the map index
+  disabled, gives 1058). If recording the item rows fails, the plain aggregates run and incremental stays
+  off until the next full build.
+
+The item table is a plugin table in `jellyfin.db` like the two key tables (one row per item per tag,
+genre, year and rating; item and library ids as 16-byte blobs, the item type as a small integer that
+indexes the list in the Incr row). `GET /JellyfinPlus/FilterCache/Status` reports `LastMode` and the
+outcome counters `rebuild-full` and `rebuild-incremental`.
+
 Tag window: postfixes on `Jellyfin.Api.Controllers.FilterController.GetQueryFiltersLegacy` and
 `GetQueryFilters` (`FilterCachePatches.cs`), so they cover the cache-served and the stock path alike.
 Two optional query parameters: `jpTagLimit` (1 to 5000) and `jpTagQuery` (a substring, matched
@@ -1592,7 +1630,7 @@ only, by Clip Up Next).
 
 | What | Where | Rebuild or clear |
 |---|---|---|
-| Filter key cache | Two tables in Jellyfin's `jellyfin.db`: `JellyfinPlus_FilterKeys(LibraryId, Kind, ItemType, CleanValue, Value, ItemCount, RefId)` and `JellyfinPlus_FilterKeysMeta(LibraryId, Kind, BuiltAtUtc, SourceItemCount, KeyCount, Fingerprint)`. Created with `CREATE TABLE IF NOT EXISTS` by raw SQL; Jellyfin's own schema and migrations are never touched. One row per distinct key per library per item type. Kinds: tags, genres, years, ratings, genre entities. | Rebuild: `POST /JellyfinPlus/FilterCache/Rebuild` or the scheduled task. A forced rebuild deletes and rewrites each library's rows in one transaction, so readers see old or new rows, never a mix. Rows of libraries that no longer exist are removed on each rebuild. Nothing in the plugin drops the tables, including on uninstall. To remove them, stop Jellyfin, back up `jellyfin.db`, and drop both tables by hand (not exercised here; the engine recreates them on its next run). |
+| Filter key cache | Two tables in Jellyfin's `jellyfin.db`: `JellyfinPlus_FilterKeys(LibraryId, Kind, ItemType, CleanValue, Value, ItemCount, RefId)` and `JellyfinPlus_FilterKeysMeta(LibraryId, Kind, BuiltAtUtc, SourceItemCount, KeyCount, Fingerprint)`. Created with `CREATE TABLE IF NOT EXISTS` by raw SQL; Jellyfin's own schema and migrations are never touched. One row per distinct key per library per item type. Kinds: tags, genres, years, ratings, genre entities. Two more tables serve the incremental update: `JellyfinPlus_FilterItemKeys(LibraryId BLOB, Kind, TypeNo, CleanValue, ItemId BLOB, Value)` (one row per item per key, plus a Kind 0 presence row per item) and `JellyfinPlus_FilterIncr(LibraryId, Watermark, GenreFp, FullAtUtc, MetaBuiltAt, Types)`. The item table is the large one (about 2 million rows for a 72k-item library with ~28 tags per item); a full rebuild rewrites it, a delta touches only the changed items' rows. | Rebuild: `POST /JellyfinPlus/FilterCache/Rebuild` or the scheduled task. A forced rebuild deletes and rewrites each library's rows in one transaction, so readers see old or new rows, never a mix. Rows of libraries that no longer exist are removed on each rebuild. Nothing in the plugin drops the tables, including on uninstall. To remove them, stop Jellyfin, back up `jellyfin.db`, and drop both tables by hand (not exercised here; the engine recreates them on its next run). |
 | Search index | Three objects in `jellyfin.db`: virtual tables `JellyfinPlus_FtsNames`, `JellyfinPlus_FtsTags` (FTS5, trigram) and `JellyfinPlus_FtsMeta(Key, Value)`, holding the signature the index was built at. Created with `IF NOT EXISTS`; Jellyfin's schema is untouched. About 45 MB on an 80k-item library. | Rebuild: `POST /JellyfinPlus/FtsIndex/Rebuild` or the scheduled task. Safe to drop by hand with Jellyfin stopped (search falls back to the stock queries; the engine recreates and rebuilds it). The plugin drops nothing on uninstall; the only drop is the one-time rebuild of a `JellyfinPlus_FtsNames` that predates its `SortName` column (7.6). |
 | Synced preferences | The viewer's own `DisplayPreferences` (display preferences id `usersettings`, client `emby`), as three `CustomPrefs` entries: `jellyfinPlus.prefs`, `jellyfinPlus.searchPageSize`, `jellyfinPlus.searchPaging`, each `{"t": ms, "v": value}`. Written through jellyfin-web's `userSettings.set`, so Jellyfin stores them in its `CustomItemDisplayPreferences` table (key length limit 64; ours are 27 or fewer). | Delete the entries by saving display preferences without them, or ignore them: nothing on the server reads them. Removing the plugin leaves them as inert strings. |
 | Plugin settings | XML at `plugins/configurations/Jellyfin.Plugin.Plus.xml` under Jellyfin's data directory (`/var/lib/jellyfin/plugins/configurations/` in the install scripts). On first start the constructor copies `Jellyfin.Plugin.GpuUpscale.xml` over if the new file is absent. | Edit on the dashboard page; changes are pushed to the patches live. Delete the file with Jellyfin stopped to return to the defaults in section 1. |
