@@ -52,6 +52,7 @@ import { installThemeFallback } from './controller/theme-fallback.js';
 import { installLibraryInfinite } from './view/library-infinite.js';
 import { installBottomNav } from './view/bottom-nav.js';
 import { installBrand } from './view/brand.js';
+import { installDetailBlurhash } from './view/detail-blurhash.js';
 
 /*
  * ENTRY POINT. Everything above this module is imported for its side effects (installing hooks)
@@ -132,6 +133,8 @@ function feature(name, install) {
         feature('detail prev/next', installDetailNav);
         feature('detail download', installDetailDownload);
         feature('detail actions', installDetailActions);
+        // Blurhash placeholder under the details header and poster until the real image loads.
+        feature('detail blurhash', installDetailBlurhash);
         // A row per person: their clips in date order, this one in the middle. Reads only.
         feature('detail timeline', installDetailTimeline);
         // Bottom bar (P3): phone and portrait tablet only; reads html classes the modules above set.

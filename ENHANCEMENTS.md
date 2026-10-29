@@ -59,6 +59,7 @@ setting, a control in the page, or "remove the plugin or script".
 | Poster zoom | Client | Tap the details poster to open it full size | On, no switch |
 | Bottom navigation bar | Client | Home, Libraries, Search, Favourites, More at the bottom of the screen on phones and on tablets without a docked drawer; More holds Now playing, Profile, Settings, Select items, Dashboard (admins) and the Plus/stock look switch | On; hidden on the video page, login pages, TV, in selection mode, with the player locked, and with `jellyfinPlus.mobileTheme = off` |
 | Image look-ahead | Client | Card images are requested before they scroll into view and are not reloaded when you scroll back | On; `localStorage jellyfinPlus.imagePreload = off` (not on TV) |
+| Details image placeholder | Client | A blurred preview of the header and poster shows while the real image loads, then fades out | On, no switch |
 | Mobile card actions | Client | Always-visible favourite, more and play buttons on phone cards | On, no switch |
 | Card badges | Client | Resolution, runtime and the first two tags on video cards, looked up lazily for the cards on screen | On; `localStorage jellyfinPlus.cardBadges = off` (not on TV) |
 | Jellyfin Plus theme | Client | `--jp-*` tokens (blue accent `#5ccfff` dark / `#0369a1` light), `jp-phone`/`jp-tablet`/`jp-desktop` width-tier classes on `<html>`, 44 px tap targets on touch tiers, loading skeletons, reduced motion zeroing `--jp-dur*`, pinch-zoom re-enabled (viewport meta rewritten) | On; `localStorage jellyfinPlus.mobileTheme = off` (sets `jp-theme-off`); never on TV |
@@ -625,6 +626,16 @@ about 0.3 s per image the first time a size is requested (it resizes, then cache
 
 Stock's own observer and the URLs it asks for are unchanged. Off switch:
 `localStorage jellyfinPlus.imagePreload = off`. Not active on the TV layout.
+
+**Details blurhash placeholder** (`web/src/view/detail-blurhash.js`, `web/src/model/blurhash.js`). Stock
+leaves the details header (`#itemBackdrop`) empty while its image loads (0.4-2 s on a cold resize) and
+draws the poster's blurhash only when the user setting is on. Once `detail-page.js` has the item DTO,
+its `ImageBlurHashes` entry (own first Backdrop, else Primary for the header; Primary for the poster)
+is decoded by a self-contained Blurhash decoder at 32x32 into a canvas, inserted as the element's
+previous sibling (where stock puts its own), so the real image always paints on top. It is painted
+only while the element still has `lazy-hidden`, has a box, and has no stock blurhash canvas; when
+`lazy-hidden` goes it fades out in 200 ms and is removed (12 s timeout as a backstop). No request, no
+storage key; no hash, a bad hash or any error leaves stock behaviour. Phone and desktop.
 
 **Library grid, card treatment, phone filter sheet, hearts everywhere** (redesign P5/P6; no storage
 keys). `view/library-grid.js` turns wrapping card lists (`.itemsContainer.vertical-wrap`, not home,
