@@ -107,7 +107,7 @@ export function installDetailOverview() {
                 page.classList.remove(FITS);
                 page.classList.remove(SAME);
             },
-            item: function (page) {
+            item: function (page, item) {
                 checkFits(page);
                 // Original title identical to the title: class only, the stock node is untouched.
                 if (item.OriginalTitle && item.Name && String(item.OriginalTitle).toLowerCase() === String(item.Name).toLowerCase()) {
