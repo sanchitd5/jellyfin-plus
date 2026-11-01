@@ -77,6 +77,15 @@ function getViews() {
         .then(function (r) { return r && r.Items; }, function () { return null; });
 }
 
+/* Resolves to the href when there is exactly one library view, null when several/none, undefined when
+   the views could not be fetched (caller keeps the sheet). */
+export function libraryDirectHref() {
+    return getViews().then(function (views) {
+        if (!views) { return undefined; }
+        return views.length === 1 ? libraryHref(views[0], modernApp()) : null;
+    }, function () { return undefined; });
+}
+
 export function openLibrariesSheet(opener, onClose) {
     ensureStyle();
     var list = el('div', 'jp-nav-list');

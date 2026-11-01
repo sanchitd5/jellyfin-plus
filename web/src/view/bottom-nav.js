@@ -2,7 +2,7 @@ import { log } from '../lib/log.js';
 import { el } from '../lib/dom.js';
 import { closeSheet } from './sheet.js';
 import { activeSlot, isVideoPath, isPublicPath } from '../model/nav-routes.js';
-import { openLibrariesSheet, openMoreSheet } from '../controller/more-sheet.js';
+import { openLibrariesSheet, openMoreSheet, libraryDirectHref } from '../controller/more-sheet.js';
 
 /*
  * BOTTOM BAR (P3): Home, Libraries, Search, Favourites, More. Phone (jp-phone) and portrait tablet
@@ -22,7 +22,7 @@ var NAV_ID = 'jellyfinPlusBottomNav';
 var ON = 'jp-nav-on';
 var SLOTS = [
     { id: 'home', label: 'Home', icon: 'home', href: '#/home' },
-    { id: 'libraries', label: 'Libraries', icon: 'video_library', sheet: openLibrariesSheet },
+    { id: 'libraries', label: 'Libraries', icon: 'video_library', sheet: openLibrariesSheet, direct: libraryDirectHref },
     { id: 'search', label: 'Search', icon: 'search', href: '#/search' },
     { id: 'favourites', label: 'Favourites', icon: 'favorite', href: '#/home?tab=1' },
     { id: 'more', label: 'More', icon: 'more_horiz', sheet: openMoreSheet }
@@ -42,16 +42,26 @@ var CSS = [
     '#' + NAV_ID + ' .jp-nav-slot { flex: 1 1 0; max-width: 168px; min-width: 0; display: flex; flex-direction: column;'
         + ' align-items: center; justify-content: center; gap: 2px; margin: 0; padding: 0; border: 0; background: none;'
         + ' font: inherit; font-size: var(--jp-font-small, 12px); line-height: 1.1; text-decoration: none; cursor: pointer;'
-        + ' color: var(--jp-text-muted, var(--jf-palette-text-secondary, #aaa)); -webkit-tap-highlight-color: transparent; }',
+        + ' position: relative; color: var(--jp-text-muted, var(--jf-palette-text-secondary, #aaa)); -webkit-tap-highlight-color: transparent; }',
+    // Active indicator (not colour alone): 20x3 accent pill on the bar's top edge; absolute, so no layout shift.
+    '#' + NAV_ID + ' .jp-nav-slot::after { content: ""; position: absolute; top: 0; left: 50%; width: 20px; height: 3px;'
+        + ' margin-left: -10px; border-radius: 0 0 3px 3px; background: var(--jp-accent, var(--jf-palette-primary-main, #00a4dc));'
+        + ' opacity: 0; transition: opacity var(--jp-dur-fast, 120ms) var(--jp-ease, ease-out); }',
+    '#' + NAV_ID + ' .jp-nav-slot[aria-current="page"]::after { opacity: 1; }',
+    '@media (prefers-reduced-motion: reduce) { #' + NAV_ID + ' .jp-nav-slot::after { transition: none; } }',
     '#' + NAV_ID + ' .jp-nav-slot[aria-current="page"], #' + NAV_ID + ' .jp-nav-slot[aria-expanded="true"] {'
         + ' color: var(--jp-accent, var(--jf-palette-primary-main, #00a4dc)); }',
     '#' + NAV_ID + ' .jp-nav-slot:focus-visible { outline: 2px solid var(--jp-accent, #00a4dc); outline-offset: -3px; }',
     '#' + NAV_ID + ' .material-icons { font-size: 24px; }',
     '@media (max-width: 359px) { #' + NAV_ID + ' .jp-nav-slot { font-size: 11px; } }',
     '@media (max-height: 480px) { #' + NAV_ID + ' .jp-nav-slot { flex-direction: row; gap: 6px; } }',
-    // Room for the bar: the stock rule reserves 5em for the music bar; stack the music bar on top.
+    // Room for the bar: a gutter above it, plus the stock 5em only while the music bar is showing (it stacks on top).
     'html.' + ON + ' .content-primary, html.' + ON + ' .padded-bottom-page, html.' + ON + ' .page,'
         + ' html.' + ON + ' .pageWithAbsoluteTabs .pageTabContent {'
+        + ' padding-bottom: calc(env(safe-area-inset-bottom) + var(--jp-space-4, 16px) + var(--jp-nav-h, 0px)); }',
+    'html.' + ON + ':has(.nowPlayingBar:not(.hide)) .content-primary, html.' + ON + ':has(.nowPlayingBar:not(.hide)) .padded-bottom-page,'
+        + ' html.' + ON + ':has(.nowPlayingBar:not(.hide)) .page,'
+        + ' html.' + ON + ':has(.nowPlayingBar:not(.hide)) .pageWithAbsoluteTabs .pageTabContent {'
         + ' padding-bottom: calc(env(safe-area-inset-bottom) + 5em + var(--jp-nav-h, 0px)); }',
     'html.' + ON + ' .nowPlayingBar:not(.hide) { bottom: var(--jp-nav-h, 0px); }'
 ].join('\n');
@@ -59,6 +69,27 @@ var CSS = [
 var nav = null;
 var slotEls = {};
 var sheetOwner = null;
+var libDirect = null;   // href when the user has exactly one library view; null = open the sheet
+var libTries = 0;
+var libPending = false;
+
+// Fail soft: any failure to learn the views leaves the sheet behaviour (and aria-haspopup) as it was.
+function refreshLibrarySlot() {
+    var n = slotEls.libraries;
+    if (!n || libPending || libTries >= 3 || libDirect !== null) { return; }
+    libPending = true;
+    libTries++;
+    Promise.resolve().then(libraryDirectHref).then(function (href) {
+        libPending = false;
+        if (href === undefined) { return; }
+        libTries = 3;
+        if (href) {
+            libDirect = href;
+            n.removeAttribute('aria-haspopup');
+            n.removeAttribute('aria-expanded');
+        }
+    }, function () { libPending = false; });
+}
 
 function hasClass(c) { return document.documentElement.classList.contains(c); }
 
@@ -97,11 +128,12 @@ function render() {
     var sheet = hasClass('jp-sheet-open');
     nav.inert = sheet;
     if (sheet) { nav.setAttribute('aria-hidden', 'true'); } else { nav.removeAttribute('aria-hidden'); }
+    if (show) { refreshLibrarySlot(); }
     var active = sheetOwner || activeSlot(window.location.hash);
     SLOTS.forEach(function (s) {
         var n = slotEls[s.id];
         if (s.id === active) { n.setAttribute('aria-current', 'page'); } else { n.removeAttribute('aria-current'); }
-        if (s.sheet) { n.setAttribute('aria-expanded', s.id === sheetOwner ? 'true' : 'false'); }
+        if (s.sheet && !(s.direct && libDirect)) { n.setAttribute('aria-expanded', s.id === sheetOwner ? 'true' : 'false'); }
     });
 }
 
@@ -129,6 +161,11 @@ function build() {
             n.type = 'button';
             n.setAttribute('aria-haspopup', 'dialog');
             n.addEventListener('click', function () {
+                if (s.direct && libDirect) {
+                    if (activeSlot(window.location.hash) === s.id) { scrollTop(); }
+                    window.location.hash = libDirect.slice(1);
+                    return;
+                }
                 if (sheetOwner === s.id) { closeSheet('slot'); return; }
                 sheetOwner = s.id;
                 s.sheet(n, function () { sheetOwner = null; render(); });
