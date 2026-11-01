@@ -565,8 +565,8 @@ a tag carried by thousands of clips cannot outvote a rare one. The client asks `
 12 and renders the result into the stock section.
 
 **Tag and person chips.** On a Video's page the one-line comma tag list is replaced by chips: people
-(linking to the person's page) and tags (linking to a search for that tag). The first 40 of each show;
-the rest fold behind "+N more". Not on TV. The stock tag line is hidden only after the chips exist.
+(linking to the person's page) and tags (linking to a search for that tag). The first 40 of each show
+(6 on phones, `html.layout-mobile`, with 36 px chips); the rest fold behind "+N more". Not on TV. The stock tag line is hidden only after the chips exist.
 
 **Person and studio pages list Videos** (`web/src/controller/person-videos.js`). Stock builds a fixed
 set of sections with no Video type. The always-built Audio Books section's request is rewritten to
@@ -641,7 +641,7 @@ hides too. Fail soft: the form is hidden only after the row is in the DOM; outsi
 theme off or on TV the row is `display:none` and the stock form shows. No new requests; no access change; no
 storage keys.
 
-**Overview on tap** (`web/src/view/detail-overview.js`). Phone portrait only: the stock overview clamp goes from 3 to 4 lines, a tap on the paragraph calls `.click()` on the stock `.overview-expand` button (class and button text stay stock's; a tap on a link inside the text is left alone), and when the text fits in 4 lines the leftover button is hidden. Fails soft to stock if the overview or button is missing. Scoped to `html.layout-mobile:not(.jp-theme-off):not(.layout-tv)`. No new requests; no access change.
+**Overview on tap** (`web/src/view/detail-overview.js`). Phone portrait only: the stock overview clamp goes from 3 to 4 lines, a tap on the paragraph calls `.click()` on the stock `.overview-expand` button (class and button text stay stock's; a tap on a link inside the text is left alone), and when the text fits in 4 lines the leftover button is hidden. An original-title line equal to the title (case-insensitive) is hidden via a `jpSameTitle` page class. Fails soft to stock if the overview or button is missing. Scoped to `html.layout-mobile:not(.jp-theme-off):not(.layout-tv)`. No new requests; no access change.
 **Phone details hero** (`web/src/view/detail-hero.js`, `docs/tasks/mobile-detail-page.md` Task A). CSS only,
 one `<style id="jpDetailHeroStyle">`, no DOM writes or observers: taller backdrop with a bottom scrim
 (`::after`), poster kept at its stock anchor beside a left-aligned, 2-line-clamped title and a one-line

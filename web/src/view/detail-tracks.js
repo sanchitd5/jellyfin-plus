@@ -50,7 +50,9 @@ var CSS = [
     ON + ' .jpTracks[open] .jpTracksChevron{transform:rotate(180deg)}',
     ON + ' #itemDetailPage.' + HAS + ':not(.' + OPEN + ') .trackSelections:not(.hide){display:none}',
     ON + ' #itemDetailPage.' + OPEN + ' .trackSelections:not(.hide){display:block}',
-    ON + ' .trackSelections .selectContainer{margin:var(--jp-space-2,.5em) 0}',
+    ON + ' .jpTracksStatic .jpTracksSummary{pointer-events:none;cursor:default}',
+    ON + ' .jpTracksStatic .jpTracksChevron{display:none}',
+    ON + ' .trackSelections .selectContainer{margin:var(--jp-space-2,.5em) 0;align-items:center}',
     ON + ' .trackSelections .selectLabel{flex-basis:5.5em}',
     ON + ' .trackSelections .detailTrackSelect{min-height:var(--jp-tap,44px)}',
     '}'
@@ -75,7 +77,8 @@ function readEntries(form) {
         return {
             label: sel ? sel.getAttribute('label') || '' : '',
             text: opt ? opt.textContent : '',
-            shown: !c.classList.contains('hide')
+            shown: !c.classList.contains('hide'),
+            options: sel ? sel.options.length : 0
         };
     });
 }
@@ -90,8 +93,25 @@ function refresh(form) {
         }
 
         details.hidden = form.classList.contains('hide');
+        var entries = readEntries(form);
+        // Nothing to choose: keep the row (it names the streams) but make it inert.
+        var choice = entries.some(function (e) { return e.shown && e.options > 1; });
+        details.classList.toggle('jpTracksStatic', !choice);
+        var sum = details.querySelector('summary');
+        if (sum) {
+            if (choice) {
+                sum.setAttribute('aria-expanded', details.open ? 'true' : 'false');
+            } else {
+                sum.removeAttribute('aria-expanded');
+            }
+        }
+
+        if (!choice && details.open) {
+            details.open = false;
+        }
+
         var text = details.querySelector('.jpTracksText');
-        var value = trackSummary(readEntries(form));
+        var value = trackSummary(entries);
         if (text && text.textContent !== value) {
             text.textContent = value;
         }
@@ -105,12 +125,12 @@ function build() {
     var summary = el('summary', 'jpTracksSummary');
     summary.setAttribute('aria-expanded', 'false');
 
-    var icon = el('span', 'material-icons tune', 'tune');
+    var icon = el('span', 'material-icons tune');
     icon.setAttribute('aria-hidden', 'true');
     var body = el('span', 'jpTracksBody');
     body.appendChild(el('span', 'jpTracksTitle', TITLE));
     body.appendChild(el('span', 'jpTracksText', ''));
-    var chevron = el('span', 'material-icons expand_more jpTracksChevron', 'expand_more');
+    var chevron = el('span', 'material-icons expand_more jpTracksChevron');
     chevron.setAttribute('aria-hidden', 'true');
 
     summary.appendChild(icon);

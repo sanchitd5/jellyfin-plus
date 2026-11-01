@@ -15,14 +15,17 @@ import { log } from '../lib/log.js';
  *  - the backdrop gets a taller box and a bottom scrim (::after; stock uses ::before for the app-bar
  *    gradient and keeps it);
  *  - the poster keeps its stock anchoring (bottom of .infoWrapper, so it already rises over the
- *    backdrop); .infoWrapper gets a min-height so the overlap is about 40 % of the poster. No
+ *    backdrop); its box is forced to 3:4 whatever the primary's shape (square and wide sheets are
+ *    cover-cropped), and .infoWrapper gets a min-height so the overlap is about 40 % of it. No
  *    transform: the poster stays the image-zoom.js tap target and the detail-blurhash.js canvas is
  *    placed from offsetTop/offsetLeft, which a transform would not move;
  *  - title, meta line, original title and series name are left-aligned, clamped, muted;
  *  - every button but the primary Play gets a label drawn from its own stock `title` (::after);
  *  - the Genre row of the details group (12.3 renders genres there, NOT in the empty .itemGenres <p>)
  *    becomes chips: the ', ' separators are text nodes inside each <span>, zeroed with font-size:0
- *    while the anchors restore their size; the group is reordered so genres come first;
+ *    while the anchors restore their size; the group is reordered so genres come first, the Genre
+ *    label stays visible and the chips carry an accent border so they do not read as tags;
+ *  - button labels wrap to two lines rather than truncate;
  *  - label-above-value details rows and tighter section headings.
  *
  * Scope: every rule is inside @media (orientation: portrait) and (max-width: 40em) and under
@@ -36,8 +39,8 @@ var STYLE_ID = 'jpDetailHeroStyle';
 
 var S = 'html.layout-mobile:not(.jp-theme-off):not(.layout-tv) #itemDetailPage';
 var POSTER_W = '27vw';
-// Poster is portrait (padder 150 %): height 1.5 x width; 60 % of it stays beside the text.
-var WRAP_MIN = 'calc(' + POSTER_W + ' * 1.5 * 0.6)';
+// Poster box is fixed 3:4 (padder 133 %) whatever the card shape; 60 % of its height stays beside the text.
+var WRAP_MIN = 'calc(' + POSTER_W + ' * 1.33 * 0.6)';
 var HAS_POSTER = ':has(.card .cardImageContainer:not([data-src=""]))';
 var GENRES = ' .itemDetailsGroup > div:last-child';
 var MUTED = 'color:var(--jp-text-muted,rgba(255,255,255,.6))';
@@ -56,7 +59,9 @@ var RULES = [
     // Poster beside the title block
     rule(' .infoWrapper', 'position:relative;padding-inline-start:0'),
     rule(' .infoWrapper' + HAS_POSTER, 'padding-inline-start:calc(' + POSTER_W + ' + var(--jp-space-3,.75em))'),
-    rule(' .infoWrapper:has(.portraitCard .cardImageContainer:not([data-src=""]))', 'min-height:' + WRAP_MIN),
+    rule(' .infoWrapper' + HAS_POSTER, 'min-height:' + WRAP_MIN),
+    // Fixed 3:4 box: square/wide sheets are centre-cropped (cover); badge and blurhash canvas stay inside it.
+    rule(' .infoWrapper .detailImageContainer .card .cardScalable .cardPadder', 'padding-bottom:133%!important'),
     rule(' .infoWrapper .card:has(.cardImageContainer[data-src=""])', 'display:none'),
     rule(' .infoWrapper .detailImageContainer .card', 'position:absolute;top:auto;bottom:0;inset-inline-start:0;'
         + 'width:' + POSTER_W + ';max-width:' + POSTER_W + ';margin:0;filter:none;overflow:hidden;z-index:3;'
@@ -80,9 +85,10 @@ var RULES = [
     // Button row (jpPrimaryPlay and the sticky bar belong to detail-actions.js)
     rule(' .mainDetailButtons', 'justify-content:flex-start;gap:var(--jp-space-1,4px);padding:0'),
     rule(' .mainDetailButtons .detailButton:not(.jpPrimaryPlay)', 'flex:1 1 0;max-width:72px;flex-direction:column;'
-        + 'min-height:56px;padding:.45em .15em!important'),
-    rule(' .mainDetailButtons .detailButton:not(.jpPrimaryPlay)::after', 'content:attr(title);display:block;font-size:11px;line-height:1.2;'
-        + 'margin-top:2px;max-width:100%;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;' + MUTED),
+        + 'min-height:64px;padding:.45em .15em!important'),
+    rule(' .mainDetailButtons .detailButton:not(.jpPrimaryPlay)::after', 'content:attr(title);font-size:11px;'
+        + 'margin-top:2px;max-width:100%;white-space:normal;display:-webkit-box;-webkit-box-orient:vertical;'
+        + '-webkit-line-clamp:2;text-align:center;overflow:hidden;overflow-wrap:anywhere;line-height:1.15;' + MUTED),
     rule(' .mainDetailButtons .detailButton:not(.jpPrimaryPlay):not([title])::after,' + S
         + ' .mainDetailButtons .detailButton:not(.jpPrimaryPlay)[title=""]::after', 'display:none'),
 
@@ -96,13 +102,12 @@ var RULES = [
     rule(' .detailsGroupItem', 'flex-direction:column;gap:2px;margin:0 0 var(--jp-space-3,.75em)!important'),
     rule(' .detailsGroupItem .label', 'flex:0 0 auto;flex-basis:auto;margin:0;' + SMALL + ';' + MUTED
         + ';text-transform:uppercase;letter-spacing:.04em'),
-    rule(GENRES + ' .detailsGroupItem .label', 'display:none'),
+    rule(GENRES + ' .detailsGroupItem .label', 'display:block'),
     rule(GENRES + ' .detailsGroupItem > .focuscontainer-x', 'display:flex;flex-wrap:wrap;gap:.45em'),
     rule(GENRES + ' .detailsGroupItem > .focuscontainer-x > span', 'font-size:0'),
     rule(GENRES + ' .detailsGroupItem > .focuscontainer-x > span > a', SMALL + ';display:inline-flex;align-items:center;'
         + 'box-sizing:border-box;min-height:2.5em;padding:.35em .95em;margin:0;border-radius:999px;'
-        + 'border:1px solid rgba(128,128,128,.45);background:rgba(128,128,128,.16);color:inherit;text-decoration:none'),
-
+        + 'border:1px solid var(--jp-accent,#00a4dc);background:rgba(128,128,128,.16);color:var(--jp-accent,#00a4dc);text-decoration:none'),
     // Sections
     rule(' .sectionTitle-cards,' + S + ' .detailVerticalSection .sectionTitle', 'font-size:1.1rem;font-weight:600;margin:0 0 var(--jp-space-2,.5em)')
 ];

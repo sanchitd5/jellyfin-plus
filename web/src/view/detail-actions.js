@@ -139,6 +139,16 @@ function navTwin(row, icon) {
     return glyph ? glyph.closest('.jpNavBtn') : null;
 }
 
+var FROM_START = 'Play from start';
+
+function restoreReplay(replay) {
+    var orig = replay.getAttribute('data-jp-title');
+    if (orig !== null) {
+        replay.removeAttribute('data-jp-title');
+        replay.title = orig;
+    }
+}
+
 function buildBar(page, row, item) {
     var bar = document.createElement('div');
     bar.className = BAR;
@@ -195,15 +205,41 @@ function buildBar(page, row, item) {
         }
 
         more.hidden = isHidden(row.querySelector('.btnMoreCommands'));
+
+        // Resume item: stock labels the replay button "Play" too; name what it does.
+        var replay = row.querySelector('.btnReplay:not(.jpNavBtn)');
+        if (replay) {
+            var resuming = !!primary && primary.classList.contains('btnPlay') && !!item.UserData && item.UserData.PlaybackPositionTicks > 0;
+            if (resuming && !isHidden(replay)) {
+                if (replay.getAttribute('data-jp-title') === null) {
+                    replay.setAttribute('data-jp-title', replay.title);
+                }
+
+                if (replay.title !== FROM_START) {
+                    replay.title = FROM_START;
+                }
+            } else {
+                restoreReplay(replay);
+            }
+        }
     };
     bar.__jpSync();
     return bar;
 }
 
+/* The app bar: stock .skinHeader on older builds, the MUI AppBar (header.MuiPaper-root) on 12.3. First one with a height wins; none = 0 (stock behaviour). */
+var HEADERS = ['.skinHeader', '.MuiAppBar-root', 'header.MuiPaper-root'];
+
 function headerBottom() {
-    var h = document.querySelector('.skinHeader');
-    var r = h && h.getBoundingClientRect();
-    return r && r.height > 0 ? Math.max(0, Math.round(r.bottom)) : 0;
+    for (var i = 0; i < HEADERS.length; i++) {
+        var h = document.querySelector(HEADERS[i]);
+        var r = h && h.getBoundingClientRect();
+        if (r && r.height > 0) {
+            return Math.max(0, Math.round(r.bottom));
+        }
+    }
+
+    return 0;
 }
 
 function teardown(page) {
@@ -215,6 +251,12 @@ function teardown(page) {
     if (page.__jpActMO) {
         page.__jpActMO.disconnect();
         page.__jpActMO = null;
+    }
+
+    Array.prototype.forEach.call(page.querySelectorAll('.btnReplay[data-jp-title]'), restoreReplay);
+    if (page.__jpActResize) {
+        window.removeEventListener('resize', page.__jpActResize);
+        page.__jpActResize = null;
     }
 
     Array.prototype.forEach.call(page.querySelectorAll('.' + BAR), function (b) {
@@ -246,16 +288,26 @@ function setup(page, item) {
         return;
     }
 
-    var top = headerBottom();
-    page.__jpActIO = new IntersectionObserver(function (entries) {
-        var e = entries[entries.length - 1];
-        var offset = headerBottom();
-        // Out of view AND above the bar's line: scrolled past, not merely below the fold.
-        var past = !e.isIntersecting && e.boundingClientRect.bottom <= offset + 1 && e.boundingClientRect.height > 0;
-        bar.style.top = offset + 'px';
-        bar.classList.toggle('jpShow', past);
-    }, { rootMargin: '-' + top + 'px 0px 0px 0px', threshold: [0, 1] });
-    page.__jpActIO.observe(row);
+    // rootMargin is fixed at construction, so rebuild the observer when the viewport (and so the app bar) changes.
+    function observe() {
+        if (page.__jpActIO) {
+            page.__jpActIO.disconnect();
+        }
+
+        page.__jpActIO = new IntersectionObserver(function (entries) {
+            var e = entries[entries.length - 1];
+            var offset = headerBottom();
+            // Out of view AND above the bar's line: scrolled past, not merely below the fold.
+            var past = !e.isIntersecting && e.boundingClientRect.bottom <= offset + 1 && e.boundingClientRect.height > 0;
+            bar.style.top = offset + 'px';
+            bar.classList.toggle('jpShow', past);
+        }, { rootMargin: '-' + headerBottom() + 'px 0px 0px 0px', threshold: [0, 1] });
+        page.__jpActIO.observe(row);
+    }
+
+    observe();
+    page.__jpActResize = observe;
+    window.addEventListener('resize', observe);
 }
 
 export function installDetailActions() {

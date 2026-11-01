@@ -23,6 +23,7 @@ import { watchDetail } from '../controller/detail-page.js';
 
 var STYLE_ID = 'jpDetailOverviewStyle';
 var FITS = 'jpOverviewFits';
+var SAME = 'jpSameTitle';
 
 var SCOPE = 'html.layout-mobile:not(.jp-theme-off):not(.layout-tv) #itemDetailPage';
 var MEDIA = '@media (orientation: portrait) and (max-width: 40em)';
@@ -35,6 +36,7 @@ var CSS = [
     '  ' + SCOPE + ' .overview-expand { font-size: var(--jp-font-small, .85rem); font-weight: 600;'
         + ' color: var(--jp-accent, #00a4dc); min-height: var(--jp-tap, 44px); padding: 0; margin: 0;'
         + ' background: none; text-align: left; justify-content: flex-start; }',
+    '  ' + SCOPE + '.' + SAME + ' .itemName.originalTitle { display: none; }',
     '}'
 ].join('\n');
 
@@ -103,9 +105,14 @@ export function installDetailOverview() {
         watchDetail({
             start: function (page) {
                 page.classList.remove(FITS);
+                page.classList.remove(SAME);
             },
             item: function (page) {
                 checkFits(page);
+                // Original title identical to the title: class only, the stock node is untouched.
+                if (item.OriginalTitle && item.Name && String(item.OriginalTitle).toLowerCase() === String(item.Name).toLowerCase()) {
+                    page.classList.add(SAME);
+                }
             }
         });
 

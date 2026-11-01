@@ -44,6 +44,8 @@ var TAG_TARGET = 'search';
 
 // Chips shown before the rest fold behind a "+N" button.
 var CHIP_FOLD = 40;
+// On a phone the same fold would be ~15 rows; 6 chips plus the button close to two or three.
+var CHIP_FOLD_PHONE = 6;
 
 var SIMILAR_LIMIT = 12;
 
@@ -166,17 +168,18 @@ function chipRow(kind, label, chips) {
     row.setAttribute('role', 'list');
     row.setAttribute('aria-label', label);
 
+    var fold = document.documentElement.classList.contains('layout-mobile') ? CHIP_FOLD_PHONE : CHIP_FOLD;
     chips.forEach(function (chip, i) {
         chip.setAttribute('role', 'listitem');
-        if (i >= CHIP_FOLD) {
+        if (i >= fold) {
             chip.classList.add('gprChipFolded');
         }
 
         row.appendChild(chip);
     });
 
-    if (chips.length > CHIP_FOLD) {
-        var more = el('button', 'gprChip gprChipMore', '+' + (chips.length - CHIP_FOLD) + ' more');
+    if (chips.length > fold) {
+        var more = el('button', 'gprChip gprChipMore', '+' + (chips.length - fold) + ' more');
         more.type = 'button';
         more.addEventListener('click', function () {
             row.classList.add('gprChipsExpanded');
@@ -378,7 +381,8 @@ function installStyle() {
         '.gprChipText { min-width: 0; overflow-wrap: anywhere; }',
         '.gprChipFolded { display: none; }',
         '.gprChipsExpanded .gprChipFolded { display: inline-flex; }',
-        'html.layout-mobile .gprChip { min-height: 2.5em; padding: 0.35em 0.95em; }',
+        'html.layout-mobile .gprChip { min-height: 36px; font-size: 13px; padding: 0.35em 0.95em; }',
+        'html.layout-mobile .gprChipRow { gap: 8px 6px; margin: 8px 0; }',
         '.gprHasChips .itemTags { display: none !important; }'
     ].join('\n');
     (document.head || document.documentElement).appendChild(style);
