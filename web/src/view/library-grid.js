@@ -54,7 +54,44 @@ var CSS = [
         + ' text-overflow: ellipsis; }',
     '.jpGrid .cardBox > .cardFooter .cardText-secondary { opacity: 0.8; font-size: var(--jp-font-small, 0.85em); }',
     '.jpGrid .jellyfinPlusCardActions [data-action="play"] { display: none; }'
-].join('\n');
+].concat(homeRowCss()).join('\n');
+
+/*
+ * HOME ROWS, PHONE ONLY (html.jp-phone .homePage .scrollSlider). CSS only, no marker class: the
+ * same in-image title treatment as .jpGrid, the play button dropped (a tap on the picture plays),
+ * heart + more kept at 44px and forced onto one line so they never wrap over the image. Rows also
+ * snap, and card widths leave the next card peeking: ~2.4 portrait/square, ~1.6 backdrop. Widths are
+ * layout only; cardBuilder's requested image sizes are untouched. The snap container is the
+ * overflow element (emby-scroller); stock scrolls it natively off TV, and html.jp-phone is never TV.
+ */
+function homeRowCss() {
+    var P = 'html.jp-phone:not(.jp-theme-off) .homePage ';
+    var C = P + '.scrollSlider .card';
+    var gutter = '16px';
+    var peek = function (n) {
+        return 'calc((100vw - ' + gutter + ') / ' + n + ' - 8px)';
+    };
+
+    return [
+        P + '[is="emby-scroller"], ' + P + '.emby-scroller { scroll-snap-type: x mandatory;'
+            + ' scroll-padding-left: 12px; overscroll-behavior-x: contain; }',
+        C + ' { scroll-snap-align: start; flex: 0 0 auto; }',
+        C + '.portraitCard, ' + C + '.squareCard { width: ' + peek(2.4) + ' !important; }',
+        C + '.backdropCard, ' + C + '.overflowBackdropCard { width: ' + peek(1.6) + ' !important; }',
+        C + ' > .cardBox { position: relative; overflow: hidden; border-radius: var(--jp-radius-m, 8px); }',
+        C + ' .cardBox > .cardFooter { position: absolute; left: 0; right: 0; bottom: 0; z-index: 1; margin: 0;'
+            + ' box-sizing: border-box; padding: 24px 8px 44px; pointer-events: none; color: #fff;'
+            + ' background: linear-gradient(to top, rgba(0,0,0,0.78), rgba(0,0,0,0)); }',
+        C + ' .cardBox > .cardFooter .cardText { color: inherit; padding: 0; white-space: nowrap; overflow: hidden;'
+            + ' text-overflow: ellipsis; }',
+        C + ' .cardBox > .cardFooter .cardText-secondary { opacity: 0.8; font-size: var(--jp-font-small, 0.85em); }',
+        C + ' .jellyfinPlusCardActions { flex-wrap: nowrap; }',
+        C + ' .jellyfinPlusCardActions [data-action="play"] { display: none; }',
+        // Section title / "see all" link: a 44px hit area (the chevron stays small).
+        P + '.sectionTitleContainer a.sectionTitleTextButton, ' + P + '.sectionTitleContainer .sectionTitleButton'
+            + ' { display: inline-flex; align-items: center; min-height: 44px; box-sizing: border-box; }'
+    ];
+}
 
 function cls() {
     return document.documentElement.classList;
