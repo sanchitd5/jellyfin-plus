@@ -5,9 +5,9 @@ Any external service can put markers on the Jellyfin Plus player's seek bar. The
 and hands it to the player. Players never talk to providers. Nothing about a particular provider is
 in code: every provider is configuration.
 
-- Server: `src/MarkerProviders.cs` (parsing, path filter, mapping), `src/MarkerSource.cs` (fetching,
-  cache, merge, moment times), `src/MarkersController.cs` (routes), `src/MomentSheets.cs`
-  (moment-preview generation, strips, storage), `src/MomentPrecompute.cs` (nightly task, new-item
+- Server: `src/Markers/MarkerProviders.cs` (parsing, path filter, mapping), `src/Markers/MarkerSource.cs` (fetching,
+  cache, merge, moment times), `src/Markers/MarkersController.cs` (routes), `src/Moments/MomentSheets.cs`
+  (moment-preview generation, strips, storage), `src/Moments/MomentPrecompute.cs` (nightly task, new-item
   queue, check index).
 - Client: `web/src/model/timeline-markers.js` (pure), `web/src/controller/timeline-markers.js` (OSD).
 
@@ -136,7 +136,7 @@ label and value only.
 
 ### Where frames come from, fastest first
 
-1. **Precomputed** (setting **`MarkerMomentsPrecompute`**, default on; `src/MomentPrecompute.cs`).
+1. **Precomputed** (setting **`MarkerMomentsPrecompute`**, default on; `src/Moments/MomentPrecompute.cs`).
    The full set normally exists before anyone presses play:
    - **Scheduled task** *Precompute marker previews* (Dashboard > Scheduled Tasks, category
      *Jellyfin Plus*, key `JellyfinPlusMomentPrecompute`, default trigger daily 03:00, can be run by

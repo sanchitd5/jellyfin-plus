@@ -2674,7 +2674,7 @@ The design above is now real code, not just a document - full write-up in `LIVE_
 own updated sections. Short version: `TranscodingJobHelper` does not exist on this Jellyfin build
 (12.1) - decompiled the real assemblies and found the actual owner is
 `MediaBrowser.MediaEncoding.Transcoding.TranscodeManager`. New Harmony patches
-(`src/patcher/SwapPatches.cs`) defer `TranscodeManager.KillTranscodingJobs` while a swap is
+(`src/patcher/Transcoding/SwapPatches.cs`) defer `TranscodeManager.KillTranscodingJobs` while a swap is
 admitted and replay it once `TranscodeManager.StartFfMpeg`'s postfix sees the new job ready -
 `StartFfMpeg` already blocks until its own first segment exists, so no new readiness watch was
 needed. Client carries the old `PlaySessionId` as a `swapfrom` query param (`state.swapFrom`,
@@ -3088,7 +3088,7 @@ Read that file before starting item 1 below.
    but not sufficient; item 3 above is what actually proves it works.
 6. **Wire it through the 5-place checklist** (AGENTS.md invariant 11 / `CLAUDE.md`'s "Before you
    change the config page") as a new neural level: `src/Configuration/PluginConfiguration.cs`, the
-   `src/patcher/UpscaleSettings.cs` mirror, `src/Configuration/configPage.html` (both the form
+   `src/patcher/Transcoding/UpscaleSettings.cs` mirror, `src/Configuration/configPage.html` (both the form
    control and the load/save script lines), the probe so the client can offer the level, and the
    session/status reporting. Data-driven per AGENTS.md: one `CONTROLS` entry plus one `LIVE_ROWS`
    line, no bespoke rendering code, display name and any degraded wording come from the probe, not

@@ -144,7 +144,7 @@ esbuild) support natively.
 
 | file | exports |
 |---|---|
-| `src/CpuBudget.cs` | `CpuBudget` (`Cores`, `PlaybackCores`, `BackgroundDegree`, pure `ContainerCores`/`PlaybackCoresFor`/`Budget`/`ParseStatTicks`; one 2 s /proc sampler of ffmpeg CPU), `DynamicGate` (async gate whose limit is re-read on every acquire/release) |
+| `src/Transcoding/CpuBudget.cs` | `CpuBudget` (`Cores`, `PlaybackCores`, `BackgroundDegree`, pure `ContainerCores`/`PlaybackCoresFor`/`Budget`/`ParseStatTicks`; one 2 s /proc sampler of ffmpeg CPU), `DynamicGate` (async gate whose limit is re-read on every acquire/release) |
 
 ## Entry point
 

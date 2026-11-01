@@ -100,7 +100,7 @@ through the API when diagnosing; the on-disk source may not be what is running.
 Adding a setting means touching all of these together, or the page breaks:
 
 1. `src/Configuration/PluginConfiguration.cs` - the property and its default
-2. `src/patcher/UpscaleSettings.cs` - the patcher-side mirror (settings cross the ALC boundary as JSON)
+2. `src/patcher/Transcoding/UpscaleSettings.cs` - the patcher-side mirror (settings cross the ALC boundary as JSON)
 3. `src/Configuration/configPage.html` - **both** the form control and the load/save script lines
 4. The probe, so the client can offer it
 5. The session/status reporting, if it changes what the server does
@@ -264,7 +264,7 @@ and deployed once by the main thread. What made that work:
 - **A shared brief in a file** (scratchpad), naming the wire contract, the environment (jfbin, Jellyfin
   12.3 source checkouts with the v12.1..v12.3 tags for diffing, the real-DB copy), build/test commands and hard rules (no deploy, no SSH,
   commit identity, no library content).
-- **Disjoint file ownership.** Shared files - `web/src/bootstrap.js`, `src/patcher/UpscalePatches.cs`
+- **Disjoint file ownership.** Shared files - `web/src/bootstrap.js`, `src/patcher/Transcoding/UpscalePatches.cs`
   (`ApplyOptional`), `context-map.md`, `ENHANCEMENTS.md` - take minimal additive edits only; the main
   thread resolves the trivial merge conflicts.
 - **Agents never deploy.** The main thread merges, builds, deploys once, and verifies live.
