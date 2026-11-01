@@ -631,6 +631,8 @@ the favourite button for any item `canRate` accepts (everything with UserData ex
 Channel, CollectionFolder, UserView); it is not hidden on phone. Scoped to
 `html:not(.jp-theme-off):not(.layout-tv)`; hidden while `html.jp-sheet-open`. No storage keys.
 
+**Overview on tap** (`web/src/view/detail-overview.js`). Phone portrait only: the stock overview clamp goes from 3 to 4 lines, a tap on the paragraph calls `.click()` on the stock `.overview-expand` button (class and button text stay stock's; a tap on a link inside the text is left alone), and when the text fits in 4 lines the leftover button is hidden. Fails soft to stock if the overview or button is missing. Scoped to `html.layout-mobile:not(.jp-theme-off):not(.layout-tv)`. No new requests; no access change.
+
 ## 5. Cards and playback
 
 **Image look-ahead** (`web/src/controller/image-preload.js`, `web/src/model/image-preload.js`). Stock
