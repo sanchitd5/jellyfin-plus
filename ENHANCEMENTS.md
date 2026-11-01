@@ -642,6 +642,14 @@ theme off or on TV the row is `display:none` and the stock form shows. No new re
 storage keys.
 
 **Overview on tap** (`web/src/view/detail-overview.js`). Phone portrait only: the stock overview clamp goes from 3 to 4 lines, a tap on the paragraph calls `.click()` on the stock `.overview-expand` button (class and button text stay stock's; a tap on a link inside the text is left alone), and when the text fits in 4 lines the leftover button is hidden. Fails soft to stock if the overview or button is missing. Scoped to `html.layout-mobile:not(.jp-theme-off):not(.layout-tv)`. No new requests; no access change.
+**Phone details hero** (`web/src/view/detail-hero.js`, `docs/tasks/mobile-detail-page.md` Task A). CSS only,
+one `<style id="jpDetailHeroStyle">`, no DOM writes or observers: taller backdrop with a bottom scrim
+(`::after`), poster kept at its stock anchor beside a left-aligned, 2-line-clamped title and a one-line
+meta row, a label under every button except the primary Play (the stock `title` via `::after`), the Genre
+row of the details group as chips, label-above-value details rows, tighter section headings. Scoped to
+`html.layout-mobile:not(.jp-theme-off):not(.layout-tv) #itemDetailPage` inside
+`(orientation: portrait) and (max-width: 40em)`; theme off, TV, landscape and tablet keep stock. Fails
+soft to the stock page. No new requests; no access change.
 
 ## 5. Cards and playback
 
