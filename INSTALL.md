@@ -2,7 +2,11 @@
 
 A complete walkthrough, from a plain Jellyfin server to working realtime upscaling.
 
-Targets **Jellyfin 12.3.0**. The walkthrough was first done on Jellyfin 12.1.0, Ubuntu 24.04, an **NVIDIA RTX 3090** with driver
+Targets **Jellyfin 12.3 and 12.4** (`targetAbi` 12.3.0.0; verified live on 12.4.0: all five core
+patches, every optional patch except the pre-existing `MetadataService.RefreshMetadata` scan-timing
+miss, a served segment upscaled 1280x720 -> 1920x1080, and both assemblies compile against the 12.4
+DLLs). 12.4 no longer accepts the legacy `api_key=` query parameter - use `ApiKey=` or the
+`Authorization: MediaBrowser Token=` header in hand-built probe URLs. The walkthrough was first done on Jellyfin 12.1.0, Ubuntu 24.04, an **NVIDIA RTX 3090** with driver
 595.84, inside an **unprivileged Proxmox LXC** with GPU passthrough. Adjust paths to your setup.
 
 > This installs software that patches Jellyfin's running code. Take a backup of

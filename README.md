@@ -106,7 +106,7 @@ GPLv2+ and links Apache-2.0 code. Build it for yourself.
   More in [the manual](docs/video-enhancement.md).
 - **Browser upscaling** switches off while native subtitles show, in iOS native fullscreen and in
   picture-in-picture. It is measured only on a desktop GPU.
-- `targetAbi` is the oldest Jellyfin that loads the plugin (12.3.0.0); a newer server still loads it, so re-verify the patches after every Jellyfin upgrade.
+- `targetAbi` is the oldest Jellyfin that loads the plugin (12.3.0.0); a newer server still loads it (verified on 12.4.0), so re-verify the patches after every Jellyfin upgrade.
 
 ## Licences and credits
 

@@ -1,6 +1,6 @@
 # What Jellyfin Plus changes in Jellyfin
 
-Jellyfin Plus is a plugin for Jellyfin 12.3 (ported from 12.1) that does two kinds of work. On the server it
+Jellyfin Plus is a plugin for Jellyfin 12.3 and 12.4 (ported from 12.1; 12.4 needed no code change) that does two kinds of work. On the server it
 runtime-patches Jellyfin's own code (with Harmony) so transcodes can be enhanced on the GPU and so
 search, library filters, "More Like This" and the filter lists behave better. In the browser it
 injects one script, `jellyfin-plus.js`, into jellyfin-web, which adds the Enhance panel and a set of
