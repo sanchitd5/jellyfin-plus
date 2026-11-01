@@ -631,6 +631,15 @@ the favourite button for any item `canRate` accepts (everything with UserData ex
 Channel, CollectionFolder, UserView); it is not hidden on phone. Scoped to
 `html:not(.jp-theme-off):not(.layout-tv)`; hidden while `html.jp-sheet-open`. No storage keys.
 
+**Phone details hero** (`web/src/view/detail-hero.js`, `docs/tasks/mobile-detail-page.md` Task A). CSS only,
+one `<style id="jpDetailHeroStyle">`, no DOM writes or observers: taller backdrop with a bottom scrim
+(`::after`), poster kept at its stock anchor beside a left-aligned, 2-line-clamped title and a one-line
+meta row, a label under every button except the primary Play (the stock `title` via `::after`), the Genre
+row of the details group as chips, label-above-value details rows, tighter section headings. Scoped to
+`html.layout-mobile:not(.jp-theme-off):not(.layout-tv) #itemDetailPage` inside
+`(orientation: portrait) and (max-width: 40em)`; theme off, TV, landscape and tablet keep stock. Fails
+soft to the stock page. No new requests; no access change.
+
 ## 5. Cards and playback
 
 **Image look-ahead** (`web/src/controller/image-preload.js`, `web/src/model/image-preload.js`). Stock

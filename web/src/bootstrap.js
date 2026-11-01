@@ -33,6 +33,7 @@ import { installBulkTags } from './controller/bulk-tags.js';
 import { installDetailNav } from './controller/detail-nav.js';
 import { installDetailDownload } from './controller/detail-download.js';
 import { installDetailActions } from './view/detail-actions.js';
+import { installDetailHero } from './view/detail-hero.js';
 import { installDetailTimeline } from './controller/detail-timeline.js';
 import { installTagAutocomplete } from './controller/tag-autocomplete.js';
 import { installSearchCensus } from './controller/search-census.js';
@@ -139,6 +140,7 @@ function feature(name, install) {
         feature('detail prev/next', installDetailNav);
         feature('detail download', installDetailDownload);
         feature('detail actions', installDetailActions);
+        feature('detail hero', installDetailHero);
         // Blurhash placeholder under the details header and poster until the real image loads.
         feature('detail blurhash', installDetailBlurhash);
         // A row per person: their clips in date order, this one in the middle. Reads only.
