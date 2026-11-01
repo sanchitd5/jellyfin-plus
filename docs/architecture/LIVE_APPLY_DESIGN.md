@@ -37,7 +37,7 @@ Full chain, VERIFIED against source in this repo plus the production shim on CT1
 4. New `PlaybackInfo` request goes through this script's `hookFetch`/`hookXhr`
    (`web/src/controller/network.js`), which rewrites the `TranscodingUrl` with the new axis
    params. Server gets a NEW `PlaySessionId`, builds a new ffmpeg command via the Harmony
-   patches (`src/patcher/UpscalePatches.cs`), and Jellyfin's own (stock, unpatched by this
+   patches (`src/patcher/Transcoding/UpscalePatches.cs`), and Jellyfin's own (stock, unpatched by this
    project) transcode manager starts a new ffmpeg process for it.
 5. The player is restarted at `current position -> new stream`, discarding the old buffer.
 
@@ -78,7 +78,7 @@ Jellyfin allocate a wholly new session and kill the old one immediately.
 **Headline design decision -- a separate, small "swap" cap, independent of `max_concurrent`:**
 
 - `UpscaleEngine.HasCapacity()` is the cap actually enforced today when Harmony patches are
-  active (VERIFIED: `UpscalePatches.BuildVerdict` at `src/patcher/UpscalePatches.cs:338` calls
+  active (VERIFIED: `UpscalePatches.BuildVerdict` at `src/patcher/Transcoding/UpscalePatches.cs:338` calls
   it, and it counts live `/proc` processes whose cmdline holds both `ffmpeg` and `libplacebo`).
 - The shim's own `take_slot()`/`SLOT_DIR` mechanism (`/usr/local/bin/jellyfin-ffmpeg-upscale` on
   CT114) is currently DEAD for production sessions: `main()` calls
@@ -138,7 +138,7 @@ Nothing beyond this document was implemented in the original pass; see below for
   `PlaystateController.ReportPlaybackStopped` (`Sessions/Playing/Stopped` - the server side of
   jellyfin-web's `stopActiveEncodings(oldPlaySessionId)`) and `DynamicHlsController.GetDynamicSegment`
   call into to kill a transcode job, and the class whose `StartFfMpeg` starts a new one.
-- New Harmony patch surface, `src/patcher/SwapPatches.cs`, patching
+- New Harmony patch surface, `src/patcher/Transcoding/SwapPatches.cs`, patching
   `TranscodeManager.KillTranscodingJobs` (Prefix: defers the kill while a swap is admitted, replaying
   it later) and `TranscodeManager.StartFfMpeg` (Postfix: fires once the new process is ready).
   **`StartFfMpeg` already does not return until its own first segment file exists (or the job

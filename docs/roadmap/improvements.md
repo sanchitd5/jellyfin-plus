@@ -7,21 +7,21 @@ Status: `[ ]` open · `[x]` done · `[~]` accepted as-is (decision recorded on t
 
 ## Plugin host (C#)
 
-- [x] `src/UpscaleController.cs:34` 🟡 risk: `GetSession` is `[Authorize]` only, with no check that `playSessionId` belongs to the caller. Any signed-in Viewer can guess a PlaySessionId and read another Viewer's session status. Scope the lookup to the caller's own sessions, or document the leak.
-- [x] `src/ShimBridge.cs:60` 🟡 risk: `/etc/jellyfin-upscale.json` is written with a plain `File.WriteAllText`. A shim invocation reading mid-write gets truncated JSON while sessions are live. Write to a temp file in the same directory, then `File.Move(..., overwrite: true)`.
-- [x] `src/PatcherLoader.cs:72-83` 🟡 risk: `Configure` swallows every exception with no logging, unlike `Load`. A failed config push leaves stale settings while the dashboard reports the new ones. Log the exception.
-- [x] `src/PatcherLoader.cs:59-61` 🟡 risk: static `Status`/`Active` are written without synchronization and read from a request thread. Mark `volatile` or guard with a lock.
+- [x] `src/Transcoding/UpscaleController.cs:34` 🟡 risk: `GetSession` is `[Authorize]` only, with no check that `playSessionId` belongs to the caller. Any signed-in Viewer can guess a PlaySessionId and read another Viewer's session status. Scope the lookup to the caller's own sessions, or document the leak.
+- [x] `src/Transcoding/ShimBridge.cs:60` 🟡 risk: `/etc/jellyfin-upscale.json` is written with a plain `File.WriteAllText`. A shim invocation reading mid-write gets truncated JSON while sessions are live. Write to a temp file in the same directory, then `File.Move(..., overwrite: true)`.
+- [x] `src/Hosting/PatcherLoader.cs:72-83` 🟡 risk: `Configure` swallows every exception with no logging, unlike `Load`. A failed config push leaves stale settings while the dashboard reports the new ones. Log the exception.
+- [x] `src/Hosting/PatcherLoader.cs:59-61` 🟡 risk: static `Status`/`Active` are written without synchronization and read from a request thread. Mark `volatile` or guard with a lock.
 - [x] `src/Configuration/PluginConfiguration.cs` ❓ q: no range validation on `TargetHeight`, `MaxConcurrent`, `MinScaleFactor`, `MaxSourceHeight` before they reach the ffmpeg command. Caught downstream in `Option()`, or nowhere?
-- [x] `src/PatcherLoader.cs:50-51` ❓ q: `_host != null` short-circuits to `Configure`, so a second `Plugin` construction keeps the old ALC assembly even when the DLL on disk changed. Intentional?
+- [x] `src/Hosting/PatcherLoader.cs:50-51` ❓ q: `_host != null` short-circuits to `Configure`, so a second `Plugin` construction keeps the old ALC assembly even when the DLL on disk changed. Intentional?
 
-Verified clean: `PluginConfiguration.cs` and `src/patcher/UpscaleSettings.cs` mirror each other 1:1 — no desynced or dead setting.
+Verified clean: `PluginConfiguration.cs` and `src/patcher/Transcoding/UpscaleSettings.cs` mirror each other 1:1 — no desynced or dead setting.
 
 ## Patcher engine
 
-- [x] `src/patcher/UpscalePatches.cs:408` 🔴 bug: `explicitlyAsked = plan.ClientOptIn || plan.DeblurApplied || plan.DenoiseApplied` omits `NeuralApplied`, `GameApplied`, `RefineApplied`, `ChromaApplied`. A session asking only for `neural=`/`game=`/`refine=`/`chroma=` (no upscale/deblur/denoise, `ForceTranscode` off) keeps the `copy` encoder, so `-vf` never applies and the filter is silently dropped. Add the four flags to `explicitlyAsked`.
-- [x] `src/patcher/UpscaleEngine.cs:706` 🟡 risk: `refine` and `chroma` have no master-enable gate, unlike `DeblurAllowed`/`DenoiseAllowed`/`NeuralAllowed`/`GameAllowed`, and `UpscaleSettings.cs` has no matching property. Any session overrides dashboard policy. Add `RefineAllowed`/`ChromaAllowed`, or document them as intentionally ungated.
-- [ ] (open: test on the server) `src/patcher/UpscaleEngine.cs:825` 🟡 risk: `plan.GameApplied && GameScalesOutput(...)` forces `srLevel`/`refineLevel` off to avoid double-upscaling but leaves `chromaLevel` on, though KrigBilateral runs in the same libplacebo `custom_shader_path` and composes against whatever luma pass ran. Confirm intent or exempt chroma explicitly like sr/refine.
-- [x] `src/patcher/UpscaleEngine.cs:848` 🔵 nit: `deband` treats only `"off"/"0"/"false"` as disabling, so any other string (`"no"`) reads as deband-on instead of falling back to the dashboard default. Other axes (kernel, jitter, depth, reactive) reject unknown values via whitelist; match that.
+- [x] `src/patcher/Transcoding/UpscalePatches.cs:408` 🔴 bug: `explicitlyAsked = plan.ClientOptIn || plan.DeblurApplied || plan.DenoiseApplied` omits `NeuralApplied`, `GameApplied`, `RefineApplied`, `ChromaApplied`. A session asking only for `neural=`/`game=`/`refine=`/`chroma=` (no upscale/deblur/denoise, `ForceTranscode` off) keeps the `copy` encoder, so `-vf` never applies and the filter is silently dropped. Add the four flags to `explicitlyAsked`.
+- [x] `src/patcher/Transcoding/UpscaleEngine.cs:706` 🟡 risk: `refine` and `chroma` have no master-enable gate, unlike `DeblurAllowed`/`DenoiseAllowed`/`NeuralAllowed`/`GameAllowed`, and `UpscaleSettings.cs` has no matching property. Any session overrides dashboard policy. Add `RefineAllowed`/`ChromaAllowed`, or document them as intentionally ungated.
+- [ ] (open: test on the server) `src/patcher/Transcoding/UpscaleEngine.cs:825` 🟡 risk: `plan.GameApplied && GameScalesOutput(...)` forces `srLevel`/`refineLevel` off to avoid double-upscaling but leaves `chromaLevel` on, though KrigBilateral runs in the same libplacebo `custom_shader_path` and composes against whatever luma pass ran. Confirm intent or exempt chroma explicitly like sr/refine.
+- [x] `src/patcher/Transcoding/UpscaleEngine.cs:848` 🔵 nit: `deband` treats only `"off"/"0"/"false"` as disabling, so any other string (`"no"`) reads as deband-on instead of falling back to the dashboard default. Other axes (kernel, jitter, depth, reactive) reject unknown values via whitelist; match that.
 
 Verified clean: all 13 axes are read via `Option(state, ...)` in `Decide`/`GameFilter` — nothing dropped at the read stage. No shell or arg injection: `kernel` goes through `ShaderLibrary.CanonicalUpscaler`; `jitter`/`depth`/`reactive` through `GameOption()` whitelists; `sr`/`deblur`/`refine`/`chroma`/`denoise`/`neural`/`game` level names validate against fixed dictionaries before any path lookup or string concat, and `ShaderLibrary.Compose` builds cache filenames from those validated names, so no path traversal.
 
@@ -66,7 +66,7 @@ All five fixed together in one change set — they share a single ffmpeg rebuild
 ## Still open
 
 - `scripts/99-jellyfin-plus` — scoping the apt hook to jellyfin-web is not a one-line edit, and the other half of the fix (root:root 0755, no group/other write on the injector and on `/usr/lib/jellyfin-plus/jellyfin-plus.js`) is host-side.
-- `src/patcher/UpscaleEngine.cs:825` — chroma with a game upscaler: run a session with chroma on and off against the same source and compare the served segment before changing anything.
+- `src/patcher/Transcoding/UpscaleEngine.cs:825` — chroma with a game upscaler: run a session with chroma on and off against the same source and compare the served segment before changing anything.
 
 ## Verification state
 
@@ -87,7 +87,7 @@ marked, and nothing below has been run against a server.
 
 Fixed immediately, because it was a regression introduced by round one:
 
-- [x] `src/patcher/UpscalePatches.cs` 🔴 `explicitlyAsked` read `plan.*Applied`, which are true for a
+- [x] `src/patcher/Transcoding/UpscalePatches.cs` 🔴 `explicitlyAsked` read `plan.*Applied`, which are true for a
   dashboard default as well as a session request. A default of `chroma=krigbilateral` would have
   turned every stream-copy-eligible playback into a full GPU transcode. Now gated on
   `UpscaleEngine.SessionNamedEnhancement(state)`, which asks whether the session named an axis.
@@ -157,7 +157,7 @@ Two agents arrived independently at the same first item, from opposite ends of t
 
 ## The one to do first
 
-- [ ] `src/patcher/UpscalePatches.cs:387` **The encoder undoes the work.** The plugin sets the
+- [ ] `src/patcher/Transcoding/UpscalePatches.cs:387` **The encoder undoes the work.** The plugin sets the
   encoder name and nothing else, so Jellyfin computes `-b:v`/`-maxrate` from the SOURCE resolution
   and clamps to the source bitrate. The chain then ships four times the pixels at 540p bitrate and
   the quantiser removes exactly the detail the shaders added. Nothing in the repo touches `cq`,
@@ -167,10 +167,10 @@ Two agents arrived independently at the same first item, from opposite ends of t
 
 ## Throughput
 
-- [ ] `src/patcher/UpscaleEngine.cs:1468` `hwdownload,format=yuv420p` sends every output frame
+- [ ] `src/patcher/Transcoding/UpscaleEngine.cs:1468` `hwdownload,format=yuv420p` sends every output frame
   Vulkan to system memory and back into NVENC: about 12 MB per frame at 2160p, paid at output size.
   `hwmap=derive_device=cuda` hands NVENC device frames. Touches the encoder args too. `[M]`
-- [x] `src/patcher/UpscaleEngine.cs:1408-1441` each CPU-side filter carries its own
+- [x] `src/patcher/Transcoding/UpscaleEngine.cs:1408-1441` each CPU-side filter carries its own
   `format=gbrpf32le,X,format=yuv420p`, so denoise plus neural round-trips through 4:2:0 8-bit
   BETWEEN two neural passes. One convert before the group, one after. No measurement needed.
 - [x] `ffmpeg/gu_inputs.h:874` `gu_inputs_frame` is entirely single-threaded, and neither
@@ -182,7 +182,7 @@ Two agents arrived independently at the same first item, from opposite ends of t
   overwritten in place by the cross-power spectrum before the inverse transform. Still worth doing,
   but it changes output, so it needs the cross spectrum written elsewhere plus an A/B swap and a
   measurement.
-- [ ] `src/patcher/UpscalePatches.cs:344,360` hwaccel and the hw decoder are suppressed for every
+- [ ] `src/patcher/Transcoding/UpscalePatches.cs:344,360` hwaccel and the hw decoder are suppressed for every
   acted-on session, but system-memory frames are only needed when a CPU-side node exists. The
   common case (sr plus deblur) could keep NVDEC. `[M]`
 - [ ] `ffmpeg/vf_optix.c:432` pageable host memory with blocking copies; `cuMemAllocHost` plus
@@ -206,7 +206,7 @@ Two agents arrived independently at the same first item, from opposite ends of t
   data. `[M]`
 - [x] `ffmpeg/vf_optix.c:410` `mode=hdr` never sets `params.hdrIntensity`, which the OptiX HDR
   model expects from `optixDenoiserComputeIntensity`. HDR output is off-scale without it.
-- [x] `src/patcher/ShaderLibrary.cs:967` the `ort` level is not matched to the session ratio:
+- [x] `src/patcher/Transcoding/ShaderLibrary.cs:967` the `ort` level is not matched to the session ratio:
   `realesr-anime-x4` at a 2x target makes 4x pixels that libplacebo then halves. These levels are
   sub-realtime, so the wasted work is the entire cost.
 - [x] `shim/jellyfin-ffmpeg-upscale:59,323,441` the fallback path contradicts the measurements:

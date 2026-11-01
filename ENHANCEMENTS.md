@@ -84,8 +84,8 @@ setting, a control in the page, or "remove the plugin or script".
 | Tag management (config page) | Server route + config page | Dashboard, Plugins, Jellyfin Plus: list tags with item counts, rename, merge, delete across items, with a dry run first | Administrators only; nothing is written without Apply (section 6) |
 | Folder covers link instead of copy | Server patch + scheduled tasks | A folder's generated cover is a symlink to the child image it shows, not a 2-3 MB copy of it in `metadata/library`; two tasks convert existing copies ("Jellyfin Plus: link folder images instead of copies", and a "(dry run)" that only counts) | On, no switch; falls back to the stock copy (section 7.9) |
 | Slow-link profile | Client (`controller/link-probe.js`, `model/link-profile.js`, applied in `controller/network.js`) | The browser times its own link (fastest of 3 `GET System/Ping`; one 256 KB range of its own bundle; ~3 s after load, then every 10 min while visible). Round trip > 120 ms or < 10 Mbps = slow: PlaybackInfo gets `EnableDirectPlay=false` and `MaxStreamingBitrate` = 60% of measured throughput (800-4000 kbps, never raised), and every enhancement axis is sent as `off` on PlaybackInfo, playlists AND segments (a seek rebuilds the command from the segment request). Address-based detection is impossible here: subnet routers SNAT remote viewers to LAN IPs. Measured over Tailscale (264 ms, ~1-2.3 Mbps): seeks 3.0-7.8 s direct play -> 2.7-2.9 s | localStorage `jellyfinPlus.linkProfile`: unset = auto, `fast` = never slow, `slow` = always; probe failure = no profile (stock) |
-| Playlist gzip | Server patch (`src/patcher/PlaylistGzipPatches.cs`) | HLS variant playlists over 16 KB are gzipped when the client accepts it. Jellyfin 12.3 compresses only ASP.NET's default MIME types, not `application/vnd.apple.mpegurl`, and a VOD playlist lists every segment with the full query (~1.1 KB each): 2.9 MB for a 2 h 9 min item -> 52 KB. Measured over Tailscale: playlist 10.5 s -> 0.8-1.5 s; start-up 15.4 s -> 6.3 s (with the probe change below) | On, no switch; any failure returns the stock uncompressed playlist |
-| Fast seek (transcodes) | Server patch (`src/patcher/SeekPatches.cs`) | A seek that restarts the plugin's HLS ffmpeg: the old process is killed 200 ms after stock's `q` instead of waiting for it to drain (measured 0.6-0.7 s per seek), and a job reading a local mkv/mp4/webm/mov with known streams probes 3 s / 10 MB instead of 200M / 1G, on first starts and seeks (measured 0.6-1 s each). A shorter first segment was not done: the VOD playlist is a fixed segment grid | On, no switch; only HLS jobs of the plugin's ffmpeg, never raises a configured probe value, any hook failure leaves stock behaviour |
+| Playlist gzip | Server patch (`src/patcher/Transcoding/PlaylistGzipPatches.cs`) | HLS variant playlists over 16 KB are gzipped when the client accepts it. Jellyfin 12.3 compresses only ASP.NET's default MIME types, not `application/vnd.apple.mpegurl`, and a VOD playlist lists every segment with the full query (~1.1 KB each): 2.9 MB for a 2 h 9 min item -> 52 KB. Measured over Tailscale: playlist 10.5 s -> 0.8-1.5 s; start-up 15.4 s -> 6.3 s (with the probe change below) | On, no switch; any failure returns the stock uncompressed playlist |
+| Fast seek (transcodes) | Server patch (`src/patcher/Transcoding/SeekPatches.cs`) | A seek that restarts the plugin's HLS ffmpeg: the old process is killed 200 ms after stock's `q` instead of waiting for it to drain (measured 0.6-0.7 s per seek), and a job reading a local mkv/mp4/webm/mov with known streams probes 3 s / 10 MB instead of 200M / 1G, on first starts and seeks (measured 0.6-1 s each). A shorter first segment was not done: the VOD playlist is a fixed segment grid | On, no switch; only HLS jobs of the plugin's ffmpeg, never raises a configured probe value, any hook failure leaves stock behaviour |
 | Faster resize of large JPEGs | Server patch | Cold image resizes decode a big JPEG source at 1/2, 1/4 or 1/8 scale when that still covers the output size; same output size | On, no switch; falls back to the stock full decode, and switches itself off if an output size is ever wrong (section 7.10) |
 | Maintenance task buttons (config page) | Config page | Start "Scan people" and "Optimize database" from the plugin page | Administrators only; stock endpoints (section 6) |
 | Preference sync across devices | Client | Enhance panel choices and search paging choices follow the viewer to other browsers | On, no switch; falls back to localStorage alone if jellyfin-web's settings object is not found (section 6) |
@@ -100,7 +100,7 @@ configuration, measurements), [ARCHITECTURE.md](docs/architecture/ARCHITECTURE.m
 `MediaBrowser.Controller.MediaEncoding.EncodingHelper` are patched to replace the `-vf` chain with a
 libplacebo (Vulkan) chain, swap the device arguments, drop the hardware decoder, and turn a stream
 copy into a real encode when enhancement was asked for. The chain is built in
-`src/patcher/UpscaleEngine.cs` and `src/patcher/ShaderLibrary.cs`.
+`src/patcher/Transcoding/UpscaleEngine.cs` and `src/patcher/Transcoding/ShaderLibrary.cs`.
 
 **The 14 axes.** `upscale`, `sr`, `deblur`, `denoise`, `deblock`, `neural`, `game`, `refine`,
 `chroma`, `deband`, `kernel`, `jitter`, `depth`, `reactive`. Each travels as a lowercase query
@@ -143,7 +143,7 @@ unless `ForceTranscodeForDirectPlay` is on (section 7.1).
 **Fallback.** `shim/jellyfin-ffmpeg-upscale` is a Python wrapper that rewrites the command without
 Harmony. The plugin tells it to stand down while the patches are active, by writing
 `plugin_patch_active` and the main settings into `/etc/jellyfin-upscale.json` if that file exists
-(`src/ShimBridge.cs`).
+(`src/Transcoding/ShimBridge.cs`).
 
 **Defaults to know.** From `src/Configuration/PluginConfiguration.cs`: `Enabled` true, `TargetHeight`
 1080, `MaxTargetHeight` 2160, `SrLevel` `fsrcnnx`, `MaxConcurrent` 4, `MaxConcurrentSwaps` 4,
@@ -159,7 +159,7 @@ requests it sends. The server cannot change what the page asks for, so most clie
 outgoing request URLs through the shared fetch and XHR hooks (`web/src/controller/network.js`,
 `markSearch`: the Suggestions clips rewrite, exclude box, then Sort and filter, then paging).
 
-**Tag matching** (`src/patcher/SearchPatches.cs`). Stock search matches item names only. This adds
+**Tag matching** (`src/patcher/Search/SearchPatches.cs`). Stock search matches item names only. This adds
 items whose tag contains the search term, as a case-insensitive, diacritic-insensitive substring
 (both sides go through Jellyfin's `GetCleanValue()`). A tag-only match scores 40, below a stock name
 match (50), so a title match ranks above a tag-only match. It runs through the stock provider's own
@@ -196,7 +196,7 @@ holds the box's `input` events in a window-level capture listener so typing alon
 Search button, or Enter in either box, replays one `input` event so React runs its normal flow
 (`search-exclude.js`, `holdTyping`, `submitSearch`). Not applied on TV layouts.
 
-**Sort** (`src/patcher/SearchSortPatches.cs`). On Jellyfin 12.1 and 12.3 the search page's `sortBy` is thrown
+**Sort** (`src/patcher/Search/SearchSortPatches.cs`). On Jellyfin 12.1 and 12.3 the search page's `sortBy` is thrown
 away: `ItemsController` re-orders loaded items by relevance. The patch re-scores the candidates so that
 score order equals the requested order. Sort keys: `SortName`, `DateCreated`, `PremiereDate`,
 `CommunityRating`, `Runtime`, `Random`, `PlayCount`, `DatePlayed` (names outside this list are
@@ -218,7 +218,7 @@ each Apply re-runs the page's queries with a two-phase refetch.
 one all-types query). The Type filter steers them: the query that should show nothing is cut down to a
 one-item stock request whose result the page discards (`typePlan`).
 
-**Cast and Crew, and search-scoped facets** (`src/SearchFacetsController.cs`). The Cast and Crew
+**Cast and Crew, and search-scoped facets** (`src/Search/SearchFacetsController.cs`). The Cast and Crew
 picker asks `GET /JellyfinPlus/Search/Facets` for the people credited on the items this search
 returns, with counts. A facet ignores its own filter, so picking one person does not shrink the list to
 that person's co-stars. Role pills offer only roles that occur in the listed people (plus any already
@@ -256,7 +256,7 @@ every pause in typing, and shows "Showing N of M matching tags". Picked tags sta
 Without server support it falls back to filtering the full list in the browser.
 
 **Skipping searches that cannot match** (`web/src/controller/search-census.js`,
-`web/src/model/search-census.js`, `src/LibraryCensusController.cs`). The search page sends a request per
+`web/src/model/search-census.js`, `src/Library/LibraryCensusController.cs`). The search page sends a request per
 result kind (artists, people, studios, programs, videos, all-types) whether or not the library has any.
 `GET /JellyfinPlus/Library/Census` says which item kinds the user has; a request whose kinds are all
 known to the census and all absent is rewritten to an `/Items?ids=<nil guid>` lookup, which returns the
@@ -340,7 +340,7 @@ rewritten to `excludeTagNames` (one parameter per tag, taken verbatim), `tagMatc
 Markers are removed from every other URL, and a marker that is never rewritten reaches the server as a
 tag nothing has: an empty list, not a wrong one.
 
-**Server side** (`src/patcher/LibraryFilterPatches.cs`, section 7.4). `excludeTagNames` is an exact
+**Server side** (`src/patcher/Library/LibraryFilterPatches.cs`, section 7.4). `excludeTagNames` is an exact
 match on the cleaned tag name, unlike the search page's substring `excludeTags`.
 
 **Quick tag filters** (per user; `web/src/view/quick-tags.js`, `view/quick-tags-editor.js`,
@@ -382,7 +382,7 @@ of a group are OR-ed, groups are AND-ed, a group with no pick adds nothing.
   context or TV: nothing. The search page's Sort &
   filter sheet already lists suggested groups with the viewer's own (`loadVisible`), so nothing was added there.
 
-**Smart tag categories** (`src/SmartTagCategories.cs` pure algorithm, `src/SmartTagsController.cs` route +
+**Smart tag categories** (`src/SmartTags/SmartTagCategories.cs` pure algorithm, `src/SmartTags/SmartTagsController.cs` route +
 loader + cache, `web/src/controller/smart-tags.js` fetch, `web/src/model/smart-tags.js` adapter).
 `GET /JellyfinPlus/Tags/Categories[?parentId=][&userId=]` (`userId`: administrators only, cross-user) derives filter categories from the tag vocabulary of the
 items the requesting user can see, and answers `[{id, label, kind: prefix|exclusive|popular, prefix?,
@@ -425,7 +425,7 @@ answer and ids (FNV-1a, never `GetHashCode`), whatever the row order.
   (stale-while-revalidate) while a background refresh runs, and only an entry past 60 minutes is a miss, so
   the route blocks on a computation only for a key that was never computed. A result computed while the
   library changed is stamped with the generation read before computing. One computation per key at a time.
-- **Precompute** (`src/SmartTagPrecompute.cs`, hosted service). 60 s after start, then every minute, it
+- **Precompute** (`src/SmartTags/SmartTagPrecompute.cs`, hosted service). 60 s after start, then every minute, it
   computes the missing or due entries for every enabled user: the no-parent scope and each library that user
   can see; the plan is capped at the cache size (300), no-parent scopes first, and logs once when truncated.
   Each is computed as that user through the route's own `SmartTagsCore.ComputeAsync`
@@ -436,7 +436,7 @@ answer and ids (FNV-1a, never `GetHashCode`), whatever the row order.
   at once), no pause when idle, a 2 s pause only when the budget is 1; at most 40 per cycle, and a cycle is skipped, and an unfinished one stops, while
   `ILibraryManager.IsScanRunning`. A cycle that computed anything logs
   `smart tag precompute cycle computed N entries in M ms`. Cold cost it removes: about 5 s per entry.
-- **CPU budget** (`src/CpuBudget.cs`; also gates the image warm batch). Background work may use the container's
+- **CPU budget** (`src/Transcoding/CpuBudget.cs`; also gates the image warm batch). Background work may use the container's
   cores minus the cores playback uses now, never below 1. Container cores: `Environment.ProcessorCount` and
   `/sys/fs/cgroup/cpu.max` (quota/period rounded up), the smaller. Playback cores: one sampler every 2 s reads
   `/proc/<pid>/{comm,stat}` for every process whose name contains `ffmpeg` (all of them, including any the plugin
@@ -468,7 +468,7 @@ the shared sheet) with a ✕; with none, nothing is drawn above the grid.
 - Same fail-soft and scope as the quick tag chips: modern library tabs only (not artists / studios, TV).
 
 **List pages: sort and paging** (`web/src/controller/list-requests.js`, `web/src/controller/list-sort.js`,
-models `web/src/model/list-requests.js` and `list-sort.js`; server `src/patcher/ListSortPatches.cs`, section 7.8).
+models `web/src/model/list-requests.js` and `list-sort.js`; server `src/patcher/Library/ListSortPatches.cs`, section 7.8).
 
 - **Random that pages without repeats.** Stock sorts Random with SQLite's `random()` per query, so
   every page is a new shuffle and page 2 repeats page 1. A list-page `/Items` request that sorts by
@@ -524,8 +524,8 @@ models `web/src/model/list-requests.js` and `list-sort.js`; server `src/patcher/
   (`initAlphaPicker` runs only when the list has a parent item, and tag lists have none) and is not
   added: it lives in closure state of the list controller that a wrapper cannot reach safely.
 
-**Filter key cache** (`src/patcher/FilterCacheEngine.cs`, `src/patcher/FilterCachePatches.cs`,
-`src/FilterCache.cs`). Stock recomputes `/Items/Filters` and `/Items/Filters2` (tags, genres, years,
+**Filter key cache** (`src/patcher/Library/FilterCacheEngine.cs`, `src/patcher/Library/FilterCachePatches.cs`,
+`src/Library/FilterCache.cs`). Stock recomputes `/Items/Filters` and `/Items/Filters2` (tags, genres, years,
 official ratings) on every request, which the code comments measure at 4 to 7 seconds on a library of
 about 47 000 items and 12 000 tags. The cache stores the keys in two tables inside Jellyfin's
 `jellyfin.db` (section 11) and answers from them when that is safe, otherwise stock runs untouched.
@@ -557,7 +557,7 @@ about 47 000 items and 12 000 tags. The cache stores the keys in two tables insi
 
 ## 4. Item pages
 
-**More Like This for Video items** (server: `src/patcher/SimilarPatches.cs`; client:
+**More Like This for Video items** (server: `src/patcher/Library/SimilarPatches.cs`; client:
 `web/src/controller/detail-related.js`). Stock has no similar-items provider for the base `Video`
 type, and the web page hides the section for it. The server ranks other Videos by shared tags and
 people: score = 5 per shared tag plus 15 per shared person, each weighted by `1 / ln(2 + postings)` so
@@ -649,7 +649,7 @@ about 0.3 s per image the first time a size is requested (it resizes, then cache
 - **Card fade:** card images (`.cardImageContainer.lazy-image-fadein`) fade in over at most 100 ms
   instead of stock's 500 ms (a CSS rule, `jellyfinPlusCardFadeStyle`). Off with the same
   `jellyfinPlus.imagePreload` switch.
-- **Server warm batch** (`src/ImageWarmController.cs`, `POST /JellyfinPlus/Images/Warm`, `[Authorize]`).
+- **Server warm batch** (`src/Library/ImageWarmController.cs`, `POST /JellyfinPlus/Images/Warm`, `[Authorize]`).
   Stock encodes one image per request, does not dedupe identical concurrent requests, and a browser has
   6 connections per host, so a cold screenful of ~30 cards takes ~2 s. For look-ahead cards *beyond*
   stock's own 50% zone the client first posts `{"urls":[...]}` (relative `/Items/<guid>/Images/<Type>[/<n>]?<query>`
@@ -884,7 +884,7 @@ when 8 seconds remain ("Start now", "Hide"), for items of 20 seconds or longer. 
 stock playback manager still advances if the viewer's auto-play setting is on. It respects the
 viewer's "next video info" overlay setting.
 
-**Timeline markers** (`src/MarkerProviders.cs`, `src/MarkersController.cs`,
+**Timeline markers** (`src/Markers/MarkerProviders.cs`, `src/Markers/MarkersController.cs`,
 `web/src/controller/timeline-markers.js`, `web/src/model/timeline-markers.js`). A generic integration:
 any external app can supply points for an item, and the player draws them as dots over the OSD
 position slider. Full contract for app authors: [docs/architecture/TIMELINE_MARKERS.md](docs/architecture/TIMELINE_MARKERS.md).
@@ -919,7 +919,7 @@ position slider. Full contract for app authors: [docs/architecture/TIMELINE_MARK
   markers' strips; moment generation driven to ready; every sheet the strips use loaded), cached per
   item in the client's per-item LRU (`entry.strips[index]` for strips); a sheet that fails to load
   hides only its own frames, and no source at all leaves label + value.
-- *Moment sheets* (`src/MomentSheets.cs`, `src/MarkerSource.cs`; setting `MarkerMoments`, default on,
+- *Moment sheets* (`src/Moments/MomentSheets.cs`, `src/Markers/MarkerSource.cs`; setting `MarkerMoments`, default on,
   Integrations tab): for a video with markers and no stock trickplay, `GET
   /JellyfinPlus/Markers/{itemId}/Moments` (`no-store`) answers the set's manifest, generating on a
   miss: 160x90 frames (one JPEG encode, `-q:v 10`) at the server's own marker times (never times from
@@ -945,7 +945,7 @@ position slider. Full contract for app authors: [docs/architecture/TIMELINE_MARK
   manager (item time), not the `<video>` clock, so a transcode resumed mid-item still lines up. Uses the
   markers already fetched for the timeline: no extra request. localStorage `jellyfinPlus.markerToasts`:
   unset = every kind, `off` = none, or a comma list of kinds (`tip,highlight`). TV layout untouched.
-- *Precompute* (`src/MomentPrecompute.cs`; setting `MarkerMomentsPrecompute`, default on): scheduled
+- *Precompute* (`src/Moments/MomentPrecompute.cs`; setting `MarkerMomentsPrecompute`, default on): scheduled
   task *Precompute marker previews* (category Jellyfin Plus, daily 03:00, runnable by hand) walks every
   matching video without stock trickplay, fetches markers with no user (no route exposes that path;
   provider calls at most 4/s, not cached for viewers) and makes the set in the background lane; plus a
@@ -1022,7 +1022,7 @@ items); the tag management page below does that.
 
 ### Tag management (config page and `/JellyfinPlus/Tags`)
 
-`src/TagAdminController.cs`, the "Tags" section of `src/Configuration/configPage.html`.
+`src/Library/TagAdminController.cs`, the "Tags" section of `src/Configuration/configPage.html`.
 Administrators only (`RequiresElevation` on the whole controller; the page itself is the dashboard's).
 
 - **List.** Every stored tag spelling that at least one item carries, with its item count, searchable
@@ -1089,7 +1089,7 @@ to the viewer's `DisplayPreferences.CustomPrefs` (`jellyfinPlus.prefs`, `jellyfi
 
 ## 7. Harmony patch reference
 
-All patches are installed by `UpscalePatches.Apply` / `ApplyOptional` (`src/patcher/UpscalePatches.cs`)
+All patches are installed by `UpscalePatches.Apply` / `ApplyOptional` (`src/patcher/Transcoding/UpscalePatches.cs`)
 when the plugin loads, in the patch assembly at `/usr/lib/jellyfin-plus/`. Harmony id:
 `jellyfin.plugin.jellyfinplus`. The result is reported as `PatchStatus` by `GET /JellyfinPlus/Status`,
 for example `active (5 EncodingHelper methods patched); optional: tag search, ...; optional UNAVAILABLE: ...`.
@@ -1352,7 +1352,7 @@ none. Then the list stays in name order and header `X-JellyfinPlus-TagOrder` say
 `count` (it is sent whenever `jpTagOrder` was given, so the client can tell). No client sends these yet:
 the library filter popover is not changed by this item.
 
-### 7.6 Search index: FTS5 trigram over names and tags (`FtsIndexEngine.cs`, `src/FtsIndex.cs`)
+### 7.6 Search index: FTS5 trigram over names and tags (`FtsIndexEngine.cs`, `src/Search/FtsIndex.cs`)
 
 Three plugin-owned tables in `jellyfin.db`, created with `IF NOT EXISTS` (Jellyfin's schema is never touched):
 `JellyfinPlus_FtsNames(ItemId UNINDEXED, CleanName, OriginalTitle, SortName)` (virtual, `fts5` trigram, one row per

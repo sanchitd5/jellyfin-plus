@@ -11,8 +11,8 @@ can settle.
 
 Sources read: `web/gpu-upscale.js` (all 3468 lines), `CLAUDE.md`, `AGENTS.md`,
 `INTEGRATION_DESIGN.md`, `RTXDLPP.md`, `RTXVSR.md`, `roadmap/driver-features.md`,
-`roadmap/gpu-only-filters.md`, `src/patcher/UpscaleEngine.cs`, `src/patcher/ShaderLibrary.cs`,
-`src/patcher/PatcherHost.cs`, `src/patcher/UpscaleSettings.cs`,
+`roadmap/gpu-only-filters.md`, `src/patcher/Transcoding/UpscaleEngine.cs`, `src/patcher/Transcoding/ShaderLibrary.cs`,
+`src/patcher/PatcherHost.cs`, `src/patcher/Transcoding/UpscaleSettings.cs`,
 `src/Configuration/PluginConfiguration.cs`, and the current `git diff` of the concurrent backend
 work.
 

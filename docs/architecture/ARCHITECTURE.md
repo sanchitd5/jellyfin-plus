@@ -6,7 +6,7 @@ GPU-residency investigation this file's filter/backend map was pulled out of.
 
 ## Pipeline shape
 
-One `-vf` chain, built by `UpscaleEngine.BuildChain` (`src/patcher/UpscaleEngine.cs`), in this
+One `-vf` chain, built by `UpscaleEngine.BuildChain` (`src/patcher/Transcoding/UpscaleEngine.cs`), in this
 fixed order:
 
 ```

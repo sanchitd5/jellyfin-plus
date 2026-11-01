@@ -31,16 +31,20 @@ part of the mandatory five, and NOT yet wired into the plugin's 5-place checklis
 Layout:
 
 ```
-src/                    plugin assembly (loads into Jellyfin's collectible ALC): plugin, controllers
-                        (UpscaleController, SearchFacetsController, LibraryCensusController),
-                        hosted/scheduled/post-scan services (FilterCache.cs, FtsIndex.cs,
-                        FolderImageLinkTasks.cs)
-src/patcher/            patcher assembly (loads into the DEFAULT ALC, this is where Harmony lives):
-                        transcode patches (UpscalePatches/SwapPatches), search (SearchPatches,
-                        SearchSortPatches, SearchDeepPagePatches, SearchWildcard, ServerTimingPatches),
-                        library (LibraryFilterPatches, FilterCacheEngine/Patches, FtsIndexEngine,
-                        SimilarPatches), ScanTimingPatches (measurement only),
-                        FolderImageLinkPatches (folder covers link, ImageSaver write guard)
+src/                    plugin assembly (loads into Jellyfin's collectible ALC), grouped by feature:
+                        Hosting/ (PatcherLoader), Transcoding/ (UpscaleController, GpuLoadController,
+                        CpuBudget, ShimBridge), Library/ (FilterCache, FolderImageLinkTasks,
+                        LibraryCensusController, IngestController, TagAdminController, ImageWarmController),
+                        Search/ (SearchFacetsController, FtsIndex), Markers/, Moments/, SmartTags/;
+                        Plugin.cs at the root. Hosted/scheduled/post-scan services are the *Tasks/FilterCache/FtsIndex files.
+src/patcher/            patcher assembly (loads into the DEFAULT ALC, this is where Harmony lives);
+                        PatcherHost.cs at the root, the rest grouped:
+                        Transcoding/ (UpscaleEngine, UpscalePatches, UpscaleSettings, ShaderLibrary,
+                        SwapPatches, SeekPatches, PlaylistGzipPatches), Search/ (SearchPatches,
+                        SearchSortPatches, SearchDeepPagePatches, SearchWildcard, ServerTimingPatches,
+                        FtsIndexEngine), Library/ (LibraryFilterPatches, ListSortPatches, FilterCacheEngine/
+                        Incremental/Patches, SimilarPatches, ScaledDecodePatches, ScanTimingPatches (measurement
+                        only), FolderImageLinkPatches (folder covers link, ImageSaver write guard))
 src/Configuration/      settings class + the dashboard page
 web/src/                real ES modules (source); web/jellyfin-plus.js is the BUILT, gitignored
                         bundle of it (esbuild, scripts/build-web-panel.sh) - the injected browser
