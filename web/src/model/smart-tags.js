@@ -2,7 +2,7 @@
  * SMART TAG CATEGORIES, PURE PART. No DOM, no network: runs under node (smart-tags.test.mjs).
  *
  * The server derives categories from the tag vocabulary of what the viewer can see
- * (GET /JellyfinPlus/Tags/Categories, src/SmartTagsController.cs):
+ * (GET /JellyfinPlus/Tags/Categories, src/SmartTags/SmartTagsController.cs):
  *   [{ id, label, kind: 'prefix'|'exclusive'|'popular', prefix?, primary, coverage, tags: [{ name, label, count }] }]
  * This turns that answer into the quick tag groups' suggestion shape (model/quick-tags.js parseSuggested):
  * a prefix family becomes { name, prefix }, an exclusive or popular facet { name, tags[] }. It also finds the

@@ -9,7 +9,7 @@
  *   `c:<from>~<to>`        fixed days, either side may be empty   (YYYY-MM-DD)
  *
  * Days are UTC days, inclusive ("Last N days" = today plus the N-1 before it), exactly the server's contract (jpMinDateAdded / jpMaxDateAdded in
- * src/patcher/LibraryFilterPatches.cs). Anything unreadable decodes to null = no date filter.
+ * src/patcher/Library/LibraryFilterPatches.cs). Anything unreadable decodes to null = no date filter.
  */
 
 export var PRESETS = [

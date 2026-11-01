@@ -5,7 +5,7 @@ import { timelineMarkers, seekTarget, stripTimes, pickTrickplay, stockTile, mome
 
 /*
  * TIMELINE MARKERS ON THE PLAYER'S SEEK BAR. External services configured on the server
- * (src/MarkerProviders.cs) supply points for an item; GET /JellyfinPlus/Markers/{itemId} returns them
+ * (src/Markers/MarkerProviders.cs) supply points for an item; GET /JellyfinPlus/Markers/{itemId} returns them
  * merged and normalised. Each is a dot over the OSD position slider, styled by kind (unknown kinds
  * neutral), sized by value, titled "label · value unit"; a click seeks a few seconds before it
  * (model/timeline-markers.js).
@@ -15,7 +15,7 @@ import { timelineMarkers, seekTarget, stripTimes, pickTrickplay, stockTile, mome
  * marker's own frame, highlighted, with two either side 5 s apart. Clicking a frame seeks to its time.
  * Frames come from the item's stock Jellyfin trickplay when it has any (Videos/{id}/Trickplay/...),
  * otherwise from the plugin's moment sheets (GET /JellyfinPlus/Markers/{id}/Moments, usually
- * precomputed on the server, src/MomentPrecompute.cs), otherwise - not ready yet - from that one
+ * precomputed on the server, src/Moments/MomentPrecompute.cs), otherwise - not ready yet - from that one
  * marker's strip made on the spot (GET .../Moments/Marker/{index}.jpg?t=, ~0.35 s server-side; tile
  * times in X-Moment-Strip). Prewarmed once per item when its markers are drawn (the strips of the
  * WARM_STRIPS highest-value markers, generation driven to ready, the sheets loaded), cached per item;

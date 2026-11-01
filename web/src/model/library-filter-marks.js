@@ -14,7 +14,7 @@ import { encode as encodeDate, decode as decodeDate, paramPairs } from './date-a
  *
  * So the extra state rides in that array as MARKER entries - strings no real tag can equal -
  * and rewriteLibraryUrl() lifts them back out of the outgoing request into the parameters the
- * server patch (src/patcher/LibraryFilterPatches.cs, plus the stock personIds) understands:
+ * server patch (src/patcher/Library/LibraryFilterPatches.cs, plus the stock personIds) understands:
  *
  *   MARK x:<tag name> END   -> excludeTagNames=<tag name>            (one parameter per tag)
  *   MARK all: END           -> tagMatch=all

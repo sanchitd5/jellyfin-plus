@@ -6,7 +6,7 @@
  * that starts with it is a chip, labelled with what follows the prefix. Picked chips of one group
  * combine with OR, different groups with AND, and a group with nothing picked adds no condition.
  * On the wire that is one `jpTagAnyOf` parameter per group that has a pick, its value the picked tag
- * names joined by `|` (src/patcher/LibraryFilterPatches.cs, ParseTagAnyOf). No tag name is baked in
+ * names joined by `|` (src/patcher/Library/LibraryFilterPatches.cs, ParseTagAnyOf). No tag name is baked in
  * anywhere in this client: names come from what the viewer picks out of the server's tag list.
  */
 

@@ -1,5 +1,5 @@
 /*
- * TIMELINE MARKERS, PURE PART. The server (src/MarkersController.cs, GET /JellyfinPlus/Markers/{itemId})
+ * TIMELINE MARKERS, PURE PART. The server (src/Markers/MarkersController.cs, GET /JellyfinPlus/Markers/{itemId})
  * answers with its own normalised contract, merged from every configured provider:
  *
  *   { markers: [{ offsetSeconds, label, value?, unit?, kind?, source }] }

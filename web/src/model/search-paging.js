@@ -12,7 +12,7 @@
  * next slice of the relevance-ranked mix, so a page boundary can fall inside a section and a later
  * page can bring more of a section that already showed on the first. The view labels it that way.
  *
- * WIRE CONTRACT with the server half (src/patcher/SearchSortPatches.cs): a paged request carries
+ * WIRE CONTRACT with the server half (src/patcher/Search/SearchSortPatches.cs): a paged request carries
  *   startIndex, limit            stock; the slice
  *   enableTotalRecordCount=true  stock; ask for the total
  *   jpPaged=true                 ours; the candidate pool is widened to cover startIndex + limit

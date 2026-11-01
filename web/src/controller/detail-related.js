@@ -10,7 +10,7 @@ import { el } from '../lib/dom.js';
  *
  *  - renderSimilarItems() hides #similarCollapsible for every type outside an allow-list
  *    (Movie, Trailer, Series, Program, Recording, MusicAlbum, MusicArtist, Playlist, Audio), so a
- *    clip never even asks. The server half (src/patcher/SimilarPatches.cs) makes the answer
+ *    clip never even asks. The server half (src/patcher/Library/SimilarPatches.cs) makes the answer
  *    non-empty; this module asks for it and renders it into the stock #similarCollapsible with
  *    the stock cardBuilder.
  *  - renderTags() writes every tag into ONE comma-joined line of text links (".itemTags"), which on

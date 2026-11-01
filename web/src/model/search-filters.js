@@ -616,7 +616,7 @@ export function rewriteSearchUrl(url, state, now) {
 var FACET_TYPE = { videos: 'Video', movies: 'Movie', episodes: 'Episode' };
 
 /*
- * The query string pairs for GET /JellyfinPlus/Search/Facets (src/SearchFacetsController.cs), apart
+ * The query string pairs for GET /JellyfinPlus/Search/Facets (src/Search/SearchFacetsController.cs), apart
  * from userId, kind, q and limit. It is the committed search term plus the committed filters,
  * EXCEPT the cast filter itself (people, roles, any/all) and the sort: a facet ignores its own
  * filter, or picking one person would shrink the list to that person's co-stars, and sort changes

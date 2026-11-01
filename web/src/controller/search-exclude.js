@@ -4,7 +4,7 @@ import { el } from '../lib/dom.js';
 /*
  * THE SEARCH PAGE'S "EXCLUDE TAGS" BOX.
  *
- * The server half lives in src/patcher/SearchPatches.cs: SqlSearchProvider.SearchAsync also matches
+ * The server half lives in src/patcher/Search/SearchPatches.cs: SqlSearchProvider.SearchAsync also matches
  * tags, and drops any item with a tag containing one of the request's `excludeTags` terms
  * (case-insensitive substring, comma- or pipe-separated). This module is the client half:
  *
