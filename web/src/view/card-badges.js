@@ -48,7 +48,7 @@ var CSS = [
     '.' + CHIPS + ' { position: absolute; left: 0; top: 0; z-index: 1; display: flex; flex-wrap: wrap; gap: 3px;'
         + ' max-width: 100%; box-sizing: border-box; padding: 4px; pointer-events: none; }',
     '.' + CHIPS + ' > span { display: inline-block; padding: 1px 5px; border-radius: 4px; background: rgba(0,0,0,0.72);'
-        + ' color: #fff; font-size: 0.72em; font-weight: 600; line-height: 1.5; letter-spacing: 0.02em; white-space: nowrap;'
+        + ' color: #fff; font-size: max(11px, 0.72em); font-weight: 600; line-height: 1.5; letter-spacing: 0.02em; white-space: nowrap;'
         + ' font-variant-numeric: tabular-nums; }',
     '.' + CHIPS + ' > .jpChipRes { background: rgba(0,0,0,0.82); box-shadow: inset 0 0 0 1px rgba(255,255,255,0.55); }',
     '.' + CHIPS + ' > .jpChipTip { background: rgba(0,0,0,0.82); color: #ffd36b; box-shadow: inset 0 0 0 1px rgba(255,211,107,0.6); }',
@@ -56,7 +56,7 @@ var CSS = [
     // The category pill: the theme's accent (fallbacks for the theme switched off), clipped, never wider than the card.
     '.' + CHIPS + ' > .' + CAT + ', .' + LIST_CAT + ' { background: var(--jp-accent, #5ccfff); color: var(--jp-on-accent, #0b1a22);'
         + ' border-radius: 999px; padding: 1px 7px; max-width: 100%; overflow: hidden; text-overflow: ellipsis; box-sizing: border-box; }',
-    '.' + LIST_CAT + ' { display: inline-block; flex: none; align-self: center; margin: 0 6px; font-size: 0.75em; font-weight: 600;'
+    '.' + LIST_CAT + ' { display: inline-block; flex: none; align-self: center; margin: 0 6px; font-size: max(11px, 0.75em); font-weight: 600;'
         + ' line-height: 1.6; white-space: nowrap; max-width: 40%; pointer-events: none; }'
 ].join('\n');
 
