@@ -34,6 +34,7 @@ import { installDetailNav } from './controller/detail-nav.js';
 import { installDetailDownload } from './controller/detail-download.js';
 import { installDetailActions } from './view/detail-actions.js';
 import { installDetailTracks } from './view/detail-tracks.js';
+import { installDetailOverview } from './view/detail-overview.js';
 import { installDetailTimeline } from './controller/detail-timeline.js';
 import { installTagAutocomplete } from './controller/tag-autocomplete.js';
 import { installSearchCensus } from './controller/search-census.js';
@@ -141,6 +142,7 @@ function feature(name, install) {
         feature('detail download', installDetailDownload);
         feature('detail actions', installDetailActions);
         feature('detail tracks', installDetailTracks);
+        feature('detail overview', installDetailOverview);
         // Blurhash placeholder under the details header and poster until the real image loads.
         feature('detail blurhash', installDetailBlurhash);
         // A row per person: their clips in date order, this one in the middle. Reads only.
