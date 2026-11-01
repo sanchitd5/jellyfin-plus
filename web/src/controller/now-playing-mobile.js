@@ -110,22 +110,58 @@ function reducedMotion() {
 }
 
 /* 6. Centre the playing row in the queue once it is open. Measured, never guessed from indexes. */
+/*
+ * Returns 'done' (centred, already visible, or nothing to do), 'wait' (open but the playing row is
+ * not rendered yet) or 'closed'. The scroller is `.playlist` itself (stock: absolute, overflow
+ * scroll, remotecontrol.scss:170-181), so element scrollTo never moves the page; the row is
+ * measured with getBoundingClientRect against it, which sidesteps offsetParent entirely.
+ * Stock marks the playing row by adding `playlistIndexIndicatorImage` to its `.listItemImage`
+ * inside loadPlaylist (remotecontrol.js:490-499), in the same tick as the innerHTML that builds
+ * the rows, and rebuilds the whole list on every playlist change / playback start.
+ */
 function scrollToCurrent(page) {
     var list = page.querySelector('.playlistSection .playlist');
-    if (!list || list.classList.contains('hide') || list.getClientRects().length === 0) { return; }
+    if (!list || list.classList.contains('hide') || list.getClientRects().length === 0) { return 'closed'; }
     var mark = list.querySelector('.playlistIndexIndicatorImage');
     var row = mark && mark.closest('.listItem');
-    if (!row) { return; }
+    if (!row) { return 'wait'; }
     var lr = list.getBoundingClientRect();
     var rr = row.getBoundingClientRect();
     var top = rr.top - lr.top;
-    if (rowVisible(top, rr.height, list.clientHeight)) { return; }
+    if (rowVisible(top, rr.height, list.clientHeight)) { return 'done'; }
     var target = centeredScrollTop(list.scrollTop, top, list.clientHeight, rr.height);
     if (!reducedMotion() && typeof list.scrollTo === 'function') {
         list.scrollTo({ top: target, behavior: 'smooth' });
     } else {
         list.scrollTop = target;
     }
+    return 'done';
+}
+
+var WAIT_MS = 2000;
+var pending = null; // { obs, timer } for the one in-flight wait; a new open replaces it
+
+function stopWaiting() {
+    if (!pending) { return; }
+    try { pending.obs.disconnect(); } catch (e) { /* gone */ }
+    clearTimeout(pending.timer);
+    pending = null;
+}
+
+/* Try now; if the rows are not there yet, watch the list for them (<= WAIT_MS, then give up). */
+function scrollWhenReady(page) {
+    stopWaiting();
+    var state = scrollToCurrent(page);
+    if (state !== 'wait') { return; }
+    var list = page.querySelector('.playlistSection .playlist');
+    if (!list || typeof MutationObserver !== 'function') { return; }
+    var obs = new MutationObserver(function () {
+        try {
+            if (scrollToCurrent(page) !== 'wait') { stopWaiting(); }
+        } catch (err) { stopWaiting(); log('now playing: queue scroll failed', err); }
+    });
+    obs.observe(list, { childList: true, subtree: true, attributes: true, attributeFilter: ['class'] });
+    pending = { obs: obs, timer: setTimeout(stopWaiting, WAIT_MS) };
 }
 
 function onClick(e) {
@@ -135,11 +171,13 @@ function onClick(e) {
         var t = e.target && e.target.closest && e.target.closest('.btnTogglePlaylist');
         var page = t && t.closest('.nowPlayingPage');
         if (!page) { return; }
-        // Stock's own click handler (bubble phase) removes .hide; look after it has run and laid out.
+        // Capture phase sees the state BEFORE stock's toggle (remotecontrol.js:813): hidden now = opening.
+        // Closing (or any other state) cancels a pending wait and does nothing.
+        var list = page.querySelector('.playlistSection .playlist');
+        if (!list || !list.classList.contains('hide')) { stopWaiting(); return; }
+        // Stock's own handler (bubble phase) removes .hide after this; one frame later it has laid out.
         requestAnimationFrame(function () {
-            requestAnimationFrame(function () {
-                try { scrollToCurrent(page); } catch (err) { log('now playing: queue scroll failed', err); }
-            });
+            try { scrollWhenReady(page); } catch (err) { log('now playing: queue scroll failed', err); }
         });
     } catch (err) {
         log('now playing: click failed', err);
@@ -148,6 +186,7 @@ function onClick(e) {
 
 export function installNowPlayingMobile() {
     ensureStyle();
+    // Same function reference + capture flag: a second install is a no-op, listeners cannot stack.
     document.addEventListener('click', onClick, true);
     log('now playing mobile: installed');
 }
