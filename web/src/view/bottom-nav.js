@@ -64,7 +64,10 @@ var CSS = [
         + ' html.' + ON + ':has(.nowPlayingBar:not(.hide)) .pageWithAbsoluteTabs .pageTabContent {'
         + ' padding-bottom: calc(env(safe-area-inset-bottom) + 5em + var(--jp-nav-h, 0px)) !important; }',
     // Phone only: the Libraries slot replaces the stock "My Media" tiles on home (fail soft: no match, no effect).
-    'html.jp-phone.' + ON + ' .homePage .verticalSection:has(.homeLibraryButtonContainer) { display: none; }',
+    // Two stock shapes: the button list, and (12.3, measured) small library tiles whose cards are views.
+    'html.jp-phone.' + ON + ' .homePage .verticalSection:has(.homeLibraryButtonContainer),'
+        + ' html.jp-phone.' + ON + ' .homePage .verticalSection:has(> .emby-scroller .card[data-type="CollectionFolder"]),'
+        + ' html.jp-phone.' + ON + ' .homePage .verticalSection:has(> .emby-scroller .card[data-type="UserView"]) { display: none; }',
     'html.' + ON + ' .nowPlayingBar:not(.hide) { bottom: var(--jp-nav-h, 0px); }'
 ].join('\n');
 
@@ -79,6 +82,9 @@ var libPending = false;
 function refreshLibrarySlot() {
     var n = slotEls.libraries;
     if (!n || libPending || libTries >= 3 || libDirect !== null) { return; }
+    // Not signed in yet (early renders at startup): wait without spending a try.
+    var c = window.ApiClient;
+    if (!c || typeof c.getCurrentUserId !== 'function' || !c.getCurrentUserId()) { return; }
     libPending = true;
     libTries++;
     Promise.resolve().then(libraryDirectHref).then(function (href) {

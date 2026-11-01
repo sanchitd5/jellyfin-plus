@@ -78,13 +78,18 @@ function homeRowCss() {
         C + ' { scroll-snap-align: start; flex: 0 0 auto; }',
         C + '.portraitCard, ' + C + '.squareCard { width: ' + peek(2.4) + ' !important; }',
         C + '.backdropCard, ' + C + '.overflowBackdropCard { width: ' + peek(1.6) + ' !important; }',
-        C + ' > .cardBox { position: relative; overflow: hidden; border-radius: var(--jp-radius-m, 8px); }',
-        C + ' .cardBox > .cardFooter { position: absolute; left: 0; right: 0; bottom: 0; z-index: 1; margin: 0;'
-            + ' box-sizing: border-box; padding: 24px 8px 44px; pointer-events: none; color: #fff;'
+        // Home cards carry no .cardFooter: the title lines are bare .cardText siblings of .cardScalable
+        // under .cardBox (measured live, 12.3). The first line goes over the image, above the 44px
+        // actions row; the rest (year, often empty) is dropped. Progress bar and actions stay on top.
+        C + ' > .cardBox { position: relative; overflow: hidden; padding-bottom: 0 !important;'
+            + ' border-radius: var(--jp-radius-m, 8px); }',
+        C + ' > .cardBox > .cardText-first { position: absolute; left: 0; right: 0; bottom: 0; z-index: 1; margin: 0;'
+            + ' box-sizing: border-box; padding: 24px 8px 44px; pointer-events: none; color: #fff; text-align: left;'
+            + ' white-space: nowrap; overflow: hidden; text-overflow: ellipsis;'
             + ' background: linear-gradient(to top, rgba(0,0,0,0.78), rgba(0,0,0,0)); }',
-        C + ' .cardBox > .cardFooter .cardText { color: inherit; padding: 0; white-space: nowrap; overflow: hidden;'
-            + ' text-overflow: ellipsis; }',
-        C + ' .cardBox > .cardFooter .cardText-secondary { opacity: 0.8; font-size: var(--jp-font-small, 0.85em); }',
+        C + ' > .cardBox > .cardText-first a { color: inherit; }',
+        C + ' > .cardBox > .cardText:not(.cardText-first) { display: none; }',
+        C + ' .innerCardFooter, ' + C + ' .jellyfinPlusCardActions { z-index: 2; }',
         C + ' .jellyfinPlusCardActions { flex-wrap: nowrap; }',
         C + ' .jellyfinPlusCardActions [data-action="play"] { display: none; }',
         // Section title / "see all" link: a 44px hit area (the chevron stays small).
