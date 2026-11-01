@@ -125,6 +125,9 @@ export function themeCss() {
     out.push(coarse.split(',').map(function (s) {
         return s + ' .listItem';
     }).join(',') + '{min-height:var(--jp-tap)}');
+    // The MUI home AppBar (stock .skinHeader is 0x0 there) has no top inset, and viewport-fit=cover puts
+    // the toolbar under a notched phone's status bar. Legacy .skinHeader pads the inset itself.
+    out.push('html.jp-phone:not(.jp-theme-off):not(.layout-tv) .MuiAppBar-root{padding-top:env(safe-area-inset-top,0px)}');
     // Loading skeletons: a placeholder row while a section is still empty. Only on elements the view
     // marks `.jpSkel` when they first appear, for at most SKELETON_MS (view/mobile-theme.js): a pure
     // `:empty` rule cannot tell "still loading" from "empty for good" and left a permanent grey band
