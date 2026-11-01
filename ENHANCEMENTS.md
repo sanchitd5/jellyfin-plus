@@ -1795,3 +1795,18 @@ a lock (`html.jp-player-locked`) turns the gestures and stock tap-to-toggle off;
 coordinates mapped by `toContent`); a heart toggles `UserData.IsFavorite` via `ApiClient.updateFavoriteStatus`.
 No storage keys: rotation and lock are per play session and reset on item change / leaving the page.
 Off switch: `jp-theme-off` (rotate and lock excluded too). TV untouched.
+
+**Now Playing page on phones** (`web/src/controller/now-playing-mobile.js`, `model/now-playing-mobile.js`).
+The queue / remote-control page (`#/queue`, `#nowPlayingPage`, stock `components/remotecontrol`), not the
+video OSD. CSS, scoped `html:not(.jp-theme-off):not(.layout-tv)`, sizes under `(pointer: coarse)`, layout
+under stock's own breakpoints: (1) while `html.jp-nav-on`, the stock fixed strip (`.playlistSectionButton`:
+queue toggle, volume, More) and the open queue / context menu move up by `--jp-nav-h`, which the plugin's
+bottom bar had been covering, and the portrait column's height budget shrinks to match; (2) transport
+buttons, the strip's buttons, the queue's drag handle and remove button are 44px; (3) seek and volume
+slider containers are 44px tall with a 20px thumb; (4) the song / episode name and the h2 title clamp at
+two lines (stock bounded album and artist only); (5) landscape phone (`max-height: 500px`): header-height
+top padding, artwork capped to the room above the strip, queue overlay from under the header, side safe
+areas; (6) opening the queue scrolls the playing row (`.playlistIndexIndicatorImage`) to the centre
+(measured with `getBoundingClientRect`, smooth unless `prefers-reduced-motion`), and the scroller has
+`overscroll-behavior: contain`. One capture-phase click listener; no storage, no requests. Checked against
+the 12.3 sources, not on a device.
