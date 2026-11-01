@@ -58,11 +58,13 @@ var CSS = [
     // Room for the bar: a gutter above it, plus the stock 5em only while the music bar is showing (it stacks on top).
     'html.' + ON + ' .content-primary, html.' + ON + ' .padded-bottom-page, html.' + ON + ' .page,'
         + ' html.' + ON + ' .pageWithAbsoluteTabs .pageTabContent {'
-        + ' padding-bottom: calc(env(safe-area-inset-bottom) + var(--jp-space-4, 16px) + var(--jp-nav-h, 0px)); }',
+        + ' padding-bottom: calc(env(safe-area-inset-bottom) + var(--jp-space-4, 16px) + var(--jp-nav-h, 0px)) !important; }',
     'html.' + ON + ':has(.nowPlayingBar:not(.hide)) .content-primary, html.' + ON + ':has(.nowPlayingBar:not(.hide)) .padded-bottom-page,'
         + ' html.' + ON + ':has(.nowPlayingBar:not(.hide)) .page,'
         + ' html.' + ON + ':has(.nowPlayingBar:not(.hide)) .pageWithAbsoluteTabs .pageTabContent {'
-        + ' padding-bottom: calc(env(safe-area-inset-bottom) + 5em + var(--jp-nav-h, 0px)); }',
+        + ' padding-bottom: calc(env(safe-area-inset-bottom) + 5em + var(--jp-nav-h, 0px)) !important; }',
+    // Phone only: the Libraries slot replaces the stock "My Media" tiles on home (fail soft: no match, no effect).
+    'html.jp-phone.' + ON + ' .homePage .verticalSection:has(.homeLibraryButtonContainer) { display: none; }',
     'html.' + ON + ' .nowPlayingBar:not(.hide) { bottom: var(--jp-nav-h, 0px); }'
 ].join('\n');
 
