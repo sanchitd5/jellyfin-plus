@@ -1,6 +1,6 @@
 // Run: node web/src/model/timeline-markers.test.mjs   (no framework; exits non-zero on failure)
 import assert from 'node:assert/strict';
-import { timelineMarkers, markerLabel, seekTarget, stripTimes, pickTrickplay, stockTile, momentTile, stripManifest, warmMarkers, crossedMarkers, toastKinds } from './timeline-markers.js';
+import { timelineMarkers, markerLabel, seekTarget, stripTimes, pickTrickplay, stockTile, momentTile, stripManifest, warmMarkers, crossedMarkers, toastKinds, clockTime, currentMarker } from './timeline-markers.js';
 
 var passed = 0;
 function t(name, fn) {
@@ -186,6 +186,24 @@ t('toastKinds: unset = all, off = none, list = those kinds', function () {
     assert.equal(toastKinds('  '), null);
     assert.deepEqual(toastKinds('off'), []);
     assert.deepEqual(toastKinds('Tip, highlight ,'), ['tip', 'highlight']);
+});
+
+t('clockTime: m:ss under an hour, h:mm:ss over, empty when unusable', function () {
+    assert.equal(clockTime(0), '0:00');
+    assert.equal(clockTime(65.9), '1:05');
+    assert.equal(clockTime(3723), '1:02:03');
+    assert.equal(clockTime(-1), '');
+    assert.equal(clockTime(NaN), '');
+});
+
+t('currentMarker: last marker at or before the position', function () {
+    var m = timelineMarkers(BODY, 1000);
+    assert.equal(currentMarker(m, 50), -1);
+    assert.equal(currentMarker(m, 100), 0);
+    assert.equal(currentMarker(m, 899), 1);
+    assert.equal(currentMarker(m, 1000), 2);
+    assert.equal(currentMarker(m, null), -1);
+    assert.equal(currentMarker(null, 10), -1);
 });
 
 console.log(passed + ' passed');

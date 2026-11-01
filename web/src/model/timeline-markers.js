@@ -78,6 +78,26 @@ export function markerLabel(label, value, unit) {
     return label || v;
 }
 
+/* "m:ss" or "h:mm:ss" for a position in seconds; '' when unusable. */
+export function clockTime(seconds) {
+    if (!finite(seconds) || seconds < 0) { return ''; }
+    var s = Math.floor(seconds);
+    var h = Math.floor(s / 3600);
+    var m = Math.floor(s % 3600 / 60);
+    var ss = String(s % 60).padStart(2, '0');
+    return h ? h + ':' + String(m).padStart(2, '0') + ':' + ss : m + ':' + ss;
+}
+
+/* Index into sorted markers of the last one at or before pos (seconds); -1 when none. */
+export function currentMarker(markers, pos) {
+    if (!Array.isArray(markers) || !finite(pos)) { return -1; }
+    var at = -1;
+    for (var i = 0; i < markers.length; i++) {
+        if (markers[i] && markers[i].offset <= pos) { at = i; } else { break; }
+    }
+    return at;
+}
+
 /* Where a click on a marker seeks to, in seconds. */
 export function seekTarget(offsetSeconds) {
     return finite(offsetSeconds) ? Math.max(0, offsetSeconds - SEEK_LEAD_SECONDS) : 0;

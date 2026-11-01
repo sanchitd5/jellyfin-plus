@@ -1,7 +1,7 @@
 import { state } from '../model/state.js';
 import { log } from '../lib/log.js';
 import { player, activePlayer } from './live-apply.js';
-import { timelineMarkers, seekTarget, stripTimes, pickTrickplay, stockTile, momentTile, stripManifest, warmMarkers, crossedMarkers, toastKinds, TOAST_PREF_KEY } from '../model/timeline-markers.js';
+import { timelineMarkers, seekTarget, stripTimes, pickTrickplay, stockTile, momentTile, stripManifest, warmMarkers, crossedMarkers, toastKinds, TOAST_PREF_KEY, clockTime, currentMarker } from '../model/timeline-markers.js';
 
 /*
  * TIMELINE MARKERS ON THE PLAYER'S SEEK BAR. External services configured on the server
@@ -20,6 +20,10 @@ import { timelineMarkers, seekTarget, stripTimes, pickTrickplay, stockTile, mome
  * times in X-Moment-Strip). Prewarmed once per item when its markers are drawn (the strips of the
  * WARM_STRIPS highest-value markers, generation driven to ready, the sheets loaded), cached per item;
  * no preview source, or an image that fails to load, leaves the label alone.
+ *
+ * MARKER LIST. A "Markers (N)" pill above the track's right end opens a scrollable list (time, kind dot,
+ * label) of every marker, the one the playhead is in highlighted; a row seeks like its dot. For touch,
+ * where the dots are tiny. Stays open across a redraw; closed by the pill, a row or Escape.
  *
  * ZERO REQUESTS WHEN OFF. GET /JellyfinPlus/Markers/Enabled is asked once (again 5 min after a
  * failure); while it says false no per-item request is made.
@@ -71,6 +75,26 @@ var CSS = [
     L + ' .jp-mthumb[data-centre] { border-color: #ffc107; opacity: 1; }',
     L + ' .jp-mthumb:hover, ' + L + ' .jp-mthumb:focus-visible { opacity: 1; outline: 1px solid #fff; }',
     L + ' .jp-mpop-label { max-width: ' + (THUMB_W * 5 + 16) + 'px; overflow: hidden; text-overflow: ellipsis; text-align: center; }',
+    // Marker list: a pill above the track's right end opens a scrollable list; a row seeks to its marker.
+    L + ' .jp-mlist-btn { position: absolute; right: 0; bottom: 100%; margin-bottom: 6px; pointer-events: auto;'
+        + ' background: rgba(20,20,20,0.85); color: #fff; border: 1px solid rgba(255,255,255,0.35); border-radius: 12px;'
+        + ' padding: 2px 10px; font-size: 0.8em; line-height: 1.6; cursor: pointer; }',
+    L + ' .jp-mlist-btn[aria-expanded="true"] { background: rgba(255,255,255,0.9); color: #111; }',
+    L + ' .jp-mlist { position: absolute; right: 0; bottom: 100%; margin-bottom: 34px; pointer-events: auto; z-index: 4;'
+        + ' width: min(360px, 90vw); max-height: min(320px, 55vh); overflow-y: auto; overscroll-behavior: contain;'
+        + ' -webkit-overflow-scrolling: touch; background: rgba(20,20,20,0.94); border-radius: 6px; padding: 4px 0;'
+        + ' box-shadow: 0 2px 10px rgba(0,0,0,0.6); }',
+    L + ' .jp-mrow { display: flex; align-items: center; gap: 8px; width: 100%; box-sizing: border-box; padding: 8px 12px;'
+        + ' margin: 0; border: 0; background: transparent; color: #fff; font: inherit; font-size: 0.9em; text-align: left;'
+        + ' cursor: pointer; min-height: 40px; }',
+    L + ' .jp-mrow:hover, ' + L + ' .jp-mrow:focus-visible { background: rgba(255,255,255,0.12); outline: none; }',
+    L + ' .jp-mrow[data-current] { background: rgba(255,193,7,0.18); }',
+    L + ' .jp-mrow-time { flex: none; min-width: 4.2em; font-variant-numeric: tabular-nums; opacity: 0.8; }',
+    L + ' .jp-mrow-dot { flex: none; width: 9px; height: 9px; border-radius: 50%; background: #e0e0e0; }',
+    L + ' .jp-mrow-dot[data-kind="tip"] { background: #ffc107; }',
+    L + ' .jp-mrow-dot[data-kind="chapter"] { background: #64b5f6; border-radius: 2px; }',
+    L + ' .jp-mrow-dot[data-kind="highlight"] { background: #ec407a; }',
+    L + ' .jp-mrow-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }',
     // Marker toasts over the video: top centre, clear of the notch, never take a tap or the wheel.
     '.jp-mtoasts { position: fixed; top: calc(env(safe-area-inset-top, 0px) + 12px); left: 50%;'
         + ' transform: translateX(-50%); z-index: 10000; display: flex; flex-direction: column; align-items: center;'
@@ -147,7 +171,9 @@ var momentsOn = false;  // the server makes moment sheets (setting MarkerMoments
 var enabledAt = 0;
 var itemKey = null;     // the item the current answer belongs to
 var body = null;        // its answer (null: none / not yet)
-var drawn = null;       // { slider, duration } last drawn, to redraw only on change
+var drawn = null;       // { slider, duration, geo } last drawn, to redraw only on change
+var listOpen = false;   // the marker list is open (survives a redraw: rotation, OSD re-layout)
+var list = null;        // { el, rows, markers } the open list, rows aligned with markers
 var preview = null;     // the current item's entry in `items` (preview source, manifest, sheets)
 // Per-item state kept across item changes, page leaves and seeks for the page's lifetime, so a video
 // opened again (or a player blip mid-seek) reuses its markers, manifest and loaded sheet images.
@@ -173,6 +199,7 @@ function onVideoPage() {
 
 function clear() {
     hidePopup();
+    list = null;
     Array.prototype.forEach.call(document.querySelectorAll(L), function (l) { l.remove(); });
     drawn = null;
 }
@@ -556,13 +583,117 @@ function loadImage(url) {
     });
 }
 
+/* ---- marker list ---------------------------------------------------------------------------- */
+
+function setListOpen(open) {
+    listOpen = open;
+    if (!list) { return; }
+    list.btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+    list.el.hidden = !open;
+    list.last = null; // force the current-row highlight to be recomputed
+    if (!open) { return; }
+    try {
+        var pm = manager();
+        refreshList(pm, pm && activePlayer(pm));
+    } catch (e) { /* position unknown: no highlight */ }
+    // Centre the current row once, on open; later highlight changes never move the user's scroll.
+    var row = list.rows[list.last];
+    if (row) { list.el.scrollTop = row.offsetTop - (list.el.clientHeight - row.offsetHeight) / 2; }
+}
+
+/* A "Markers (N)" pill above the track opens a list; a row seeks to its marker (easier than the dots on touch). */
+function buildList(layer, markers) {
+    var btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'jp-mlist-btn';
+    btn.textContent = 'Markers (' + markers.length + ')';
+    btn.setAttribute('aria-haspopup', 'true');
+    btn.setAttribute('aria-expanded', 'false');
+    btn.setAttribute('aria-label', 'Marker list, ' + markers.length + ' markers');
+
+    var el = document.createElement('div');
+    el.className = 'jp-mlist';
+    el.setAttribute('role', 'menu');
+    el.hidden = true;
+
+    var rows = markers.map(function (m) {
+        var r = document.createElement('button');
+        r.type = 'button';
+        r.className = 'jp-mrow';
+        r.setAttribute('role', 'menuitem');
+        var t = document.createElement('span');
+        t.className = 'jp-mrow-time';
+        t.textContent = clockTime(m.offset);
+        var d = document.createElement('span');
+        d.className = 'jp-mrow-dot';
+        d.setAttribute('data-kind', m.kind);
+        var l = document.createElement('span');
+        l.className = 'jp-mrow-label';
+        l.textContent = m.label || (m.kind === 'neutral' ? 'Marker' : m.kind); // untrusted text: textContent only
+        r.appendChild(t);
+        r.appendChild(d);
+        r.appendChild(l);
+        r.addEventListener('click', function (e) {
+            e.preventDefault();
+            e.stopPropagation();
+            hidePopup();
+            seekTo(m.offset);
+            setListOpen(false);
+        });
+        el.appendChild(r);
+        return r;
+    });
+
+    [btn, el].forEach(function (n) {
+        ['pointerdown', 'mousedown', 'click'].forEach(function (t) { n.addEventListener(t, stop); });
+        n.addEventListener('touchstart', stop, { passive: true });
+    });
+    el.addEventListener('wheel', stop, { passive: true }); // the player binds wheel to volume; still scrolls
+    el.addEventListener('keydown', function (e) {
+        if (e.key === 'Escape') {
+            e.stopPropagation();
+            e.preventDefault();
+            setListOpen(false);
+            btn.focus();
+        }
+    });
+    btn.addEventListener('click', function () { setListOpen(!listOpen); });
+
+    layer.appendChild(el);
+    layer.appendChild(btn);
+    list = { el: el, btn: btn, rows: rows, markers: markers, last: null };
+    if (listOpen) { setListOpen(true); }
+}
+
+/* Highlight the row of the marker the playhead is in (DOM touched only when it changes). */
+function refreshList(pm, pl) {
+    if (!list || !listOpen || !pm || typeof pm.currentTime !== 'function') { return; }
+    var ms = pm.currentTime(pl);
+    if (typeof ms !== 'number' || !isFinite(ms)) { return; }
+    var idx = currentMarker(list.markers, ms / 1000);
+    if (idx === list.last) { return; }
+    list.last = idx;
+    list.rows.forEach(function (r, i) {
+        if (i === idx) { r.setAttribute('data-current', ''); } else { r.removeAttribute('data-current'); }
+    });
+}
+
 /* ---- drawing -------------------------------------------------------------------------------- */
+
+/* "left:width" (whole px) of the track inside the host; null while the OSD is hidden / not laid out. */
+function trackGeo(host) {
+    if (!host) { return null; }
+    var hr = host.getBoundingClientRect();
+    if (!hr.width) { return null; }
+    var tr = (host.querySelector('.mdl-slider-background-flex') || host).getBoundingClientRect();
+    return Math.round(tr.left - hr.left) + ':' + Math.round(tr.width);
+}
 
 function draw(slider, durationSeconds) {
     clear();
     var markers = timelineMarkers(body, durationSeconds);
     if (!markers.length) {
-        drawn = { slider: slider, duration: durationSeconds };
+        drawn = { slider: slider, duration: durationSeconds, geo: trackGeo(hostOf(slider)) };
         return;
     }
 
@@ -620,7 +751,8 @@ function draw(slider, durationSeconds) {
     });
 
     host.appendChild(layer);
-    drawn = { slider: slider, duration: durationSeconds };
+    buildList(layer, markers);
+    drawn = { slider: slider, duration: durationSeconds, geo: trackGeo(host) };
     if (itemKey) { prewarm(itemKey, markers, durationSeconds); }
 }
 
@@ -630,6 +762,7 @@ function tick() {
             itemKey = null;
             body = null;
             lastPos = null;
+            listOpen = false;
             clear();
             clearToasts();
             return;
@@ -644,6 +777,7 @@ function tick() {
         if (key !== itemKey) {
             itemKey = key;
             lastPos = null;
+            listOpen = false;
             clear();
             clearToasts();
             var e = entry(key);
@@ -667,13 +801,16 @@ function tick() {
 
         // Toasts run whether or not the OSD (and its slider) is showing.
         try { toastPassed(pm, pl, duration); } catch (te) { lastPos = null; }
+        try { refreshList(pm, pl); } catch (le) { /* highlight only */ }
 
         var slider = document.querySelector('#' + PAGE_ID + ' .osdPositionSlider');
         if (!slider) { clear(); return; }
 
         var host = hostOf(slider);
         var layerGone = !host || !host.querySelector(L);
+        var geo = trackGeo(host);
         if (!drawn || drawn.slider !== slider || Math.abs(drawn.duration - duration) > 0.5
+            || (geo && geo !== drawn.geo)
             || (layerGone && timelineMarkers(body, duration).length)) {
             draw(slider, duration);
         }
@@ -692,7 +829,9 @@ export function installTimelineMarkers() {
             (document.head || document.documentElement).appendChild(style);
         }
         setInterval(tick, POLL_MS);
-        window.addEventListener('resize', function () { drawn = null; });
+        var redraw = function () { drawn = null; };
+        window.addEventListener('resize', redraw);
+        window.addEventListener('orientationchange', redraw);
         log('timeline markers installed');
     } catch (err) {
         log('timeline markers install failed', err);

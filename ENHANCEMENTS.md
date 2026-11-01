@@ -907,6 +907,10 @@ position slider. Full contract for app authors: [docs/architecture/TIMELINE_MARK
   `kind` (`tip`, `chapter`, `highlight`; anything else neutral), sized by value relative to the largest,
   label in `title` only (never HTML); a click seeks to `max(0, offset - 3)`. Removed on item change and
   when the video page goes; nothing on the TV layout. Any failure leaves the stock player.
+- *Marker list*: a "Markers (N)" pill above the track's right end opens a scrollable list (time, kind
+  dot, label as textContent) of every marker, the current one highlighted; a row seeks like its dot
+  (3 s before), Escape or the pill closes it. Meant for touch, where dots are tiny. Wheel events on the
+  list are stopped (the player binds wheel to volume). Client only; no new localStorage key.
 - *Preview popup*: hovering or focusing a dot (touch: first tap or tap-and-hold; a second tap seeks)
   opens a popup above the seek bar with `label · value unit` (textContent only; provider key
   `valueUnit`, at most 24 characters, comes back as the marker's `unit`) and a strip of five frames:
