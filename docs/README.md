@@ -82,6 +82,7 @@ with ENHANCEMENTS.md or the code, the code wins.
 | [vfx-sdk-vsr-task.md](tasks/vfx-sdk-vsr-task.md) | `vf_vsr.c` wrapping the Maxine VFX SDK |
 | [vulkan-cuda-hwmap-task.md](tasks/vulkan-cuda-hwmap-task.md) | Patching FFmpeg's `hwcontext_vulkan.c` for Vulkan↔CUDA hwmap |
 | [mobile-detail-page.md](tasks/mobile-detail-page.md) | Item details page on a phone: hero, icon labels, overview, watch-options disclosure (spec for three parallel client tasks) |
+| [mobile-detail-page-review.md](tasks/mobile-detail-page-review.md) | UX review of the shipped phone details page: prioritised findings, measurements, three disjoint work packages |
 
 Code comments and build-error messages refer to these documents by bare name (for example "see
 OPTIX.md"); each name is unique, so a file search finds it.
