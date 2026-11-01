@@ -631,6 +631,16 @@ the favourite button for any item `canRate` accepts (everything with UserData ex
 Channel, CollectionFolder, UserView); it is not hidden on phone. Scoped to
 `html:not(.jp-theme-off):not(.layout-tv)`; hidden while `html.jp-sheet-open`. No storage keys.
 
+**Watch options disclosure** (`web/src/view/detail-tracks.js`, `web/src/model/detail-tracks.js`; spec
+`docs/tasks/mobile-detail-page.md` Task B). On a Video's details page in phone portrait, one
+`<details class="jpTracks">` row ("Watch options" plus a one-line summary such as `1080p H264 · English… · Off`)
+sits before the stock `.trackSelections` form; the form is hidden until the row is opened. The stock selects
+are never cloned or written to, so media-source switching and the `AudioStreamIndex` Play sends stay stock's.
+The summary is re-read after each `change` and when the form's class changes; when stock hides the form the row
+hides too. Fail soft: the form is hidden only after the row is in the DOM; outside phone portrait, with the
+theme off or on TV the row is `display:none` and the stock form shows. No new requests; no access change; no
+storage keys.
+
 ## 5. Cards and playback
 
 **Image look-ahead** (`web/src/controller/image-preload.js`, `web/src/model/image-preload.js`). Stock
