@@ -47,6 +47,10 @@ var NAV = 'html.jp-nav-on.layout-mobile:not(.jp-theme-off):not(.layout-tv)' + PA
 var PORTRAIT = '@media all and (orientation: portrait) and (max-width: 43em)';
 var LANDSCAPE = '@media all and (orientation: landscape) and (max-height: 500px) and (pointer: coarse)';
 var STRIP = '4.2em';
+// Stock .skinHeader (position: fixed) = safe-area-top + .headerTop (0.54em x2 padding + a 2.78em button:
+// 0.556em x2 padding + 1.67em icon) = 3.86em at the 16px root the theme restores (theme-tokens.js).
+// 4.2em leaves ~5px; stock's own 5em padding is too tall for a 375px-high landscape screen.
+var HEAD = 'calc(4.2em + env(safe-area-inset-top, 0px))';
 
 var CSS = [
     // 1. room for the plugin's bottom bar (stock pads the strip with the safe area; the bar already does).
@@ -54,7 +58,13 @@ var CSS = [
     NAV + ' .playlistSection .playlist, ' + NAV + ' .playlistSection .contextMenu {'
         + ' bottom: calc(' + STRIP + ' + var(--jp-nav-h, 0px)); }',
     NAV + ' .remoteControlSection { padding-bottom: calc(' + STRIP + ' + var(--jp-nav-h, 0px)); }',
+    // 5 visible transport buttons are ~352px wide at stock sizes (2.78em at 24px = 67px, play 80px) against
+    // ~297px of row on a 320px phone and ~331px on 360: they overflowed both edges (justify-content: center).
+    // Share the row equally (play keeps its size); 44px stays the floor via min-width. Stock's auto margins go.
     PORTRAIT + ' {',
+    '  ' + P + PAGE + ' .nowPlayingInfoButtons .paper-icon-button-light { flex: 1 1 0; min-width: var(--jp-tap, 44px);'
+        + ' margin-left: 0; margin-right: 0; padding-left: 0; padding-right: 0; justify-content: center; }',
+    '  ' + P + PAGE + ' .nowPlayingInfoButtons .btnPlayPause { flex: 0 0 auto; }',
     '  ' + NAV + ' .nowPlayingInfoContainer { height: calc(100% - ' + STRIP + ' - var(--jp-nav-h, 0px)); }',
     '}',
 
@@ -64,11 +74,16 @@ var CSS = [
     '  ' + P + PAGE + ' .playlist .listViewDragHandle { min-width: var(--jp-tap, 44px); min-height: var(--jp-tap, 44px); }',
     '  ' + P + PAGE + ' .playlist .listItem { min-height: var(--jp-tap, 44px); }',
     '  ' + P + PAGE + ' .nowPlayingInfoButtons { flex-wrap: nowrap; min-width: 0; }',
+    // stock .sliderContainer has no align-items (stretch): the times would sit at the top of the 44px row
+    '  ' + P + PAGE + ' .sliderContainer { align-items: center; }',
+    '  ' + P + PAGE + ' .positionTime, ' + P + PAGE + ' .runtime { flex: none; white-space: nowrap; }',
     '  ' + P + PAGE + ' .sliderContainer .mdl-slider-container { height: var(--jp-tap, 44px); }',
     '  ' + P + PAGE + ' .sliderContainer .mdl-slider-container .mdl-slider { height: 100%; }',
     '  ' + P + PAGE + ' .sliderContainer .mdl-slider-background-flex-container { padding: 0 10px; }',
     '  ' + P + PAGE + ' .sliderContainer .mdl-slider::-webkit-slider-thumb { width: 20px; height: 20px; }',
     '  ' + P + PAGE + ' .sliderContainer .mdl-slider::-moz-range-thumb { width: 20px; height: 20px; }',
+    // the hover bubble tracks the thumb centre: stock insets it 0.54em (half of its 1.08em thumb)
+    '  ' + P + PAGE + ' .sliderContainer .sliderBubbleTrack { margin: 0 10px; }',
     '  ' + P + PAGE + ' .positionTime, ' + P + PAGE + ' .runtime {'
         + ' font-size: var(--jp-font-small, 0.9em); font-variant-numeric: tabular-nums; }',
     '}',
@@ -84,16 +99,16 @@ var CSS = [
 
     // 5. landscape phone: stock gives it the desktop row
     LANDSCAPE + ' {',
-    // header is .headerTop (0.54em padding + a 2.54em button row); 4em clears it with no gap worth a strip
-    '  ' + P + PAGE + ' { padding-top: 4em !important; }',
+    // clear the fixed header (see HEAD); the old 4em left 2px and none at all under a top safe area
+    '  ' + P + PAGE + ' { padding-top: ' + HEAD + ' !important; }',
     '  ' + P + PAGE + ' .remoteControlContent { padding-left: max(3.3%, env(safe-area-inset-left, 0px)) !important;'
         + ' padding-right: max(3.3%, env(safe-area-inset-right, 0px)) !important; }',
     '  ' + P + PAGE + ' .nowPlayingPageImageContainer { width: auto; max-width: 34%; }',
     '  ' + P + PAGE + ' .nowPlayingPageImage { width: auto; max-width: 100%;'
-        + ' max-height: calc(100vh - 4em - ' + STRIP + ' - 1em - var(--jp-nav-h, 0px)); }',
+        + ' max-height: calc(100vh - ' + HEAD + ' - ' + STRIP + ' - 1em - var(--jp-nav-h, 0px)); }',
     '  ' + P + PAGE + ' .nowPlayingSecondaryButtons { flex-wrap: nowrap; }',
     '  html.layout-mobile:not(.jp-theme-off):not(.layout-tv)' + PAGE + ' .playlistSection .playlist,',
-    '  html.layout-mobile:not(.jp-theme-off):not(.layout-tv)' + PAGE + ' .playlistSection .contextMenu { top: 4em; }',
+    '  html.layout-mobile:not(.jp-theme-off):not(.layout-tv)' + PAGE + ' .playlistSection .contextMenu { top: ' + HEAD + '; }',
     '}'
 ].join('\n');
 
