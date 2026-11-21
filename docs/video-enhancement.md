@@ -42,7 +42,8 @@ chain nodes it lacks, so an unavailable level is simply not offered and an alrea
 back to plain scaling rather than failing the session.
 
 The five custom filters (`oidn`, `optix`, `ort`, `fsr2`, `dlss`) need a patched FFmpeg, which
-[`scripts/build-ffmpeg.sh`](../scripts/build-ffmpeg.sh) builds in one command. **No binary is
+[`scripts/build-ffmpeg.sh`](../scripts/build-ffmpeg.sh) builds in one command (`GPU_VENDOR=intel` builds
+`oidn` and `ort`, plus `fsr2` with `WITH_FSR2=1`, with VA-API and QSV; [GPU_VENDORS.md](architecture/GPU_VENDORS.md) section 5.7). **No binary is
 distributed, deliberately**: the build is `--enable-gpl --enable-libx264` so it is GPLv2+, and it
 links Apache-2.0 code, which GPLv2 is not compatible with. Building it for yourself carries no such
 obligation; publishing it would. The OptiX, NGX and FSR2 paths additionally sit under their vendors'

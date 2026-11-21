@@ -217,9 +217,9 @@ keeps the code path that existed before the setting did:
   level ran) says what the command **asked for** (whether ONNX Runtime loaded the provider is only in
   ffmpeg's log), `NeuralDeviceNote` says why it is the CPU on Intel, and both are flat on the session
   route and in the Recent sessions summary. The OpenVINO runtime is built in by
-  `scripts/build-ffmpeg.sh` with `ORT_EP=openvino` (NEURAL.md; the build needs no OptiX or other NVIDIA SDK,
-  but still installs FFmpeg's nvcodec headers and the CUDA hwmap patches until the Intel build of
-  GPU_VENDORS.md PR 8). Unmeasured on an Intel GPU.
+  `scripts/build-ffmpeg.sh` with `GPU_VENDOR=intel` (which defaults `ORT_EP=openvino`; NEURAL.md and
+  GPU_VENDORS.md section 5.7: no OptiX, no other NVIDIA SDK, no nvcodec headers, no CUDA patches). Unmeasured
+  on an Intel GPU; no Intel build has been run.
 - **Source-height routing, `NeuralMaxSourceHeight`** (dashboard, Neural and game upscalers; 0, the default,
   does nothing and every string and the probe stay as they were). Above 0, for the ONNX levels only
   (not `dlpp-*` or `vsr-rtcuda`): a source whose upright height is at or below it gets the neural level,
@@ -235,7 +235,7 @@ keeps the code path that existed before the setting did:
 
 **fsr2 without CUDA (PR 6).** `gu_inputs.h` builds with `-DGU_NO_NVOF` (no CUDA, no NVOFA: zero motion
 vectors, empty reactive mask, jitter still measured) and falls back to the same zero flow when CUDA will not
-start. `ORT_EP=openvino WITH_FSR2=1 scripts/build-ffmpeg.sh` builds it (patch `ffmpeg/0016`) and leaves
+start. `GPU_VENDOR=intel WITH_FSR2=1 scripts/build-ffmpeg.sh` (or `ORT_EP=openvino WITH_FSR2=1`) builds it (patch `ffmpeg/0016`) and leaves
 `<prefix>/fsr2-nocuda`; with that file and a detected Intel GPU `GpuCapability.NoCudaGameAvailable` is true,
 the probe offers `fsr2` (not `dlss`/`dlaa`) and `SessionRecord.GameMotionNote` says the vectors are zero.
 Without the file everything is as before. NVIDIA is unchanged. Not compiled or run on an Intel GPU;
