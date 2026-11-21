@@ -217,9 +217,9 @@ keeps the code path that existed before the setting did:
   level ran) says what the command **asked for** (whether ONNX Runtime loaded the provider is only in
   ffmpeg's log), `NeuralDeviceNote` says why it is the CPU on Intel, and both are flat on the session
   route and in the Recent sessions summary. The OpenVINO runtime is built in by
-  `scripts/build-ffmpeg.sh` with `ORT_EP=openvino` (NEURAL.md; the build needs no OptiX or other NVIDIA SDK,
-  but still installs FFmpeg's nvcodec headers and the CUDA hwmap patches until the Intel build of
-  GPU_VENDORS.md PR 8). Unmeasured on an Intel GPU.
+  `scripts/build-ffmpeg.sh` with `GPU_VENDOR=intel` (which defaults `ORT_EP=openvino`; NEURAL.md and
+  GPU_VENDORS.md section 5.7: no OptiX, no other NVIDIA SDK, no nvcodec headers, no CUDA patches). Unmeasured
+  on an Intel GPU; no Intel build has been run.
 - **Source-height routing, `NeuralMaxSourceHeight`** (dashboard, Neural and game upscalers; 0, the default,
   does nothing and every string and the probe stay as they were). Above 0, for the ONNX levels only
   (not `dlpp-*` or `vsr-rtcuda`): a source whose upright height is at or below it gets the neural level,

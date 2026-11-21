@@ -270,14 +270,20 @@ and nothing from NVIDIA's SDKs:
   `ORT_SDK=/path/` holding `include/` of that version.
 * **The host** needs OpenCL for the Intel GPU plugin (`ocl-icd-libopencl1` and `intel-opencl-icd`; the
   plugin's `NEEDED` list names `libOpenCL.so.1`). The script does not install them.
-* **What it still installs from NVIDIA's side:** FFmpeg's own `nv-codec-headers` (MIT headers; the
-  driver is loaded at run time, so no SDK and no card are needed), the `--enable-ffnvcodec`, `--enable-cuda`
-  and `--enable-nvenc` configure flags, and patches 0006 to 0014 (the CUDA hwmap bridge and
-  `transpose_cuda`). They are unconditional in the script and two of them touch the generic `hwmap`
-  filter; taking them out of an Intel build is the `GPU_VENDOR=intel` build of GPU_VENDORS.md PR 8, which
-  also has to change the five-filter invariant. `proxmox-build.sh` does not know `ORT_EP`, requires all
-  five filters, and so refuses this binary; use `build-ffmpeg.sh` directly. The CUDA bridge test is
-  skipped by default for `openvino` (there is no CUDA to cross).
+* **`GPU_VENDOR=intel` is the whole Intel build.** Run on its own, `ORT_EP=openvino` still installs
+  FFmpeg's `nv-codec-headers`, the `--enable-ffnvcodec/cuda/nvenc` flags and patches 0006 to 0014 (the
+  CUDA hwmap bridge and `transpose_cuda`). `GPU_VENDOR=intel` (GPU_VENDORS.md section 5.7) drops all of
+  that except patches 0008 and 0009, adds VA-API, libvpl and libdrm, defaults to `WITH_ORT=1
+  ORT_EP=openvino`, and `proxmox-build.sh` with the same variable requires only `oidn` and `ort`:
+
+  ```bash
+  GPU_VENDOR=intel sudo -E ./scripts/build-ffmpeg.sh        # PLAN_ONLY=1 prints the plan and stops
+  GPU_VENDOR=intel sudo -E ./scripts/proxmox-build.sh --with-ffmpeg
+  ```
+
+  Without `GPU_VENDOR=intel`, `proxmox-build.sh` requires all five filters and refuses an
+  `ORT_EP=openvino`-only binary; use `build-ffmpeg.sh` directly. The CUDA bridge test is skipped by
+  default for `openvino` (there is no CUDA to cross). Not run on an Intel box.
 * **One ONNX Runtime per prefix.** The script refuses if `<prefix>/ort/lib` already holds the CUDA
   provider. A server with both vendors builds for the vendor `GpuVendor` selects.
 

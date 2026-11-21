@@ -119,15 +119,17 @@ hook points decide and file order is irrelevant. This is why Anime4K + RCAS shar
 enlarging regardless of how the file is composed - that pairing was measured and kept because it
 still beat CAS-after, but the reasoning must be checked, not assumed, whenever a shader is added.
 
-**10. The patched ffmpeg binary is separate, and all five mandatory filters must survive a
+**10. The patched ffmpeg binary is separate, and every filter its vendor requires must survive a
 rebuild.** `vf_oidn`, `vf_optix`, `vf_ort`, `vf_fsr2` and `vf_dlss` live in a binary beside the
-stock `jellyfin-ffmpeg`, which is never modified. The shim routes a session there only when it
+stock `jellyfin-ffmpeg`, which is never modified. All five are mandatory for `GPU_VENDOR=nvidia`
+(the default); `GPU_VENDOR=intel` builds only `oidn` and `ort`, which are the Intel set (one list,
+`scripts/ffmpeg-vendor.sh`, read by both build scripts). The shim routes a session there only when it
 asks for a filter that binary alone provides, and it asks the binary which filters it actually
 carries, stripping chain nodes it lacks. So a rebuild that quietly drops a `vf_*.c` degrades to
 unenhanced playback rather than failing every session, which means **nothing will tell you it
 happened**. Check `-filters` after every rebuild. `scripts/proxmox-build.sh` keeps the previous
 binary at `<binary>.prev` on success as well as on failure, so there is something to fall back to
-when a build lists all five filters and one of them then fails against the driver. The opt-in
+when a build lists its required filters and one of them then fails against the driver. The opt-in
 `dlpp_rtcuda`/`vsr_rtcuda` filters build into the same binary but are not in this mandatory set and
 not in the shim's own `PATCHED_FILTERS` tuple yet - compiled and present via `-filters` is not the
 same as reachable from a real session; see `docs/tasks/TASK.md` for that gap. The shim also re-probes the
