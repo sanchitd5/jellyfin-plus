@@ -1,7 +1,10 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
+using System.IO;
 using System.Linq;
+using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
 using System.Threading;
 using System.Threading.Tasks;
@@ -12,7 +15,12 @@ using Microsoft.AspNetCore.Mvc;
 
 namespace Jellyfin.Plugin.Plus
 {
-    /// <summary>Cheap GPU/transcode load snapshot so background encoders can back off while people watch.</summary>
+    /// <summary>
+    /// Cheap GPU/transcode load snapshot so background encoders can back off while people watch.
+    /// NVIDIA is read from nvidia-smi (the NVENC session count, as ever). Intel is read from the
+    /// kernel's per-client DRM fdinfo and sysfs, which needs no tool and no privilege but sees only
+    /// this server's own processes (docs/architecture/GPU_VENDORS.md, 5.2).
+    /// </summary>
     [ApiController]
     [Authorize]
     [Route("JellyfinPlus")]
@@ -22,6 +30,12 @@ namespace Jellyfin.Plugin.Plus
         private static readonly SemaphoreSlim ProbeGate = new SemaphoreSlim(1, 1);
         private static int? _nvencCached;
         private static DateTime _nvencAtUtc = DateTime.MinValue;
+
+        private static readonly object IntelLock = new object();
+        private static readonly SemaphoreSlim IntelGate = new SemaphoreSlim(1, 1);
+        private static IntelLoad _intelCached;
+        private static DateTime _intelAtUtc = DateTime.MinValue;
+        private static IntelSample _intelPrevious;
 
         private readonly ISessionManager _sessions;
 
@@ -48,12 +62,189 @@ namespace Jellyfin.Plugin.Plus
                 // counts stay 0
             }
 
+            string vendor = null;
+            string renderNode = null;
+            try
+            {
+                JsonObject gpu = PatcherLoader.GpuRecord();
+                bool detected = gpu?["Detected"]?.GetValue<bool>() == true;
+                string v = gpu?["Vendor"]?.GetValue<string>();
+                if (detected && (v == "nvidia" || v == "intel"))
+                {
+                    vendor = v;
+                    renderNode = gpu["RenderNode"]?.GetValue<string>();
+                }
+            }
+            catch (Exception)
+            {
+                // unknown stays null
+            }
+
+            if (vendor == "intel")
+            {
+                // No NVIDIA GPU to ask: nvencSessions is null, and nvidia-smi is not spawned.
+                IntelLoad intel = await IntelLoadAsync(renderNode).ConfigureAwait(false);
+                return new GpuLoad
+                {
+                    ActiveTranscodes = active,
+                    ActiveVideoTranscodes = video,
+                    EnhancedSessions = null,
+                    NvencSessions = null,
+                    Vendor = "intel",
+                    EncoderSessions = intel?.VideoClients,
+                    GpuBusyPercent = intel?.BusyPercent,
+                    GpuIdlePercent = intel?.IdlePercent,
+                    LoadSource = intel == null ? null : "drm-fdinfo (this server's processes only)",
+                };
+            }
+
+            int? nvenc = await NvencCountAsync().ConfigureAwait(false);
             return new GpuLoad
             {
                 ActiveTranscodes = active,
                 ActiveVideoTranscodes = video,
                 EnhancedSessions = null, // patcher exposes no running-session count, only history
-                NvencSessions = await NvencCountAsync().ConfigureAwait(false),
+                NvencSessions = nvenc,
+
+                // Additive. On NVIDIA the encoder sessions are the NVENC ones; busy and idle are
+                // not read from nvidia-smi here, so they are null rather than guessed. A server
+                // whose vendor is unknown but whose nvidia-smi answered is NVIDIA all the same.
+                Vendor = vendor ?? (nvenc != null ? "nvidia" : "none"),
+                EncoderSessions = nvenc,
+                LoadSource = nvenc != null ? "nvidia-smi" : null,
+            };
+        }
+
+        /* ---- Intel: DRM fdinfo and sysfs ------------------------------------------------- */
+
+        private const int SampleGapMs = 300;
+        private static readonly TimeSpan IntelCacheFor = TimeSpan.FromSeconds(5);
+
+        private sealed class IntelSample
+        {
+            public DateTime AtUtc { get; set; }
+
+            public Dictionary<string, DrmClient> Clients { get; set; }
+
+            public Dictionary<string, long> Residency { get; set; }
+        }
+
+        private sealed class IntelLoad
+        {
+            public int VideoClients { get; set; }
+
+            public double? BusyPercent { get; set; }
+
+            public double? IdlePercent { get; set; }
+        }
+
+        private static bool TryIntelCached(out IntelLoad value)
+        {
+            lock (IntelLock)
+            {
+                value = _intelCached;
+                return DateTime.UtcNow - _intelAtUtc < IntelCacheFor;
+            }
+        }
+
+        // Single-flight and cached for 5 s, like the NVENC count: a dashboard poll or a back-off
+        // check costs one /proc walk per window however often it is asked.
+        private static async Task<IntelLoad> IntelLoadAsync(string renderNode)
+        {
+            if (TryIntelCached(out var cached))
+            {
+                return cached;
+            }
+
+            await IntelGate.WaitAsync().ConfigureAwait(false);
+            try
+            {
+                if (TryIntelCached(out cached))
+                {
+                    return cached;
+                }
+
+                IntelLoad result = null;
+                try
+                {
+                    result = await MeasureIntelAsync(renderNode).ConfigureAwait(false);
+                }
+                catch (Exception)
+                {
+                    // null: unavailable, never an error on a route that exists to be cheap
+                }
+
+                lock (IntelLock)
+                {
+                    _intelCached = result;
+                    _intelAtUtc = DateTime.UtcNow;
+                }
+
+                return result;
+            }
+            finally
+            {
+                IntelGate.Release();
+            }
+        }
+
+        private static IntelSample TakeIntelSample(string renderNode)
+        {
+            var clients = DrmFdinfo.Scan("/proc", renderNode);
+            if (clients == null)
+            {
+                return null;
+            }
+
+            string name = string.IsNullOrEmpty(renderNode) ? null : Path.GetFileName(renderNode);
+            return new IntelSample
+            {
+                AtUtc = DateTime.UtcNow,
+                Clients = clients,
+                Residency = GpuIdleResidency.Read("/sys/class/drm", name),
+            };
+        }
+
+        // Two samples make a rate. The previous call's sample is reused when it is recent enough to
+        // be a fair window; otherwise the first call waits SampleGapMs between two reads.
+        private static async Task<IntelLoad> MeasureIntelAsync(string renderNode)
+        {
+            IntelSample now = TakeIntelSample(renderNode);
+            if (now == null)
+            {
+                return null;
+            }
+
+            IntelSample before;
+            lock (IntelLock)
+            {
+                before = _intelPrevious;
+            }
+
+            double age = before == null ? double.MaxValue : (now.AtUtc - before.AtUtc).TotalSeconds;
+            if (age < 0.5 || age > 30)
+            {
+                before = now;
+                await Task.Delay(SampleGapMs).ConfigureAwait(false);
+                now = TakeIntelSample(renderNode);
+                if (now == null)
+                {
+                    return null;
+                }
+            }
+
+            lock (IntelLock)
+            {
+                _intelPrevious = now;
+            }
+
+            double seconds = (now.AtUtc - before.AtUtc).TotalSeconds;
+            DrmLoadResult load = DrmFdinfo.Compute(before.Clients, now.Clients, seconds);
+            return new IntelLoad
+            {
+                VideoClients = load.VideoClients,
+                BusyPercent = load.BusyPercent,
+                IdlePercent = GpuIdleResidency.IdlePercent(before.Residency, now.Residency, seconds),
             };
         }
 
@@ -174,9 +365,41 @@ namespace Jellyfin.Plugin.Plus
             [JsonPropertyName("enhancedSessions")]
             public int? EnhancedSessions { get; set; }
 
-            /// <summary>Gets or sets NVENC sessions across GPUs, null when unavailable.</summary>
+            /// <summary>Gets or sets NVENC sessions across GPUs, null when unavailable (always null on Intel).</summary>
             [JsonPropertyName("nvencSessions")]
             public int? NvencSessions { get; set; }
+
+            /// <summary>Gets or sets the GPU vendor the figures below come from: nvidia, intel or none.</summary>
+            [JsonPropertyName("vendor")]
+            public string Vendor { get; set; }
+
+            /// <summary>
+            /// Gets or sets encoder sessions. NVIDIA: the NVENC session count. Intel: clients whose
+            /// video-engine time moved in the window, which is encode on this plugin's chain
+            /// (software decode) and would also count a client decoding in hardware. Null when
+            /// unavailable.
+            /// </summary>
+            [JsonPropertyName("encoderSessions")]
+            public int? EncoderSessions { get; set; }
+
+            /// <summary>
+            /// Gets or sets the busiest engine class's busy percent (0-100) from DRM fdinfo, over
+            /// this server's own processes only. Intel only; null on NVIDIA and when unavailable.
+            /// </summary>
+            [JsonPropertyName("gpuBusyPercent")]
+            public double? GpuBusyPercent { get; set; }
+
+            /// <summary>
+            /// Gets or sets the percent of the window the least-idle GT spent asleep (its idle
+            /// RC6 residency), from sysfs, which covers every process on the GPU. Intel only; null
+            /// when sysfs offers no counter. "Idle" is not the inverse of busy, so it is its own field.
+            /// </summary>
+            [JsonPropertyName("gpuIdlePercent")]
+            public double? GpuIdlePercent { get; set; }
+
+            /// <summary>Gets or sets where the vendor figures came from, null when none were read.</summary>
+            [JsonPropertyName("loadSource")]
+            public string LoadSource { get; set; }
         }
     }
 }

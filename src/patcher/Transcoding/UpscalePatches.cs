@@ -931,6 +931,65 @@ namespace Jellyfin.Plugin.Plus.Patcher
         }
 
         /// <summary>
+        /// The Intel half of the encoder decision, for a job Jellyfin was already going to
+        /// transcode. Returns true when it handled the job (and the caller stops), false to let the
+        /// code that existed before the vendor setting run: always false off Intel, so an NVIDIA
+        /// server is untouched.
+        ///
+        /// The Encoder setting defaults to hevc_nvenc, which an Intel GPU cannot run, and that
+        /// default used to replace whatever Jellyfin chose. Here an NVENC (or auto) setting means
+        /// "follow Jellyfin": a QSV or software choice of Jellyfin's is kept, with the reason in
+        /// Recent sessions, and a choice that cannot take this chain (a VA-API or an NVENC encoder,
+        /// either of which would be a dead stream) is replaced by the engine's Intel pick. A named
+        /// QSV or software encoder is not handled here and goes through the usual guards.
+        /// </summary>
+        internal static bool ApplyIntelEncoder(EncodingJobInfo state, UpscaleSettings cfg, ref string __result)
+        {
+            if (!UpscaleEngine.IsIntelPath())
+            {
+                return false;
+            }
+
+            string configured = cfg.Encoder;
+            bool auto = string.IsNullOrWhiteSpace(configured)
+                || string.Equals(configured.Trim(), "auto", StringComparison.OrdinalIgnoreCase);
+            bool foreign = UpscaleEngine.IsNvencEncoder(configured);
+            if (!auto && !foreign)
+            {
+                return false;
+            }
+
+            string sessionKey = UpscaleEngine.SessionKey(state);
+            if (UpscaleEngine.EncoderFitsIntelChain(__result))
+            {
+                if (foreign)
+                {
+                    string why = "configured '" + configured.Trim() + "' is an NVIDIA encoder and this server's GPU is Intel; treated as auto and kept Jellyfin's " + __result;
+                    UpscaleEngine.NoteEncoder(sessionKey, __result, why);
+                    _logger?.LogInformation("JellyfinPlus: {Reason} for {Path}", why, state.MediaPath);
+                }
+
+                return true;
+            }
+
+            if (!ShouldAct(state, out _))
+            {
+                return true;
+            }
+
+            string chosen = UpscaleEngine.EncoderFor(state, out string reason);
+            UpscaleEngine.NoteEncoder(sessionKey, chosen, reason + " (replacing Jellyfin's " + __result + ", which cannot take this chain's frames)");
+            _logger?.LogInformation(
+                "JellyfinPlus: encoder {Was} -> {Now} for {Path} ({Reason})",
+                __result,
+                chosen,
+                state.MediaPath,
+                reason);
+            __result = chosen;
+            return true;
+        }
+
+        /// <summary>
         /// Applies the configured Encoder to a job Jellyfin was already going to transcode and this
         /// plugin is enhancing. Only the configured encoder is ever written here: if the guards
         /// refuse it, Jellyfin's own choice is left exactly as it was, because Jellyfin picked it
@@ -949,6 +1008,11 @@ namespace Jellyfin.Plugin.Plus.Patcher
                     state.MediaPath,
                     av1Reason);
                 __result = swapped;
+            }
+
+            if (ApplyIntelEncoder(state, cfg, ref __result))
+            {
+                return;
             }
 
             string configured = cfg.Encoder;

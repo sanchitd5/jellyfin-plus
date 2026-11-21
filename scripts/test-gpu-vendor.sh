@@ -7,13 +7,19 @@
 # /usr/lib/jellyfin/bin, see CLAUDE.md "Deploying"). The harness compiles the real patcher sources
 # against them (scripts/gpu-vendor-harness), so it needs no GPU and no running Jellyfin.
 #
-# What it proves (docs/architecture/GPU_VENDORS.md, PR 1):
+# What it proves (docs/architecture/GPU_VENDORS.md, PR 1 and PR 2):
 #   - the PCI vendor ids map to the right vendor (0x10de NVIDIA, 0x8086 Intel, anything else none);
 #   - auto picks NVIDIA first, the explicit settings override it, a vendor that was chosen and not
 #     found reports Detected=false instead of claiming a capability;
 #   - the real sysfs reader works on a fake sysfs tree, and ignores a node with no /dev entry;
-#   - with GpuVendor set to ANY value, HwaccelArgs, BuildChain and EncoderFor return exactly what
-#     they returned before the setting existed (the NVIDIA command lines are byte-identical).
+#   - with GpuVendor set to ANY value, and no Intel GPU that was actually seen, HwaccelArgs,
+#     BuildChain and EncoderFor return exactly what they returned before the setting existed (the
+#     NVIDIA command lines are byte-identical), on a no-GPU, an NVIDIA and a mixed machine;
+#   - (PR 2) with an Intel GPU seen, the encoder is QSV (software when ffmpeg lists none), a VA-API
+#     encoder is refused, an NVENC setting is treated as auto, the chain never ends in the CUDA
+#     hand-off, and nothing emitted contains nvenc, cuda or vaapi;
+#   - (PR 2) the DRM fdinfo reader (i915 and xe fixtures, a fake /proc), the idle-residency reader,
+#     and GET /JellyfinPlus/Gpu/Load through the real controller.
 #
 # Exit status: 0 every check passed, 1 a check failed, 2 the harness could not be built.
 set -uo pipefail

@@ -415,7 +415,7 @@
                             <span>Keep frames on the GPU for encoding</span>
                         </label>
                         <div class="fieldDescription checkboxFieldDescription">
-                        Hands NVENC the finished frame directly instead of copying it to system memory and back, which saves one full frame of PCIe traffic each way at output size. On by default. If sessions fail to start on your build, turn it off; nothing else in the chain changes.
+                        Hands NVENC the finished frame directly instead of copying it to system memory and back, which saves one full frame of PCIe traffic each way at output size. On by default. If sessions fail to start on your build, turn it off; nothing else in the chain changes. NVIDIA only: on an Intel GPU the frame is always copied back to system memory for the encoder, whatever this says, and Recent sessions shows it as n/a.
                     </div>
                     </div>
 
@@ -426,9 +426,12 @@
                             <option value="hevc_nvenc"></option>
                             <option value="h264_nvenc"></option>
                             <option value="av1_nvenc"></option>
+                            <option value="hevc_qsv"></option>
+                            <option value="h264_qsv"></option>
+                            <option value="av1_qsv"></option>
                         </datalist>
                         <div class="fieldDescription">
-                        Video encoder for transcodes this plugin enhances, including ones it forces out of a stream copy. Blank or auto follows the codec the client negotiated. A named encoder (hevc_nvenc, h264_nvenc, ...) is used only if this ffmpeg has it and the client said it can play that codec; otherwise the negotiated codec is kept and Recent sessions shows why. Default hevc_nvenc.
+                        Video encoder for transcodes this plugin enhances, including ones it forces out of a stream copy. Blank or auto follows the codec the client negotiated. A named encoder (hevc_nvenc, h264_nvenc, ...) is used only if this ffmpeg has it and the client said it can play that codec; otherwise the negotiated codec is kept and Recent sessions shows why. Default hevc_nvenc. On an Intel GPU an NVENC name (the default included) is treated as auto and the encoder is the QSV one for the codec (hevc_qsv, h264_qsv, av1_qsv), with Recent sessions saying so; name a QSV or software encoder to choose one yourself. A VA-API encoder is refused: the chain hands the encoder system-memory frames, which VA-API encoders cannot take.
                     </div>
                     </div>
 
@@ -440,7 +443,7 @@
                             <option value="none">None</option>
                         </select>
                         <div class="fieldDescription">
-                        Which GPU vendor this server is treated as having. Auto reads the vendor of each render node (/sys/class/drm/renderD*/device/vendor), with /proc/driver/nvidia or nvidia-smi as the tie-breaker, and picks NVIDIA when it is present, so an install that already works is unchanged. For now this only changes what is reported: the line at the top of this page, the player probe and Recent sessions say what was found. It does not change any ffmpeg command or encoder. Default Auto.
+                        Which GPU vendor this server is treated as having. Auto reads the vendor of each render node (/sys/class/drm/renderD*/device/vendor), with /proc/driver/nvidia or nvidia-smi as the tie-breaker, and picks NVIDIA when it is present, so an install that already works is unchanged. It sets what is reported (the line at the top of this page, the player probe, Recent sessions) and, for Intel, the encoder: with an Intel GPU actually found, the encoder is QSV and the GPU-resident hand-off is off. A vendor chosen and not found changes nothing; the NVIDIA behaviour stays. Default Auto.
                     </div>
                     </div>
                     </div>

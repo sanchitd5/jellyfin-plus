@@ -83,15 +83,17 @@ namespace Jellyfin.Plugin.Plus.Patcher
         /// codec the client negotiated. A named encoder is used only when ffmpeg actually has it
         /// AND the session declared the corresponding codec as playable - otherwise the
         /// client-negotiated codec wins, because handing a client a codec it cannot decode is a
-        /// black screen rather than a worse picture.
+        /// black screen rather than a worse picture. On an Intel GPU an NVENC name is treated as
+        /// auto and the QSV encoder for the codec is used.
         /// </summary>
         public string Encoder { get; set; } = "hevc_nvenc";
 
         /// <summary>
         /// The GPU vendor to treat this server as having: auto, nvidia, intel, none. Mirrors
-        /// PluginConfiguration.GpuVendor. Read only by GpuDetector, to build the capability record
-        /// the probe, the status route and the session record report; nothing else in the engine
-        /// reads it, so no ffmpeg command line changes with it (docs/architecture/GPU_VENDORS.md).
+        /// PluginConfiguration.GpuVendor. Read by GpuDetector to build the capability record the
+        /// probe, the status route and the session record report, and through it by the encoder
+        /// choice and the end of the chain, but only when an Intel GPU was actually found; any
+        /// other server's command lines do not depend on it (docs/architecture/GPU_VENDORS.md).
         /// </summary>
         public string GpuVendor { get; set; } = "auto";
 

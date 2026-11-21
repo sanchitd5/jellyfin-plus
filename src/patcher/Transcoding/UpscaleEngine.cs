@@ -184,11 +184,20 @@ namespace Jellyfin.Plugin.Plus.Patcher
         /// <summary>
         /// The GPU capability record as the plugin saw it when this session's command was built:
         /// vendor, render node, encoder family, decode type, whether the CUDA-only levels and
-        /// OpenVINO are available. REPORT ONLY: nothing read it to build the command, so it
-        /// describes the server, not a choice made for this session. Null only when the session
-        /// was recorded by a build that predates the field.
+        /// OpenVINO are available. On Intel the vendor and Detected decided the encoder and the end
+        /// of the chain (docs/architecture/GPU_VENDORS.md, PR 2); the other fields are descriptive.
+        /// Null only when the session was recorded by a build that predates the field.
         /// </summary>
         public GpuCapability Gpu { get; set; }
+
+        /// <summary>
+        /// Whether the encoder was fed straight from the GPU (the frame mapped from Vulkan to CUDA
+        /// without a download): "on", "off" (the GpuResidentEncode setting is off), or "n/a" on an
+        /// Intel GPU, where that hand-off exists only for NVENC and the frame is always downloaded.
+        /// Null when the session ran no Vulkan chain (not enhanced, or a CUDA-native level, which
+        /// never leaves GPU memory). Never "on" on a server where the hand-off did not happen.
+        /// </summary>
+        public string GpuResidentEncode { get; set; }
 
         /// <summary>applied | not-requested | off-by-client | concurrency-cap | subtitle-burn-in | stream-copy | disabled | ineligible.</summary>
         public string Status { get; set; }
@@ -584,14 +593,17 @@ namespace Jellyfin.Plugin.Plus.Patcher
                                 || plan.ChromaApplied || plan.DebandApplied)
                             ? "CUDA+Vulkan (RTX bridge)"
                             : "CUDA (RTX)")
-                        : (Settings?.GpuResidentEncode == true ? "Vulkan (GPU-resident)" : "Vulkan"),
+                        : (GpuResidentEncodeOn() ? "Vulkan (GPU-resident)" : "Vulkan"),
+                GpuResidentEncode = !plan.Act || plan.UsesCudaNeural
+                    ? null
+                    : IsIntelPath() ? "n/a" : (Settings?.GpuResidentEncode == true ? "on" : "off"),
                 Status = status,
                 Reason = reason,
 
-                // Report only: this is read for the record and for no decision. Current never
-                // throws and asks the machine once per process, so after the first session it costs
-                // the transcode path one small allocation (plus a file-exists check on Intel).
-                Gpu = GpuDetector.Current(Settings?.GpuVendor, Settings?.NeuralModelDirectory),
+                // Current never throws and asks the machine once per process, so after the first
+                // session it costs the transcode path one small allocation (plus a file-exists
+                // check on Intel); the encode family is resolved against ffmpeg's cached list.
+                Gpu = Capability(),
             };
 
             // GetVideoEncoder and GetVideoProcessingFilterParam are separate call sites and
@@ -1913,6 +1925,115 @@ namespace Jellyfin.Plugin.Plus.Patcher
         /// <summary>Public read of a session's own option, for callers outside this class (BuildVerdict's swapfrom marker).</summary>
         public static string OptionValue(EncodingJobInfo state, string name) => RawOption(state, name);
 
+        /* ----------------------------------------------------------------------- GPU vendor */
+
+        /// <summary>
+        /// The GPU capability record with the Intel encode family resolved against this ffmpeg.
+        /// The detector alone cannot say whether ffmpeg has a QSV encoder; this can, so a server
+        /// without one reports software rather than a family the encoder choice will not use.
+        /// </summary>
+        public static GpuCapability Capability()
+        {
+            GpuCapability cap = GpuDetector.Current(Settings?.GpuVendor, Settings?.NeuralModelDirectory);
+            if (cap.Vendor == GpuVendors.Intel && cap.Detected && !IntelHasQsvEncoder())
+            {
+                cap.EncoderFamily = "software";
+                cap.Reason += "; ffmpeg lists no QSV encoder, so the encode is software (a VA-API encoder cannot take this chain's system-memory frames)";
+            }
+
+            return cap;
+        }
+
+        /// <summary>
+        /// True when this server's GPU is an Intel one that was actually seen. Every Intel
+        /// decision in the engine is gated on this and on nothing else, so a server with no
+        /// vendor, an NVIDIA GPU, or an Intel setting with no Intel GPU behind it takes the code
+        /// path that existed before the vendor setting did, byte for byte. Never throws.
+        /// </summary>
+        internal static bool IsIntelPath()
+        {
+            try
+            {
+                GpuCapability cap = GpuDetector.Current(Settings?.GpuVendor, Settings?.NeuralModelDirectory);
+                return cap.Vendor == GpuVendors.Intel && cap.Detected;
+            }
+            catch (Exception)
+            {
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Whether the chain hands the encoder a frame straight from the GPU: the GpuResidentEncode
+        /// setting, and only where the hand-off exists. It is a Vulkan-to-CUDA map (ffmpeg/0006),
+        /// so it is NVENC-only; on Intel it is always off, whatever the setting says.
+        /// </summary>
+        private static bool GpuResidentEncodeOn() => Settings?.GpuResidentEncode == true && !IsIntelPath();
+
+        private static readonly string[] IntelCodecs = { "h264", "hevc", "av1" };
+
+        /// <summary>
+        /// True when ffmpeg can be shown to lack a QSV encoder. An unreadable list is not "lacks":
+        /// the safe response to not knowing is the usual QSV choice, as with every other probe here.
+        /// </summary>
+        private static bool IntelHasQsvEncoder()
+        {
+            HashSet<string> available = AvailableEncoders();
+            return available == null || IntelCodecs.Any(c => available.Contains(c + "_qsv"));
+        }
+
+        /// <summary>
+        /// The encoder an Intel server uses for a codec, with a note when it is not the plain QSV
+        /// one. QSV, because the chain's frames are in system memory (GPU_VENDORS.md, 5.1). With
+        /// no QSV encoder listed it is the software encoder for the codec, if ffmpeg has one.
+        /// </summary>
+        private static string IntelEncoderFor(string codec, out string note)
+        {
+            note = null;
+            if (codec == null)
+            {
+                return null;
+            }
+
+            string qsv = codec + "_qsv";
+            HashSet<string> available = AvailableEncoders();
+            if (available == null || available.Contains(qsv))
+            {
+                return qsv;
+            }
+
+            string software = codec == "h264" ? "libx264" : codec == "hevc" ? "libx265" : "libsvtav1";
+            if (available.Contains(software))
+            {
+                note = "ffmpeg has no " + qsv + ", so " + software + " (software)";
+                return software;
+            }
+
+            note = "ffmpeg lists neither " + qsv + " nor " + software + "; " + qsv + " will fail to open";
+            return qsv;
+        }
+
+        /// <summary>
+        /// Whether an encoder can take the frames the Intel chain ends in (system memory): a QSV
+        /// encoder or a software one. A VA-API encoder needs VA-API frames and an NVENC one is for
+        /// the wrong GPU; either would be a dead stream, so neither is kept when Jellyfin chose it.
+        /// </summary>
+        internal static bool EncoderFitsIntelChain(string encoder)
+        {
+            if (string.IsNullOrWhiteSpace(encoder))
+            {
+                return false;
+            }
+
+            string e = encoder.Trim();
+            return e.EndsWith("_qsv", StringComparison.OrdinalIgnoreCase)
+                || e.StartsWith("lib", StringComparison.OrdinalIgnoreCase);
+        }
+
+        /// <summary>True when the encoder name is an NVENC one (<c>hevc_nvenc</c>).</summary>
+        internal static bool IsNvencEncoder(string encoder)
+            => !string.IsNullOrWhiteSpace(encoder) && encoder.Trim().EndsWith("_nvenc", StringComparison.OrdinalIgnoreCase);
+
         /* ------------------------------------------------------------------- encoder selection */
 
         /// <summary>The ffmpeg binary Jellyfin is using, captured from EncodingOptions when seen.</summary>
@@ -1928,6 +2049,12 @@ namespace Jellyfin.Plugin.Plus.Patcher
         /// </summary>
         private static bool _encodersProbed;
         private static readonly object _encodersLock = new object();
+
+        /// <summary>
+        /// Replaces the ffmpeg encoder list (null result = unreadable). The tests set it so the
+        /// encoder choice does not depend on the machine's ffmpeg; nothing in production does.
+        /// </summary>
+        internal static Func<HashSet<string>> EncoderListSource { get; set; }
 
         public static void NoteFfmpegPath(string path)
         {
@@ -1945,6 +2072,11 @@ namespace Jellyfin.Plugin.Plus.Patcher
         /// </summary>
         private static HashSet<string> AvailableEncoders()
         {
+            if (EncoderListSource != null)
+            {
+                return EncoderListSource();
+            }
+
             if (_encodersProbed)
             {
                 return _encoders;
@@ -2440,6 +2572,11 @@ namespace Jellyfin.Plugin.Plus.Patcher
         public static string GuardAv1(EncodingJobInfo state, string encoder, out string reason)
         {
             reason = null;
+            if (IsIntelPath())
+            {
+                return GuardAv1Intel(state, encoder, out reason);
+            }
+
             if (!string.Equals(encoder, "av1_nvenc", StringComparison.OrdinalIgnoreCase) || Av1NvencUsable() != false)
             {
                 return encoder;
@@ -2449,6 +2586,111 @@ namespace Jellyfin.Plugin.Plus.Patcher
             string swap = supported.Count == 0 || supported.Contains("hevc") ? "hevc_nvenc" : "h264_nvenc";
             reason = "GPU has no AV1 encoder (needs compute capability 8.9+), used " + swap + " instead of av1_nvenc";
             return swap;
+        }
+
+        /// <summary>
+        /// The Intel counterpart: av1_qsv is listed by any build that compiles it, but only an Arc
+        /// or newer GPU can open it, and it fails at open, which kills the transcode. So one frame
+        /// is test-encoded (once, remembered) and a failure swaps to hevc_qsv, or h264_qsv when the
+        /// session cannot take HEVC. An inconclusive probe leaves the choice alone.
+        /// </summary>
+        private static string GuardAv1Intel(EncodingJobInfo state, string encoder, out string reason)
+        {
+            reason = null;
+            if (!string.Equals(encoder, "av1_qsv", StringComparison.OrdinalIgnoreCase) || Av1QsvUsable() != false)
+            {
+                return encoder;
+            }
+
+            var supported = SupportedCodecs(state);
+            string swap = supported.Count == 0 || supported.Contains("hevc") ? "hevc_qsv" : "h264_qsv";
+            reason = "a test encode with av1_qsv failed on this GPU, used " + swap + " instead of av1_qsv";
+            return swap;
+        }
+
+        private static bool? _av1Qsv;
+        private static readonly object _av1QsvLock = new object();
+
+        /// <summary>Replaces the one-frame AV1 test encode (null result = inconclusive). For the tests.</summary>
+        internal static Func<bool?> Av1QsvProbeSource { get; set; }
+
+        /// <summary>
+        /// Whether av1_qsv can open on this GPU, found by encoding one frame. Null when it could
+        /// not be tried (no ffmpeg, a timeout): the caller leaves the choice alone rather than
+        /// guess, and the answer is not remembered so a later session asks again.
+        /// </summary>
+        private static bool? Av1QsvUsable()
+        {
+            if (Av1QsvProbeSource != null)
+            {
+                return Av1QsvProbeSource();
+            }
+
+            lock (_av1QsvLock)
+            {
+                if (_av1Qsv.HasValue)
+                {
+                    return _av1Qsv;
+                }
+
+                var candidates = new List<string>();
+                if (!string.IsNullOrWhiteSpace(_ffmpegPath))
+                {
+                    candidates.Add(_ffmpegPath);
+                }
+
+                candidates.Add("/usr/lib/jellyfin-ffmpeg/ffmpeg");
+                candidates.Add("/usr/bin/ffmpeg");
+
+                foreach (string exe in candidates)
+                {
+                    try
+                    {
+                        if (!File.Exists(exe))
+                        {
+                            continue;
+                        }
+
+                        var psi = new System.Diagnostics.ProcessStartInfo(
+                            exe,
+                            "-hide_banner -loglevel error -f lavfi -i color=c=black:s=640x360:r=1 -frames:v 1 -vf format=nv12 -c:v av1_qsv -f null -")
+                        {
+                            RedirectStandardOutput = true,
+                            RedirectStandardError = true,
+                            UseShellExecute = false,
+                        };
+
+                        using (var proc = System.Diagnostics.Process.Start(psi))
+                        {
+                            // Both pipes drained before the wait, as in the other probes here.
+                            var stdoutRead = proc.StandardOutput.ReadToEndAsync();
+                            var stderrRead = proc.StandardError.ReadToEndAsync();
+                            if (!proc.WaitForExit(10000))
+                            {
+                                try
+                                {
+                                    proc.Kill();
+                                }
+                                catch (Exception)
+                                {
+                                    // already gone
+                                }
+
+                                return null;
+                            }
+
+                            _av1Qsv = proc.ExitCode == 0;
+                            return _av1Qsv;
+                        }
+                    }
+                    catch (Exception)
+                    {
+                        // try the next candidate
+                    }
+                }
+
+                return null;
+            }
         }
 
         private static bool? _av1Nvenc;
@@ -2513,16 +2755,50 @@ namespace Jellyfin.Plugin.Plus.Patcher
 
         private static string ChooseEncoder(EncodingJobInfo state, out string reason)
         {
+            // On an Intel server the encoder setting's NVENC default cannot run, so it is treated
+            // as auto, and the reason says so. The NVIDIA path below is the code that existed
+            // before the vendor setting did, and is reached unchanged by every other server.
+            bool intel = IsIntelPath();
+            string configured = Settings?.Encoder;
+            string foreign = null;
+            if (intel && IsNvencEncoder(configured))
+            {
+                foreign = "configured '" + configured.Trim() + "' is an NVIDIA encoder and this server's GPU is Intel; treated as auto: ";
+                configured = "auto";
+            }
+
+            string chosen = ChooseEncoderFor(state, intel, configured, out reason);
+            if (foreign != null)
+            {
+                reason = foreign + reason;
+            }
+
+            return chosen;
+        }
+
+        private static string ChooseEncoderFor(EncodingJobInfo state, bool intel, string configured, out string reason)
+        {
             string clientCodec = ClientCodec(state);
-            string clientEncoder = clientCodec == "h264" ? "h264_nvenc"
+            string pickNote = null;
+            string clientEncoder = intel
+                ? IntelEncoderFor(clientCodec, out pickNote)
+                : clientCodec == "h264" ? "h264_nvenc"
                 : clientCodec == "hevc" ? "hevc_nvenc"
                 : clientCodec == "av1" ? "av1_nvenc"
                 : null;
 
-            string configured = Settings?.Encoder;
-
             if (string.IsNullOrWhiteSpace(configured) || string.Equals(configured.Trim(), "auto", StringComparison.OrdinalIgnoreCase))
             {
+                if (intel)
+                {
+                    string picked = clientEncoder == null ? IntelEncoderFor("hevc", out pickNote) : clientEncoder;
+                    reason = (clientEncoder != null
+                        ? "Encoder set to auto; following the client-negotiated " + clientCodec + " (" + clientEncoder + ")"
+                        : "Encoder set to auto and the client named no codec; using " + picked)
+                        + (pickNote == null ? string.Empty : "; " + pickNote);
+                    return picked;
+                }
+
                 reason = clientEncoder != null
                     ? "Encoder set to auto; following the client-negotiated " + clientCodec
                     : "Encoder set to auto and the client named no codec; using hevc_nvenc";
@@ -2542,6 +2818,12 @@ namespace Jellyfin.Plugin.Plus.Patcher
             if (!available.Contains(configured))
             {
                 reason = "ffmpeg has no encoder '" + configured + "'; used " + fallback;
+                return fallback;
+            }
+
+            if (intel && !EncoderFitsIntelChain(configured))
+            {
+                reason = "configured '" + configured + "' cannot take the system-memory frames this chain ends in (a VA-API encoder needs VA-API frames); used " + fallback;
                 return fallback;
             }
 
@@ -2740,7 +3022,13 @@ namespace Jellyfin.Plugin.Plus.Patcher
             // GpuResidentEncode instead derives a CUDA device from the existing Vulkan one and
             // hands NVENC the frame without leaving the GPU - see the config page for why this
             // is opt-in rather than the default.
-            sb.Append(cfg?.GpuResidentEncode == true
+            //
+            // On an Intel GPU there is no such hand-off (it is a Vulkan-to-CUDA map), so the tail
+            // is always the download, whatever GpuResidentEncode says. It stays yuv420p: hwdownload
+            // yields the Vulkan frames' own format, which libplacebo leaves as the input's, and the
+            // QSV encoder's nv12 is reached by the conversion ffmpeg inserts at the graph output.
+            // The tail is therefore the string NVIDIA's non-resident path already uses.
+            sb.Append(GpuResidentEncodeOn()
                 ? ",hwmap=derive_device=cuda"
                 : ",hwdownload,format=yuv420p");
             return sb.ToString();

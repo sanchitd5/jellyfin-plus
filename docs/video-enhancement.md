@@ -517,8 +517,8 @@ Dashboard → Plugins → Jellyfin Plus. Defaults suit a single busy GPU:
 | `MinScaleFactor` | 1.15 | skip near-identity upscales entirely |
 | `MaxSourceHeight` | 1440 | never upscale sources taller than this |
 | `MaxConcurrent` | 4 | beyond this, stock transcoding is used |
-| `Encoder` | `hevc_nvenc` | falls back to the client's codec when unsupported; `av1_nvenc` requires compute 8.9+ (Ada Lovelace), guarded automatically |
-| `GpuVendor` | `auto` | `auto` / `nvidia` / `intel` / `none`. Report only for now: says what the dashboard, the probe and Recent sessions report about the GPU; changes no command (see [GPU_VENDORS.md](architecture/GPU_VENDORS.md)) |
+| `Encoder` | `hevc_nvenc` | falls back to the client's codec when unsupported; `av1_nvenc` requires compute 8.9+ (Ada Lovelace), guarded automatically. On an Intel GPU an NVENC name is treated as auto and the QSV encoder for the codec is used (`av1_qsv` is test-encoded first and swapped to HEVC if it fails) |
+| `GpuVendor` | `auto` | `auto` / `nvidia` / `intel` / `none`. Says what the dashboard, the probe and Recent sessions report about the GPU and, when an Intel GPU is actually found, selects the QSV encoder and turns the GPU-resident hand-off off; NVIDIA commands are unchanged (see [GPU_VENDORS.md](architecture/GPU_VENDORS.md)) |
 | `RequireClientOptIn` | false | off (default) = enhance every eligible transcode |
 | `ForceTranscode` | false | turn a would-be stream copy into a real transcode |
 | `ForceTranscodeForDirectPlay` | false | see below — stops clients direct playing eligible material |

@@ -2,11 +2,14 @@
 
 Design spec for making the enhancement engine vendor-aware. Written to be implemented as a series of
 small pull requests, each one landing on its own branch and verified before the next starts. **PR 1
-(detection and a report-only capability model) is built (section 3); the rest are the plan, with
-what is known, what was measured, and what is still a guess marked as such.** Nothing in PRs 2 to 8
-is built. PR 1 builds clean (plugin and patcher) against the Jellyfin 12.4 server assemblies and
-`scripts/test-gpu-vendor.sh` passes (113 checks) in a .NET 10 SDK container with no GPU. It has not
-been run on an NVIDIA or an Intel box, so the detection itself is untested against real sysfs.
+(detection and a report-only capability model, section 3) and PR 2 (the encoder per vendor and Intel
+load, sections 5.1 and 5.2) are built; the rest are the plan, with what is known, what was measured,
+and what is still a guess marked as such.** Nothing in PRs 3 to 8 is built. PR 1 and PR 2 build clean
+(plugin and patcher) against the Jellyfin 12.4 server assemblies and `scripts/test-gpu-vendor.sh`
+passes (581 checks) in a .NET 10 SDK container with no GPU. Neither has been run on an NVIDIA or an
+Intel box: the detection is untested against real sysfs, the Intel command line has not been run
+through ffmpeg, and the fdinfo parser has been run only against fixtures written from the kernel
+documentation, not against output captured from a machine.
 
 Today every GPU-specific decision in the engine assumes NVIDIA. This spec does not change that for
 anyone who has an NVIDIA card: with the card present, every ffmpeg command line this plugin builds
@@ -57,8 +60,9 @@ deblock CPU filters, the whole search and library half of the plugin.
 ### 3.1 What it does
 
 Finds out which GPU the server has, records it in a **capability record**, and shows the record in
-the places this plugin already reports what the server did. **Nothing reads the record to decide
-anything.** No command line, no encoder choice, no level list changes, whatever the record says.
+the places this plugin already reports what the server did. **In PR 1 nothing reads the record to
+decide anything** (PR 2 changed that for Intel only, section 5.1). No command line, no encoder choice,
+no level list changes, whatever the record says.
 
 This is deliberate: it is the smallest change that makes the next seven PRs checkable. A later PR
 can be reviewed against a record that has been live on real servers, and the claim "NVIDIA command
@@ -147,6 +151,21 @@ running Jellyfin. It checks:
   bridged through libplacebo) and `EncoderFor` return the exact strings they returned before the
   setting existed. The expected strings are written out by hand from the code, not computed;
 - that the probe, the status route and `SessionRecord` carry the record.
+
+PR 2 extends the same harness (it now compiles the DRM fdinfo reader and the load controller as
+well). The NVIDIA strings above are asserted on a machine with no GPU, an NVIDIA one and a mixed one,
+for every `GpuVendor` value, and are extended to the encoder choice (client codec to `*_nvenc`, the
+default setting, a refused setting, a named QSV encoder on a non-Intel box) and to the session
+record's `GpuResidentEncode` and `Pipeline`; the PR 1 goldens are unchanged. Intel is asserted
+separately: it picks QSV, falls back to software when ffmpeg lists no QSV encoder, refuses a VA-API
+encoder, treats an NVENC setting as auto with the reason, swaps `av1_qsv` after a failed test
+encode, and **never emits `nvenc`, `cuda` or `vaapi`** in the encoder, the chain or the device
+arguments across every setting, client codec and `GpuResidentEncode` value. The fdinfo reader is
+tested on i915 and xe fixtures (`scripts/gpu-vendor-harness/fixtures/`), a fake `/proc` tree with
+duplicate descriptors and a second process, and the idle-residency reader on i915, xe (two GTs) and
+older-kernel layouts. The load route is called through the real controller and its JSON shape and the
+NVIDIA, Intel and mixed-box branches are checked. A mutation check (turning off the Intel gate on the
+two decisions) fails seven of these, so they do test what they name.
 
 ## 4. The series
 
@@ -372,7 +391,8 @@ encode, the neural levels, or more than one session.
 - **Fail soft.** Detection and every new patch fall back to today's path on any error (invariants 4
   and 15). A detection failure is vendor `none`, never an exception on the transcode path.
 - **One axis is only real when `Option()` reads it** (invariant 11): `GpuVendor` is a setting, not an
-  axis, and is read only by the capability record until PR 2 makes it matter.
+  axis. Since PR 2 it also decides the encoder and the end of the chain, but only when an Intel GPU
+  was actually seen.
 - **Unmeasured ships off.** Anything whose cost on Intel has not been measured defaults off, or to a
   value that offers nothing.
 - **No library content** in the repo (invariant 18). Measurements name hardware and resolutions only.

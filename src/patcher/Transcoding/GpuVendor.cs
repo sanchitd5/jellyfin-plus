@@ -86,11 +86,12 @@ namespace Jellyfin.Plugin.Plus.Patcher
     }
 
     /// <summary>
-    /// What this server's GPU is and what the vendor-specific parts of the chain could use, as
-    /// the plugin sees it. REPORT ONLY: nothing in the engine reads it to make a decision yet, so
-    /// a command line is the same whatever it says (docs/architecture/GPU_VENDORS.md, PR 1).
-    /// Every flag is about what was seen, not what the setting wishes: a vendor that was chosen
-    /// and not found reports <see cref="Detected"/> false and no capability.
+    /// What this server's GPU is and what the vendor-specific parts of the chain can use, as the
+    /// plugin sees it. The encoder choice and the end of the chain read <see cref="Vendor"/> and
+    /// <see cref="Detected"/> (docs/architecture/GPU_VENDORS.md, PR 2); the rest is still reported
+    /// only. Every flag is about what was seen, not what the setting wishes: a vendor that was
+    /// chosen and not found reports <see cref="Detected"/> false and no capability, and then the
+    /// engine takes the NVIDIA path it always took.
     /// </summary>
     public sealed class GpuCapability
     {
@@ -106,7 +107,12 @@ namespace Jellyfin.Plugin.Plus.Patcher
         /// <summary>The render node of the chosen vendor, or null: an NVIDIA GPU without nvidia_drm has none.</summary>
         public string RenderNode { get; set; }
 
-        /// <summary>The encoder family the vendor's chain would end in: nvenc, vaapi (qsv is the alternative PR 2 measures), or software.</summary>
+        /// <summary>
+        /// The encoder family the vendor's chain ends in: nvenc, qsv (Intel; the chain hands the
+        /// encoder system-memory frames, which QSV accepts and VA-API does not), or software. The
+        /// detector reports qsv for Intel; the engine downgrades it to software on a server whose
+        /// ffmpeg lists no qsv encoder, because only the engine can ask ffmpeg.
+        /// </summary>
         public string EncoderFamily { get; set; } = "software";
 
         /// <summary>
@@ -314,6 +320,20 @@ namespace Jellyfin.Plugin.Plus.Patcher
 
         private static readonly object _lock = new object();
         private static Inventory _inventory;
+        private static IGpuEnvironment _environment;
+
+        /// <summary>
+        /// Points detection at another machine (a fake in the tests) and forgets what was probed.
+        /// Null goes back to the real one. Nothing in production calls this.
+        /// </summary>
+        public static void UseEnvironment(IGpuEnvironment environment)
+        {
+            lock (_lock)
+            {
+                _environment = environment;
+                _inventory = null;
+            }
+        }
 
         /// <summary>
         /// The record for this server under the given setting. Safe on the transcode path: the
@@ -323,10 +343,11 @@ namespace Jellyfin.Plugin.Plus.Patcher
         {
             try
             {
-                var env = new SystemGpuEnvironment();
+                IGpuEnvironment env;
                 Inventory inv;
                 lock (_lock)
                 {
+                    env = _environment ?? new SystemGpuEnvironment();
                     inv = _inventory ?? (_inventory = Inventory.Gather(env));
                 }
 
@@ -425,7 +446,7 @@ namespace Jellyfin.Plugin.Plus.Patcher
             {
                 cap.Detected = intelSeen;
                 cap.RenderNode = intelNode?.RenderNode;
-                cap.EncoderFamily = "vaapi";
+                cap.EncoderFamily = "qsv";
                 cap.DecodeType = "vaapi";
                 cap.OpenVinoAvailable = intelSeen && OpenVinoProvider(neuralModelDirectory, env);
             }

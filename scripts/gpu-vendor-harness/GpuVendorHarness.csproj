@@ -26,6 +26,20 @@
   <ItemGroup>
     <Compile Include="Program.cs" />
     <Compile Include="../../src/patcher/**/*.cs" Exclude="../../src/patcher/obj/**;../../src/patcher/bin/**" />
+    <!-- The DRM fdinfo and idle-residency readers of the load route: BCL only, so they compile
+         here on their own, without the controller or the rest of the plugin assembly. -->
+    <Compile Include="../../src/Transcoding/GpuFdinfo.cs" />
+    <!-- The load route itself, with the three plugin files it needs (the patcher loader, the
+         shim bridge it reports and the settings class), so the response shape and the vendor
+         branch are tested through the real controller. -->
+    <Compile Include="../../src/Transcoding/GpuLoadController.cs" />
+    <Compile Include="../../src/Hosting/PatcherLoader.cs" />
+    <Compile Include="../../src/Transcoding/ShimBridge.cs" />
+    <Compile Include="../../src/Configuration/PluginConfiguration.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="fixtures/**" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
   <ItemGroup>

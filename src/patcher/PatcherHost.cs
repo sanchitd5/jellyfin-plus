@@ -201,8 +201,7 @@ namespace Jellyfin.Plugin.Plus.Patcher
                 ["Upscalers"] = ShaderLibrary.Upscalers,
 
                 // The GPU capability record: what vendor this server has and what that vendor's
-                // chain could use. Report only, so the panel can say what it is running on; no
-                // level list above is filtered by it yet.
+                // chain can use. No level list above is filtered by it yet.
                 ["Gpu"] = Gpu(),
             };
         }
@@ -210,9 +209,14 @@ namespace Jellyfin.Plugin.Plus.Patcher
         /// <summary>The GPU capability record under the current GpuVendor setting. Never throws.</summary>
         private static GpuCapability Gpu()
         {
-            var cfg = UpscaleEngine.Settings;
-            return GpuDetector.Current(cfg?.GpuVendor, cfg?.NeuralModelDirectory);
+            return UpscaleEngine.Capability();
         }
+
+        /// <summary>
+        /// The GPU capability record as JSON, for the plugin side (the load route tells NVIDIA from
+        /// Intel by it). Primitives only across the load-context boundary, like everything here.
+        /// </summary>
+        public static string GpuJson() => JsonSerializer.Serialize(Gpu());
 
         /// <summary>Status plus recent sessions, as JSON.</summary>
         public static string StatusJson()
@@ -335,6 +339,7 @@ namespace Jellyfin.Plugin.Plus.Patcher
                 ["Encoder"] = record.Encoder,
                 ["EncoderReason"] = record.EncoderReason,
                 ["Gpu"] = record.Gpu,
+                ["GpuResidentEncode"] = record.GpuResidentEncode,
                 ["Status"] = record.Status,
                 ["Summary"] = record.Summary,
             });
