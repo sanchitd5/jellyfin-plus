@@ -27,6 +27,7 @@ applies it, and what was measured and rejected.
 | [WEB_PANEL_DESIGN.md](architecture/WEB_PANEL_DESIGN.md) | The Enhance panel: data-driven levels, server versus client wording, `dlpp_rtcuda` / `vsr_rtcuda` |
 | [INTEGRATION_DESIGN.md](architecture/INTEGRATION_DESIGN.md) | Integrating `dlpp_rtcuda` and `vsr_rtcuda` into the plugin |
 | [TIMELINE_MARKERS.md](architecture/TIMELINE_MARKERS.md) | Timeline markers: the provider contract, mapping keys and env override for external apps |
+| [GPU_VENDORS.md](architecture/GPU_VENDORS.md) | Running on Intel as well as NVIDIA: detection and the capability record (PR 1), then the planned series (encoder per vendor, Vulkan device from the render node, Intel load, OpenVINO, decode, an Intel ffmpeg build), with the A380 measurements |
 
 ## filters/ — one document per custom ffmpeg filter
 
