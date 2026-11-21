@@ -4,13 +4,15 @@ Design spec for making the enhancement engine vendor-aware. Written to be implem
 small pull requests, each one landing on its own branch and verified before the next starts. **PR 1
 (detection and a report-only capability model, section 3), PR 2 (the encoder per vendor and Intel
 load, sections 5.1 and 5.2), PR 3 (the Vulkan device from the render node, and the NVIDIA-only
-levels withheld on Intel, section 5.3) and PR 5 (the ONNX neural level on OpenVINO, routing by source
-height, and the `ORT_EP` build, section 5.4) are built; the rest are the plan, with what is known, what
-was measured, and what is still a guess marked as such.** Nothing in PRs 6 to 8 is built (PR 4 was
-folded into PR 2). The four build clean (plugin and patcher) against the Jellyfin 12.4 server assemblies
+levels withheld on Intel, section 5.3), PR 5 (the ONNX neural level on OpenVINO, routing by source
+height, and the `ORT_EP` build, section 5.4) and PR 8 (the `GPU_VENDOR=intel` ffmpeg build and the
+per-vendor required-filter set, section 5.7) are built; the rest are the plan, with what is known, what
+was measured, and what is still a guess marked as such.** Nothing in PRs 6 and 7 is built (PR 4 was
+folded into PR 2). The first four build clean (plugin and patcher) against the Jellyfin 12.4 server assemblies
 and `scripts/test-gpu-vendor.sh` passes (1082 checks, plus 11 in `scripts/test-shim-device.py`) in a .NET
 10 SDK container with no GPU; `scripts/test-vf-ort.sh` compiles `ffmpeg/vf_ort.c` against FFmpeg 8.1.2
-and checks its provider calls (28 checks). None has been run on an NVIDIA or an Intel box: the detection is untested
+and checks its provider calls (28 checks); `scripts/test_build_ffmpeg_vendor.py` runs both build scripts
+in plan-only mode for each vendor (section 5.7; no ffmpeg is built). None has been run on an NVIDIA or an Intel box: the detection is untested
 against real sysfs, the Intel command lines (the encoder, the render-node device of PR 3 and the
 OpenVINO device of PR 5) have not been run through ffmpeg, the OpenVINO provider has been exercised
 only on a machine with no GPU, and the fdinfo parser has been run only against fixtures written from the
@@ -54,7 +56,7 @@ has to make vendor-aware, or consciously leave NVIDIA-only.
 | `vf_ort` | The ONNX Runtime filter creates a CUDA execution provider and falls back to the CPU one (`ffmpeg/vf_ort.c`, option `device` = `cuda` / `cpu`) | PR 5 |
 | `gu_inputs.h` (`vf_fsr2`, `vf_dlss`) | Motion vectors come from NVOFA optical flow (`libnvidia-opticalflow`), through CUDA | PR 6 |
 | Decode | The decoder patches drop `-hwaccel` and `-c:v *_cuvid` so frames reach `hwupload` in system memory; only the CUDA-native levels keep a CUDA hwaccel | PR 7 |
-| `scripts/build-ffmpeg.sh`, `proxmox-build.sh` | The patched binary must carry all five of `oidn optix ort fsr2 dlss` or the deploy is refused (AGENTS.md invariant 10); four of them need NVIDIA SDKs | PR 8 |
+| `scripts/build-ffmpeg.sh`, `proxmox-build.sh` | The patched binary must carry all five of `oidn optix ort fsr2 dlss` or the deploy is refused (AGENTS.md invariant 10); four of them need NVIDIA SDKs | PR 8: a required set per vendor (`scripts/ffmpeg-vendor.sh`), section 5.7 |
 
 What is **not** NVIDIA-specific and so needs no work: the libplacebo chain itself (Vulkan), every
 shader SR level (FSRCNNX, Anime4K, RAVU, CuNNy), RCAS, deband, nlmeans_vulkan, the denoise and
@@ -541,10 +543,9 @@ today's path, unedited).
   the one it uses (`GpuVendor`).
 - *What still needs NVIDIA headers.* `nv-codec-headers` (FFmpeg's own MIT headers; the driver is
   `dlopen`ed at run time, so no NVIDIA SDK and no card), the `--enable-ffnvcodec --enable-cuda
-  --enable-nvenc` configure flags and patches 0006 to 0014 are unconditional in the script, and 0008
-  and 0009 are in the generic `hwmap` filter, which PR 7's VA-API work may want. Taking them out
-  of an Intel build is PR 8's `GPU_VENDOR=intel`, together with the required-filter set (invariant 10).
-  So the variant needs no NVIDIA SDK, and still installs the FFmpeg nvcodec headers.
+  --enable-nvenc` configure flags and patches 0006 to 0014 were unconditional in the script when
+  PR 5 was written. PR 8's `GPU_VENDOR=intel` takes them out of an Intel build, except 0008 and 0009
+  (section 5.7), together with the per-vendor required-filter set (invariant 10).
 - The script did not checksum any download before this; only the new ones are checked here, and the
   FFmpeg tarball's sha256 is not pinned by this PR.
 - Intel's GPU plugin also needs the host's OpenCL stack (`libOpenCL.so.1`, from `ocl-icd-libopencl1`,
@@ -600,21 +601,77 @@ exact command and the FFmpeg error text, since the cause above is a guess. It st
 (a setting, default off) until it has been verified on a served segment, because an unverified
 hardware decode path is a dead stream for a viewer, not a worse picture.
 
-### 5.7 PR 8: a `GPU_VENDOR=intel` build, and the five-filter invariant
+### 5.7 PR 8: a `GPU_VENDOR=intel` build, and the per-vendor required filters
 
-`scripts/build-ffmpeg.sh` gains `GPU_VENDOR=nvidia|intel` (default `nvidia`, today's behaviour).
-`intel` builds with VA-API (and oneVPL if PR 2 chooses QSV), the ORT OpenVINO provider, and without
-the CUDA-only filters and the NVIDIA headers (`optix`, `dlss`, `dlpp_rtcuda`, `vsr_rtcuda`,
-`nv-codec-headers`).
+`scripts/build-ffmpeg.sh` and `scripts/proxmox-build.sh` take `GPU_VENDOR=nvidia|intel` (default
+`nvidia`; anything else is refused by both scripts). With `nvidia` the configure line, the apt
+list, the patch order and the verify step are what they were before, and the test below compares the
+plan against a golden to keep it so.
 
-That collides with AGENTS.md invariant 10, which requires all five of `oidn optix ort fsr2 dlss`
-to survive a rebuild and makes `proxmox-build.sh` refuse a binary missing any. Four of the five need
-NVIDIA SDKs, so an Intel binary can never satisfy it. The fix is a **required set per vendor**
-(NVIDIA: the five; Intel: the subset that builds), checked by the same script. That is an amendment
-to an invariant, so it is made in PR 8 with the invariant's own text updated in the same commit and
-is the maintainer's call, not something to slip in. The shim's per-invocation probe of the binary's
-filter list already strips nodes the binary lacks, so a binary with fewer filters degrades rather
-than failing, which is what the amended invariant relies on.
+**What `intel` builds.** The same FFmpeg and the same `vf_oidn` and `vf_ort`, plus:
+
+- apt `libva-dev libvpl-dev libdrm-dev` (the oneVPL dispatcher, `libvpl-dev` 2023.3.0 or newer, is
+  `vpl >= 2.6` to FFmpeg's configure; `--enable-libmfx` and `--enable-libvpl` cannot be combined, so
+  only the latter is used) and configure `--enable-vaapi --enable-libvpl --enable-libdrm`. libdrm is
+  there for PR 3's Vulkan device from the render node (`drm=dr:<node>`, then `vulkan=vk@dr`).
+- `WITH_ORT=1` and `ORT_EP=openvino` by default (section 5.4).
+- No `nv-codec-headers`, no `--enable-ffnvcodec/cuda/cuvid/nvdec/nvenc`, no CUDA-LLVM flags, no
+  patches 0006, 0007 and 0010 to 0014 (the CUDA encode and filter patches), no `transpose_cuda`
+  check and no bridge test.
+
+**Why 0008 and 0009 stay on Intel.** Both touch only `libavfilter/vf_hwmap.c`. 0008 takes the output
+format of a chained `hwmap` from `hwframes_ref`; 0009 pins the formats of `derive_device=vulkan` and
+`derive_device=cuda` and falls through to the stock `ff_all_formats` for any other device type. They
+are format-negotiation fixes for a `hwmap` chain, which is the shape PR 7's VA-API to Vulkan decode
+needs, so they are kept rather than dropped and re-added later. **That is unverified on Intel:** no
+Intel box has built or run this binary. If PR 7 shows they change nothing for a VA-API chain, or
+they get in the way, removing them is a one-line change to the `intel` patch list in `build-ffmpeg.sh`.
+
+**The invariant.** AGENTS.md invariant 10 required all five of `oidn optix ort fsr2 dlss` to survive a
+rebuild and made `proxmox-build.sh` refuse a binary missing any. Four of the five need NVIDIA SDKs,
+so an Intel binary can never satisfy it. It is now a **required set per vendor**, one list in
+`scripts/ffmpeg-vendor.sh` that both scripts source (NVIDIA: the five; Intel: `oidn ort`), and
+AGENTS.md invariant 10 and CLAUDE.md say so in the same change. That is an amendment to an invariant
+and so the maintainer's call, flagged in the pull request. The shim's per-invocation probe of the
+binary's filter list already strips nodes the binary lacks, so a binary with fewer filters degrades
+rather than failing, which is what the amended invariant relies on.
+
+**Refusals.** On `intel` the script stops, naming the variable, for `WITH_OPTIX=1`, `WITH_FSR2=1`,
+`WITH_DLSS=1`, `WITH_MAXINE_VSR=1`, `WITH_RTXDLPP=1`, `WITH_RTXVSR=1`, `ORT_EP=cuda`, `WITH_ORT=0`,
+`WITH_OIDN=0` and `BRIDGE_TEST=1`: each would either need an NVIDIA SDK or would drop a filter the
+Intel set requires. `proxmox-build.sh` does not turn the NVIDIA-only switches on for `intel`; it
+checks the built binary's `-filters` against the vendor's set and restores `<binary>.prev` on a miss,
+as before.
+
+**`PLAN_ONLY=1`.** `GPU_VENDOR=intel PLAN_ONLY=1 scripts/build-ffmpeg.sh` runs the preflight, skips the
+root and disk checks, prints `plan:` lines (vendor, apt list, nv-codec-headers, patches, hwaccel flags,
+CUDA-LLVM flags, required filters, bridge-test default) and exits 0 before any apt, download or write.
+The real run reads the same arrays the plan prints, so the plan cannot drift from the build; it does
+**not** run apt, `patch`, configure or make, so it says nothing about whether the build succeeds.
+
+**Downloads.** The Intel variant adds none: libva, libvpl and libdrm come from apt, so there is
+nothing new to pin by sha256. The existing wheel and header pins are untouched. The FFmpeg and OIDN
+tarballs stay unpinned in `build-ffmpeg.sh`; `scripts/test-vf-ort.sh` already pins FFmpeg 8.1.2
+(`464beb5e...`), which a later change could reuse there.
+
+**Host runtime.** The binary needs the host's VA-API driver and QSV runtime at run time
+(`intel-media-va-driver-non-free`, and `libvpl2` or `libmfx-gen1.2` for QSV), the same kind of host
+package as the OpenCL stack in section 5.4. The script's closing message says so; it does not install
+them.
+
+**Test.** `python3 scripts/test_build_ffmpeg_vendor.py` runs the real `build-ffmpeg.sh` with
+`PLAN_ONLY=1` for both vendors (goldens, each refusal, nothing written to disk, the unknown vendor),
+the real `proxmox-build.sh` against a stub repo and a fake `ffmpeg` (a missing required filter
+restores `.prev` for each vendor, an unknown vendor is refused before anything is touched), and static
+wiring checks (`bash -n`, the arrays are the ones the real run reads, the NVIDIA filter list appears in
+no build script). It also mutates copies of the scripts and requires the test to fail for each of its
+mutants. It needs no root, GPU, network or ffmpeg build.
+
+**Not verified.** No ffmpeg has been built with `GPU_VENDOR=intel`: that libvpl and VA-API configure
+and link, that `-hwaccels` lists `vaapi` and `-encoders` lists `h264_qsv`, `hevc_qsv` and `av1_qsv`
+(the Intel verify step checks it), that 0006..0014 as skipped leave a tree the rest still patches
+(patch stacking was not run), and 0008 and 0009 on a VA-API chain are all open until a build on an
+Intel server.
 
 ## 6. A380 measurements
 
