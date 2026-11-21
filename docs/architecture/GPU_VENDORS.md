@@ -199,7 +199,7 @@ verified on the real box.
 | 2 | Encoder per vendor and Intel load (the old PR 2 and PR 4 together, section 5.1 and 5.2): map the negotiated codec to `*_nvenc` or `*_qsv`; a `*_nvenc` setting on an Intel box is treated as auto and said so; Jellyfin's own `*_qsv` choice is kept; `GuardAv1` test-encodes `av1_qsv` on Intel; the GPU-resident encode (`hwmap=derive_device=cuda`) is NVIDIA-only and reported n/a on Intel; `Gpu/Load` gains `vendor`, `encoderSessions`, `gpuBusyPercent` from DRM fdinfo | 1 | Served segment codec and size on each vendor; NVIDIA command byte-identical; busy percentage under a known encode |
 | 3 | The Vulkan device from the render node instead of `vk:0`, on Intel only (section 5.3); the QSV device pinned to the same node where the encoder would not find it by itself; the NVIDIA-only levels (`optix`, `dlpp-*`, `vsr-rtcuda`, `fsr2`, `dlss`, `dlaa`) withheld from the probe on Intel and reported as "needs NVIDIA"; `MaxConcurrent` 1 for 4K output on a small Intel GPU recommended in docs, default unchanged | 1, 2 | Command on a two-GPU box names the right device; NVIDIA, `none` and one-GPU commands unchanged; the probe on an Intel box lacks the NVIDIA-only levels |
 | 4 | Folded into PR 2 (Intel load via DRM fdinfo, section 5.2) | 1 | see PR 2 |
-| 5 | `vf_ort` OpenVINO execution provider, `NeuralMaxSourceHeight` | 1, 8 | Neural level offered and running on Intel; a served segment |
+| 5 | `vf_ort` OpenVINO execution provider (`device=openvino`, CPU with a reason when the provider is absent); `NeuralMaxSourceHeight` (0 = off) routing the ONNX neural levels by source height; `scripts/build-ffmpeg.sh` `ORT_EP=cuda\|openvino` with a standalone build patch that no longer needs the OptiX chain (section 5.4) | 1 (8 only for the required-filter set) | Harness for the routing and the `device` option; `scripts/test-vf-ort.sh` compiles the filter and checks its provider calls; on Intel, a served segment larger than the source with `NeuralDevice` `openvino` |
 | 6 | `gu_inputs` without CUDA | 5 | Motion vectors from a non-NVOFA source, compared by the project's temporal measurements |
 | 7 | Opt-in Intel hardware decode, with the VA-API to Vulkan derived-device fix | 2, 3 | Frames reach libplacebo from VA-API; off by default |
 | 8 | A `GPU_VENDOR=intel` ffmpeg build and a per-vendor required-filter set | 1 | `-filters` lists the intel set; deploy refuses a binary missing one of it |
@@ -399,21 +399,145 @@ admit four. The setting is not changed.
 
 ### 5.4 PR 5: `vf_ort` on OpenVINO, and routing by source height
 
-`vf_ort` creates a CUDA execution provider and falls back to the CPU one. ONNX Runtime has an
-OpenVINO execution provider that runs on Intel GPUs; adding it is a new `device` value
-(`openvino`) in `vf_ort.c` and an ORT build that carries the provider, which is what
-`OpenVinoAvailable` will check for. OpenVINO is Apache-2.0, so under AGENTS.md ("Apache-2.0 is
-usable only because this is GPLv2-or-later") the file that links it records that the combined work
-ships as GPLv3.
+(This is the fourth pull request of the series upstream, because PR 4 was folded into PR 2; the
+numbering here is the table's.) Three changes. NVIDIA is not touched: with no Intel GPU seen every
+string the engine builds stays what it was (section 7), and `NeuralMaxSourceHeight` at its default of
+0 changes nothing on any server.
 
-A neural level costs per pixel of source, so on a small GPU it is affordable only for small sources.
-**`NeuralMaxSourceHeight`** (new setting, patcher mirror, probe) routes by source height: at or below
-it a neural level may run on the vendor's neural path; above it the session uses the shader SR level
-the ladder already offers. This is the Intel counterpart of the CUDA path's `SrMinScaleFactor`, and
-like it the value is chosen from measurement. **No neural measurement exists for the A380 yet**, so
-PR 5 measures first and sets the default from the result; until then the setting would default to a
-value that offers nothing, so nothing unmeasured ships on (the project's rule for anything
-unmeasured).
+**The execution provider.** ONNX Runtime has an OpenVINO execution provider that runs on Intel GPUs.
+Decided from the ORT 1.24.1 C header and the `onnxruntime-openvino` 1.24.1 wheel (both read, neither
+run):
+
+- The C API appends it with `SessionOptionsAppendExecutionProvider_OpenVINO_V2(options, keys, values,
+  n)` (`\since 1.17`), a string map; `device_type` takes `GPU` (OpenVINO's first GPU) or `GPU.<n>`.
+  No OpenVINO header is needed to build the filter, only `onnxruntime_c_api.h`.
+- `vf_ort.c` gains `device=openvino` beside `cuda` and `cpu`. `device_id` already exists for CUDA; for
+  OpenVINO `0` is `GPU` and `n` is `GPU.<n>`. The engine does not pass it: OpenVINO numbers GPUs in
+  its own order and nothing here maps a render node to that number, so on a box with an integrated
+  GPU and an Arc card `GPU` may be the integrated one. **Unverified**, and the reason Intel-with-two-
+  GPUs stays "first node wins" (section 5.3).
+- The filter's contract does not change: warn and run on the CPU rather than fail the session. That
+  covers the provider failing to append and now also the session failing to build with it (an
+  OpenVINO device error shows up in `CreateSession`, not in the append), in which case the filter
+  builds a fresh session on the CPU provider once and says so in the log. The CUDA branch is not
+  edited.
+- The provider is a separate shared object (`libonnxruntime_providers_openvino.so`) that ONNX Runtime
+  loads at run time, so `vf_ort.c` does not link OpenVINO. OpenVINO is Apache-2.0, which is why the
+  combined binary is GPLv3 (the OIDN-linking build already is, `scripts/build-ffmpeg.sh` header, and
+  AGENTS.md "Apache-2.0 is usable only because this is GPLv2-or-later"); `vf_ort.c` stays LGPL-2.1-or-
+  later and says where the provider comes from.
+
+**Which device a session asks for.** Only on the Intel path (`IsIntelPath`):
+
+| Intel GPU seen and | The node the engine builds | The record says |
+|---|---|---|
+| the OpenVINO provider file is present (`OpenVinoAvailable`) | `ort=model=...:device=openvino` | `NeuralDevice` `openvino` |
+| it is not | `ort=model=...:device=cpu` | `NeuralDevice` `cpu` and why: the provider is not installed, ONNX Runtime's CPU provider runs, not measured for this chain |
+
+Any other server's node carries no `device` option, as today (the filter's default is CUDA). Today an
+Intel server also ends on the CPU, but by way of a failed CUDA attempt and a warning; saying `cpu` is
+the honest statement of the same outcome and spares the attempt. What the engine records is what it
+asked for: whether ONNX Runtime really loaded the provider is visible only in ffmpeg's log (`OpenVINO
+execution provider unavailable`), and the record says "requested" rather than claim it.
+
+**`NeuralMaxSourceHeight`** (new setting; 0 = off, the default, so behaviour is unchanged; plugin
+setting, patcher mirror, the probe when set, the dashboard). The owner's requirement is to use neural
+upscaling when the resolution is really low; this is where the line is drawn. With it above 0 the
+session's **source height** decides, and only for the ONNX levels (`realesr-*`, the `ort` filter); the
+CUDA-native levels (`dlpp-*`, `vsr-rtcuda`) are not routed:
+
+- source height at or below it: the neural level is used. It is the session's own choice or the
+  dashboard's `NeuralLevel` when there is one. When neither names a level (and the viewer did not pick
+  Off, and the upscale itself is on, and no game upscaler is in force), the cheapest installed weight
+  is chosen (`realesr-anime-x2`, then `-anime-x4`, then `-general-x4`, with the ratio substitution
+  `NeuralForRatio` already does). That is the one place the engine picks a network for a viewer, and
+  it only happens because an operator set this value. The record says it was chosen, in
+  `NeuralRouting`, and `NeuralRequested` stays `off`: the viewer did not ask.
+- **Not on the CPU by choice.** On the Intel path this automatic choice needs the OpenVINO provider
+  (`OpenVinoAvailable`). Without it nothing is chosen and `NeuralRouting` says why, because a network
+  on the CPU is far from real time and choosing it for a viewer is a dead stream, not a worse picture.
+  A level the session or the dashboard asked for by name still runs on the CPU as before, with the
+  device reason.
+- source height above it: an ONNX neural level that was asked for is not run, the shader path the
+  ladder offers is what the session gets, and `NeuralRouting` says so ("neural X not run: source Np is
+  taller than NeuralMaxSourceHeight M"). `NeuralRequested` keeps naming what was asked.
+
+The height is the upright source height (`Plan.SourceHeight`, after rotation), so a portrait phone
+clip is judged on its long edge, like `MaxSourceHeight`'s portrait rule. 480 is the recommended value
+on Intel, recorded as a recommendation: it is the owner's, it is not measured, and section 6 has no
+neural row.
+
+**What a neural level costs per source pixel, and why 480.** The three weights are Real-ESRGAN's
+`SRVGGNetCompact`, BSD-3-Clause, exported from the official checkpoints (docs/filters/NEURAL.md; no
+weights are added to this repository). A compact network's cost is per **source** pixel and fixed by
+its shape: one 3x3 convolution into 64 features, `num_conv` 3x3 convolutions of 64 to 64, one 3x3
+convolution out to `3 x scale^2` channels, then a pixel shuffle. That is 9 x (3x64 + 64x64 x
+`num_conv` + 64 x 3 x scale^2) multiply-accumulates (MACs) per source pixel (PReLU not counted):
+
+| Weight | `num_conv` | MACs per source pixel | Measured on NVIDIA, 960x540 source to 1080p (NEURAL.md) | Source pixels per second |
+|---|---|---|---|---|
+| `realesr-anime-x2` | 16 | 598,464 | 24 fps | 12.4 M |
+| `realesr-anime-x4` | 16 | 619,200 | 15 fps | 7.8 M |
+| `realesr-general-x4` | 32 | 1,209,024 | 10 fps | 5.2 M |
+
+The MAC counts are arithmetic from the published architecture (`num_conv` 16, 16 and 32 as the code
+comments in `ShaderLibrary` and NEURAL.md state them), not read back from the weights in this series.
+The measured column is from the NVIDIA card the project was built on, the whole chain, with the
+unpack and scaling that come with a larger output, which is why x4 costs more than its MACs say. Real
+time at 24 fps from an 854x480 source is 9.8 M source pixels per second. Scaling the NVIDIA numbers
+(inferred, not measured at 480p): `realesr-anime-x2` clears it (about 30 fps), `-anime-x4` and
+`-general-x4` do not (about 19 and 13 fps). So 480 is a ceiling that only the x2 weight could meet even
+on that card. **Nothing is measured on the A380.** At 480p and 24 fps the x2 weight needs about 5.9
+trillion MACs per second sustained; whether an A380 delivers that through OpenVINO's GPU plugin is the
+measurement this series still lacks, and until it exists the default stays 0 (section 7, "Unmeasured
+ships off") and the docs say to start with `realesr-anime-x2` as the `NeuralLevel` and measure.
+
+**The build.** `scripts/build-ffmpeg.sh` gains `ORT_EP=cuda|openvino` (default `cuda`, which is
+today's path, unedited).
+
+- *The coupling.* Patch 0003 adds `vf_ort` to `configure`, the Makefile and `allfilters.c` with
+  context lines patch 0002 (the OptiX filter) added, so `WITH_ORT=1` died unless `WITH_OPTIX=1`, which
+  in turn needs `optix.h` (NVIDIA EULA) and the Optical Flow headers. That is a patch-context
+  accident, not a code dependency: `vf_ort.c` includes nothing OptiX. `ORT_EP=openvino` applies a new
+  `ffmpeg/0015-add-ort-filter-to-build-standalone.patch`, written against the tree with only 0001
+  applied (the script always applies 0001 first), so it needs no OptiX SDK, no Optical Flow SDK and no
+  NVPTX clang for ONNX Runtime. 0003 is not changed. `ORT_EP=openvino` refuses `WITH_OPTIX`, `WITH_FSR2`,
+  `WITH_DLSS` and `WITH_MAXINE_VSR` (they need the NVIDIA SDKs, and 0004 and 0005 stack on 0003).
+- *The runtime.* The OpenVINO provider is not in Microsoft's release tarballs; Intel publishes it in
+  the `onnxruntime-openvino` wheel (MIT), which carries `libonnxruntime.so.1.24.1`, the provider, the
+  OpenVINO runtime (Apache-2.0), the Intel GPU plugin and oneTBB, all with `RPATH` `$ORIGIN` (read with
+  `readelf`; unlike the CUDA provider no `patchelf` fix is needed). The script downloads that wheel, pinned
+  by version and checked against its sha256, and stages the libraries under `<prefix>/ort/lib`, the
+  directory the binary's rpath and `OpenVinoAvailable` already name. The core and the provider must be
+  the same ORT version, so the headers come from the same version too: the script fetches the
+  `Microsoft.ML.OnnxRuntime` 1.24.1 package from nuget.org (sha256 pinned), takes only
+  `onnxruntime_c_api.h`, and checks `ORT_API_VERSION` against the runtime. One ORT per binary: the
+  CUDA build and the OpenVINO build are different ORT cores, so a server with both vendors builds for
+  the one it uses (`GpuVendor`).
+- *What still needs NVIDIA headers.* `nv-codec-headers` (FFmpeg's own MIT headers; the driver is
+  `dlopen`ed at run time, so no NVIDIA SDK and no card), the `--enable-ffnvcodec --enable-cuda
+  --enable-nvenc` configure flags and patches 0006 to 0014 are unconditional in the script, and 0008
+  and 0009 are in the generic `hwmap` filter, which PR 7's VA-API work may want. Taking them out
+  of an Intel build is PR 8's `GPU_VENDOR=intel`, together with the required-filter set (invariant 10).
+  So the variant needs no NVIDIA SDK, and still installs the FFmpeg nvcodec headers.
+- The script did not checksum any download before this; only the new ones are checked here, and the
+  FFmpeg tarball's sha256 is not pinned by this PR.
+- Intel's GPU plugin also needs the host's OpenCL stack (`libOpenCL.so.1`, from `ocl-icd-libopencl1`,
+  and the Intel compute runtime, `intel-opencl-icd`); the plugin's `NEEDED` list names it. That is a
+  host package, not something the script stages.
+
+**Tests.** The harness (`scripts/gpu-vendor-harness`) asserts the routing and the device by value,
+with the NVIDIA goldens alongside: the `ort` node on NVIDIA, no GPU, a mixed box and an Intel box
+with `GpuVendor` set to something else is byte-identical to today's; on Intel it carries
+`device=openvino` with the provider file and `device=cpu` without it; the routing table by source
+height and setting (0, below, at, above; a session choice, the dashboard default, an explicit Off, the
+CUDA-native levels, a game level in force, no weights); the record's reasons; the probe key when
+the setting is on and its absence when it is 0. For the C side, `scripts/test-vf-ort.sh` compiles
+`ffmpeg/vf_ort.c` against FFmpeg 8.1.2's own headers and the ONNX Runtime 1.24.1 C header inside a
+container (a native arm64 container is enough for a compile-only check; it says nothing about x86
+code generation or about running a model), then links the filter's session setup against a fake
+`OrtApi` and checks which provider calls it makes for each `device` value and that an OpenVINO
+failure builds a CPU session instead of ending the filter. It is not a run on an Intel GPU.
 
 ### 5.5 PR 6: `gu_inputs` without CUDA
 
@@ -506,7 +630,7 @@ encode, the neural levels, or more than one session.
 2. ~~Whether the pinned jellyfin-ffmpeg can select the Vulkan device by DRM node~~ It can, by derivation from a DRM device, and the selection is by PCI device id, so two identical cards are not told apart (section 5.3). Unverified on a binary and a machine.
 3. The real cause of the VA-API to Vulkan failure; the derived-device explanation is a hypothesis
    (PR 7).
-4. Neural throughput on the A380, and so the default for `NeuralMaxSourceHeight` (PR 5).
+4. Neural throughput on the A380 through OpenVINO's GPU plugin, and so the default for `NeuralMaxSourceHeight` (PR 5 ships it at 0, section 5.4); also which `GPU.<n>` OpenVINO gives the Arc card on a box with an integrated GPU.
 5. A non-CUDA flow source for `gu_inputs` that survives the temporal measurements (PR 6), or the
    decision that Intel does not get the game upscalers.
 6. Where Xe-driver fdinfo differs from i915 on the target kernel (PR 2, section 5.2; the fixtures in the harness are written from the kernel documentation, not captured from a machine).
