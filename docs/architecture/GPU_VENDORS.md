@@ -6,8 +6,8 @@ small pull requests, each one landing on its own branch and verified before the 
 load, sections 5.1 and 5.2), PR 3 (the Vulkan device from the render node, and the NVIDIA-only
 levels withheld on Intel, section 5.3) and PR 5 (the ONNX neural level on OpenVINO, routing by source
 height, and the `ORT_EP` build, section 5.4) are built; the rest are the plan, with what is known, what
-was measured, and what is still a guess marked as such.** Nothing in PRs 6 to 8 is built (PR 4 was
-folded into PR 2). The four build clean (plugin and patcher) against the Jellyfin 12.4 server assemblies
+was measured, and what is still a guess marked as such.** Nothing in PRs 7 and 8 is built (PR 4 was
+folded into PR 2). PR 6 (`gu_inputs` without CUDA, section 5.5) is written but was authored with no compiler available, so none of it has been built or run. The four build clean (plugin and patcher) against the Jellyfin 12.4 server assemblies
 and `scripts/test-gpu-vendor.sh` passes (1082 checks, plus 11 in `scripts/test-shim-device.py`) in a .NET
 10 SDK container with no GPU; `scripts/test-vf-ort.sh` compiles `ffmpeg/vf_ort.c` against FFmpeg 8.1.2
 and checks its provider calls (28 checks). None has been run on an NVIDIA or an Intel box: the detection is untested
@@ -52,7 +52,7 @@ has to make vendor-aware, or consciously leave NVIDIA-only.
 | `GpuLoadController` (`GET /JellyfinPlus/Gpu/Load`) | NVENC session count from `nvidia-smi --query-gpu=encoder.stats.sessionCount` | PR 2 (section 5.2) |
 | CUDA-only levels | `optix` denoise, `dlss` / `dlaa`, `dlpp-1..4`, `vsr-rtcuda` need CUDA (and, for DLSS, the NVIDIA runtime the operator fetches); `fsr2` is fed by NVOFA motion vectors through CUDA | Withheld from the probe on a detected Intel GPU, and reported as "needs NVIDIA" (PR 3, section 5.3) |
 | `vf_ort` | The ONNX Runtime filter creates a CUDA execution provider and falls back to the CPU one (`ffmpeg/vf_ort.c`, option `device` = `cuda` / `cpu`) | PR 5 |
-| `gu_inputs.h` (`vf_fsr2`, `vf_dlss`) | Motion vectors come from NVOFA optical flow (`libnvidia-opticalflow`), through CUDA | PR 6 |
+| `gu_inputs.h` (`vf_fsr2`, `vf_dlss`) | Motion vectors come from NVOFA optical flow (`libnvidia-opticalflow`), through CUDA; `GU_NO_NVOF` builds run with zero flow | PR 6 (section 5.5) |
 | Decode | The decoder patches drop `-hwaccel` and `-c:v *_cuvid` so frames reach `hwupload` in system memory; only the CUDA-native levels keep a CUDA hwaccel | PR 7 |
 | `scripts/build-ffmpeg.sh`, `proxmox-build.sh` | The patched binary must carry all five of `oidn optix ort fsr2 dlss` or the deploy is refused (AGENTS.md invariant 10); four of them need NVIDIA SDKs | PR 8 |
 
@@ -401,7 +401,7 @@ is stated, never silent:
 |---|---|---|
 | Denoise | `optix`, `optix-temporal` (and the unlisted `optix-hdr`) | OptiX needs CUDA frames |
 | Neural | `dlpp-1` to `dlpp-4`, `vsr-rtcuda` (and the retired `vsr`) | NVIDIA RTX DLPP / VSR libraries over CUDA |
-| Game | `fsr2`, `dlss`, `dlaa` | DLSS is NVIDIA's; `fsr2` is fed by NVOFA motion vectors through CUDA (`gu_inputs.h`), which is PR 6's problem |
+| Game | `dlss`, `dlaa`; and `fsr2` unless the ffmpeg is the PR 6 CUDA-free build | DLSS is NVIDIA's; `fsr2` is fed by NVOFA motion vectors through CUDA (`gu_inputs.h`), and is offered on Intel only when the build left the `fsr2-nocuda` marker (section 5.5) |
 
 Each is removed from the probe lists (`Levels.Denoise`, `Neural`, `Game`, `GameOptionLevels` and the
 label maps), so the client, which builds its menu from the probe, never offers it. A server whose
@@ -576,12 +576,47 @@ correlation, the reactive mask derives from flow consistency, and **motion vecto
 the NVIDIA fixed-function optical-flow block, through CUDA. That one dependency is what ties
 `vf_fsr2` to NVIDIA although FSR2 itself is vendor-neutral. DLSS needs NVIDIA regardless.
 
-The work is a flow provider interface in `gu_inputs.h` with NVOFA as one implementation and a
-non-CUDA one as another (a CPU block-matching search, or an optical-flow network on the OpenVINO
-path). Until a provider measures well, **Intel offers no game-upscaler levels**, reported through the
-capability (`CudaOnlyLevelsAvailable` false and no flow provider), not hidden. The temporal-artifact
-measurements AGENTS.md prescribes (still-pixel variation across frames) apply to any new flow source,
-because per-frame metrics cannot see what a wrong flow field does.
+**Decision: no new flow source.** A CPU block-matching search or an optical-flow network would be a
+new motion estimator, and AGENTS.md says per-frame metrics cannot judge one (still-pixel variation
+across frames is the measurement, and it has not been made). So PR 6 does not write one. It makes
+`gu_inputs.h` run without CUDA, with the inputs it can still honestly produce, and offers only the
+level that can use them:
+
+| Input | Without CUDA | How |
+|---|---|---|
+| Motion vectors | zero | no optical flow, so the upscaler is told nothing moved |
+| Reactive mask | empty | it derives from flow consistency, and there is no flow |
+| Jitter | measured | CPU phase correlation, as on NVIDIA |
+| Depth | model (OpenVINO, PR 5) or flat 0.5 | unchanged; flat when no model is configured |
+
+`gu_inputs.h` has a compile switch, `GU_NO_NVOF`, that removes every CUDA and NVOFA line (the
+`ffnvcodec` and Optical Flow headers, the CUDA context, the NVOFA session, the flow and reactive code),
+so the build needs neither nv-codec-headers nor the Optical Flow SDK. Without the switch the NVIDIA path
+is the one it was, plus one change: a CUDA that will not load or start (no `libcuda`, `cuInit` fails)
+now logs a warning and runs with zero flow, as a missing NVOFA already did, instead of failing the
+filter. Zero motion vectors are a known failure, not a noisy one, and the session record says so
+(`GameMotionNote`, and a sentence in the summary): with them FSR2 behaves close to a spatial upscaler
+that also accumulates history, so ghosting on moving content is possible and is **not measured**.
+
+**The build.** `ORT_EP=openvino WITH_FSR2=1 scripts/build-ffmpeg.sh` is now allowed (it still refuses
+`WITH_OPTIX`, `WITH_DLSS` and `WITH_MAXINE_VSR` there). `0004-add-fsr2-gu-inputs.patch` stacks on the
+OptiX patches, so an OpenVINO build applies the standalone
+`0016-add-fsr2-filter-to-build-standalone.patch` instead (the same shape as 0015 is for `ort`), which
+registers `fsr2` with no `ffnvcodec` dependency, and compiles with `-DGU_NO_NVOF`. The build leaves a
+marker, `fsr2-nocuda`, beside the models directory's parent, as the OpenVINO build leaves its provider.
+
+**The plugin.** `GpuCapability.NoCudaGameAvailable` is true only when an Intel GPU was seen and that
+marker exists. Then, on Intel, `fsr2` is offered and runs; `dlss` and `dlaa` stay withheld ("needs
+NVIDIA"), and without the marker all three stay withheld as PR 3 left them. NVIDIA, no-GPU and
+mixed-box command lines and probes are unchanged.
+
+**Not verified.** Nothing here has been compiled with a real toolchain or run on an Intel GPU; the
+0016 patch has not been applied to a real FFmpeg tree; whether FSR2 with zero motion vectors looks
+acceptable has not been looked at. `scripts/test-gu-inputs.sh` is the compile-and-run check for the
+CUDA-free variant, and also runs the default variant against stub `ffnvcodec` and Optical Flow headers and
+a fake CUDA (the call order, and a CUDA failing at load, `cuInit` or the context push). The stubs prove the
+CUDA call order and the degrade path, not that the real SDK headers compile and not the NVOFA calls; a
+`WITH_FSR2=1` NVIDIA build is that check.
 
 ### 5.6 PR 7: opt-in Intel hardware decode, and the VA-API to Vulkan fix
 
@@ -660,6 +695,7 @@ encode, the neural levels, or more than one session.
 3. The real cause of the VA-API to Vulkan failure; the derived-device explanation is a hypothesis
    (PR 7).
 4. Neural throughput on the A380 through OpenVINO's GPU plugin, and so the default for `NeuralMaxSourceHeight` (PR 5 ships it at 0, section 5.4); also which `GPU.<n>` OpenVINO gives the Arc card on a box with an integrated GPU.
-5. A non-CUDA flow source for `gu_inputs` that survives the temporal measurements (PR 6), or the
-   decision that Intel does not get the game upscalers.
+5. Whether FSR2 with zero motion vectors is acceptable on Intel, by the still-pixel temporal
+   measurement; and a real non-CUDA flow source for `gu_inputs` (PR 6 shipped the zero-flow variant,
+   section 5.5, and did not write one).
 6. Where Xe-driver fdinfo differs from i915 on the target kernel (PR 2, section 5.2; the fixtures in the harness are written from the kernel documentation, not captured from a machine).
