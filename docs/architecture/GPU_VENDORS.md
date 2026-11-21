@@ -759,6 +759,96 @@ and link, that `-hwaccels` lists `vaapi` and `-encoders` lists `h264_qsv`, `hevc
 (patch stacking was not run), that 0016 applies without 0006 to 0014, and 0008 and 0009 on a VA-API
 chain are all open until a build on an Intel server.
 
+### 5.8 The Intel image, and the 13-row end-to-end matrix
+
+The Intel Arc end-to-end series needs a container the cluster can run: `docker/intel/Dockerfile`
+(image) and `scripts/bench-intel.sh` (the matrix). Neither has run: no image was built and no Arc card
+was touched when this section was written.
+
+**Image.** Three stages, all `FROM` the image production runs, so `ldd` resolves against the Debian
+the binary will meet:
+
+- `base-pkgs`: the package list the base already has.
+- `build`: FSR2's Vulkan library out of tree (the recipe in `docs/filters/FSR2.md`), then the
+  unmodified `scripts/build-ffmpeg.sh` with `GPU_VENDOR=intel WITH_ORT=1 ORT_EP=openvino WITH_FSR2=1`
+  and `PREFIX=/usr/lib/jellyfin-ffmpeg-oidn`; `docker/intel/stage-plugin.sh` publishes the plugin and
+  patcher against the base's own Jellyfin assemblies; the web client is built and injected into
+  `/jellyfin/jellyfin-web`; `scripts/install-shaders.sh` fetches the shaders; the runtime package list
+  is derived (below).
+- final: the base plus those outputs. The stock `/usr/lib/jellyfin-ffmpeg` is untouched; the patched
+  binary sits beside it and `/usr/local/bin/jellyfin-ffmpeg-upscale` (the shim) routes per session.
+
+The root filesystem of the pod is read-only, so the runtime install steps become build-time ones: the
+web inject runs at build time, and `/etc/jellyfin-upscale.json` and `/var/log/jellyfin-upscale.log`
+are symlinks into `/var/cache/jellyfin`. The Deployment must mount emptyDirs at `/var/cache/jellyfin`
+and `/run/jellyfin-upscale` (the shim's slot directory), and an initContainer must copy
+`/usr/lib/jellyfin-plus-dist/JellyfinPlus_1.0.0.0` into `/config/plugins/`. The patcher and
+`0Harmony.dll` are read from `/usr/lib/jellyfin-plus`. `JELLYFIN_FFMPEG` defaults to the shim and the
+Deployment may override it. The GPU node needs `/dev/dri` and the host's VA-API and QSV driver.
+
+**Pins.**
+
+| What | Pinned to |
+|---|---|
+| Base image | `docker.io/jellyfin/jellyfin:12.4.20261026-211555@sha256:fea863d0cd9ec445985d9c75fc6ed64e38a1d2766cf0c250a33d553f4fc1b771` |
+| FidelityFX-FSR2 | commit `1680d1edd5c034f88ebbbb793d8b88f8842cf804` (a git commit id is a content hash; the build checks `git rev-parse HEAD`) |
+| .NET 10 SDK | `10.0.404` tarball, checked against its published sha512 (`DOTNET_SDK_SHA512`) |
+| Runtime libraries | not hand-listed: derived from the built binary's `ldd`, minus what the base has, and installed in the final stage |
+
+**Acceptance, enforced by the build.** `ldd` of the patched ffmpeg shows no `not found`; `-filters`
+lists `oidn ort fsr2 libplacebo xpsnr`; the `fsr2-nocuda` marker exists; `-hwaccels` lists `vaapi`;
+`-encoders` lists `h264_qsv`; the stock ffmpeg is byte-identical to the base's (`cmp`); the web
+inject, patcher and plugin files are in place. A failed check fails the build.
+
+**Known gaps (not pinned).** The shared scripts fetch FFmpeg, OIDN, ONNX Runtime, shaderc and
+libplacebo sources, the shader files (`install-shaders.sh`), apt packages and NuGet packages from
+mutable URLs without a hash; this image inherits that and does not edit those scripts. The in-image
+checks above are what stands in for a pin. FFmpeg 8.1.2's sha256 exists only in
+`scripts/test-vf-ort.sh`. Reusing it in `build-ffmpeg.sh` is a separate change. The binary links
+GPL components: it stays in the owner's registry and is never published.
+
+**The matrix.** `scripts/bench-intel.sh --dry-run` prints the plan with no GPU, ffmpeg or network;
+the plan test proves the plan, not the run. Every figure is the median of `BENCH_RUNS` (3) runs, and
+the thresholds are the starting points of the owner's decision, recorded alongside the measured
+value either way. A row that lacks an input (no API token, no clip, no ONNX model) is `SKIP` and is
+never `PASS`.
+
+| Row | What | Must pass |
+|---|---|---|
+| 1 | Vendor record | vendor=intel; render node; Vulkan `vk@dr`; no NVIDIA-only level; fsr2 offered; no nvenc/cuda in any command |
+| 2 | FSRCNNX 360p to 1080p, software decode | fps >= 100; xpsnr >= bicubic + 0.5 dB |
+| 3 | FSRCNNX 720p to 1080p | end-to-end fps >= 1.2x source; xpsnr >= bicubic + 0.3 dB |
+| 4 | FSRCNNX 1080p to 2160p | scaler-only fps >= 34; end-to-end with QSV >= 1.2x; xpsnr >= bicubic + 0.3 dB |
+| 5 | Neural (ORT on OpenVINO) | record says `openvino`, not CPU; fps measured at 360p and 720p; slower than real time is a valid result |
+| 6 | Routing by source height | `NeuralMaxSourceHeight=480` sends a 720p source to the shader path, and the record says why |
+| 7 | fsr2 without CUDA, still pixels | after the first ceil(8*scale^2) frames (72 at 3x, 32 at 2x, 18 at 1.5x): mean consecutive-frame luma difference <= 0.5, per-frame max <= 16 in 99% of frames; FSRCNNX control exactly 0 |
+| 8 | fsr2 without CUDA, moving content | xpsnr on the panning cut >= bicubic (a miss is a result, not a blocker) |
+| 9 | Hardware decode off/on | on: `-hwaccel vaapi`, `hwmap=derive_device=vulkan`, no `Conversion failed!`, cpu time per frame >= 30% lower, xpsnr(on,off) >= 50 dB |
+| 10 | QSV encode | `h264_qsv`/`hevc_qsv` chosen; served segment codec matches; `/Gpu/Load` within 10 points of the fdinfo figure |
+| 11 | Contention with one Plex hardware transcode | fps >= 36 while it runs (the caller asserts the Plex transcode) |
+| 12 | Client, headless | forced transcode at 480p, 720p, 1080p and 2160p: target height, a QSV codec, the expected filter in the log |
+| 13 | Client, human | always `MANUAL`: browser, hard reload, `window.__jellyfinPlus.installed===true`, 5 min at two levels plus one 2160p output, two seeks, no stall over 2 s |
+
+**Gates.** A real run refuses to start unless `BENCH_ASSERT_QUIET=1` (the pod cannot see vzdump or
+other transcodes: the caller must), outside 01:00 to 07:00 and 16:30 to 18:30 Australia/Melbourne
+(drain, trivy, backups), and with memory PSI `some avg60` under 1%. Exit codes: 0, 1 if any row
+`FAIL`, 2 for a refusal.
+
+**Inputs the owner supplies.** The lossless clips (`<title>_{360,720,1080,2160}p.mkv`, `still_720p.png`,
+`pan_720p.mkv`, `pan_1080p.mkv`), an admin API token for the test Jellyfin, and an ONNX model for
+row 5. No library content is committed (AGENTS.md invariant 18).
+
+**Test.** `python3 scripts/test_bench_intel.py` checks the plan goldens (13 rows, must-pass lines,
+thresholds, command shapes), the refusals, a hermetic stub run, mutants of the script, and the
+Dockerfile's pins and checks (including this section's digest). It needs no GPU, network or docker.
+
+**Not verified.** An image build; any run on an Arc card (so the real execution of every row,
+the jq parsing of the plugin's API, the stream URL parameters and the fsr2 filter options are
+untested); the initContainer copy and the symlinks; the base image's layout (`/jellyfin`,
+`/jellyfin/jellyfin-web`); the derived runtime package names. The OpenCL compute runtime that
+OpenVINO's GPU device needs is not installed by the image and whether the base carries it is unchecked:
+row 5's `device=` figure is what shows a CPU fallback.
+
 ## 6. A380 measurements
 
 Reported by the owner from runs on an Intel Arc A380. **The method (source clips, frame counts,
