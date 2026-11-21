@@ -7,7 +7,7 @@
 # /usr/lib/jellyfin/bin, see CLAUDE.md "Deploying"). The harness compiles the real patcher sources
 # against them (scripts/gpu-vendor-harness), so it needs no GPU and no running Jellyfin.
 #
-# What it proves (docs/architecture/GPU_VENDORS.md, PR 1 and PR 2):
+# What it proves (docs/architecture/GPU_VENDORS.md, PR 1, PR 2 and PR 3):
 #   - the PCI vendor ids map to the right vendor (0x10de NVIDIA, 0x8086 Intel, anything else none);
 #   - auto picks NVIDIA first, the explicit settings override it, a vendor that was chosen and not
 #     found reports Detected=false instead of claiming a capability;
@@ -19,7 +19,16 @@
 #     encoder is refused, an NVENC setting is treated as auto, the chain never ends in the CUDA
 #     hand-off, and nothing emitted contains nvenc, cuda or vaapi;
 #   - (PR 2) the DRM fdinfo reader (i915 and xe fixtures, a fake /proc), the idle-residency reader,
-#     and GET /JellyfinPlus/Gpu/Load through the real controller.
+#     and GET /JellyfinPlus/Gpu/Load through the real controller;
+#   - (PR 3) on a no-GPU, an NVIDIA and a mixed machine the Vulkan device stays "vulkan=vk:0", the
+#     render-node test never runs, and the probe (the same keys and level lists as ShaderLibrary
+#     offers) and the status route carry nothing new; with an Intel GPU seen the Vulkan device is
+#     derived from its render node (never vk:0), falls back to vk:0 when the test start fails, a
+#     QSV device is pinned only above renderD135, a two-GPU machine gets the node of the vendor
+#     that was chosen, the NVIDIA-only levels (optix, dlpp, vsr-rtcuda, fsr2, dlss, dlaa) are
+#     withheld from the probe and not run on Intel, with the reason in the probe and the session
+#     record, and an NVIDIA session with the same request runs them;
+#   - (PR 3) the shim's optional render_node (scripts/test-shim-device.py, when python3 is present).
 #
 # Exit status: 0 every check passed, 1 a check failed, 2 the harness could not be built.
 set -uo pipefail
@@ -36,3 +45,15 @@ dotnet build "$HERE/gpu-vendor-harness/GpuVendorHarness.csproj" -c Release \
     -p:JellyfinBin="$(cd "$JFBIN" && pwd)" -o "$OUT" --nologo -v q || { echo "test-gpu-vendor: build failed" >&2; exit 2; }
 
 dotnet "$OUT/GpuVendorHarness.dll"
+status=$?
+
+if command -v python3 >/dev/null; then
+    echo
+    echo "shim device arguments (scripts/test-shim-device.py)"
+    python3 -I "$HERE/test-shim-device.py" || status=1
+else
+    echo
+    echo "test-gpu-vendor: python3 not found, so the shim device checks (scripts/test-shim-device.py) were NOT run"
+fi
+
+exit "$status"

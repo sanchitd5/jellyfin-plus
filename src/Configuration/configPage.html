@@ -809,6 +809,17 @@
                 return ' GPU: ' + found + node + ' (' + g.Reason + ').';
             }
 
+            // The levels this server's GPU cannot run, as the server reports them: only an Intel
+            // server sends any, and then every one needs NVIDIA. Nothing is said otherwise.
+            function withheldText(w) {
+                if (!w) { return ''; }
+                var names = [];
+                Object.keys(w).forEach(function (axis) {
+                    Object.keys(w[axis] || {}).forEach(function (level) { names.push(level); });
+                });
+                return names.length ? ' Not offered on this GPU (needs NVIDIA): ' + names.join(', ') + '.' : '';
+            }
+
             function loadStatus(page) {
                 ApiClient.ajax({
                     type: 'GET',
@@ -816,7 +827,7 @@
                     dataType: 'json'
                 }).then(function (s) {
                     page.querySelector('#patchStatus').textContent =
-                        'Filter injection: ' + s.PatchStatus + '. FFmpeg shim: ' + s.ShimSync + '.' + gpuText(s.Gpu);
+                        'Filter injection: ' + s.PatchStatus + '. FFmpeg shim: ' + s.ShimSync + '.' + gpuText(s.Gpu) + withheldText(s.Withheld);
                     var rows = (s.Sessions || []).map(function (a) {
                         // EncoderReason is a column of its own rather than a title attribute:
                         // a tooltip is invisible to touch and to the keyboard, so the reason a

@@ -2,14 +2,16 @@
 
 Design spec for making the enhancement engine vendor-aware. Written to be implemented as a series of
 small pull requests, each one landing on its own branch and verified before the next starts. **PR 1
-(detection and a report-only capability model, section 3) and PR 2 (the encoder per vendor and Intel
-load, sections 5.1 and 5.2) are built; the rest are the plan, with what is known, what was measured,
-and what is still a guess marked as such.** Nothing in PRs 3 to 8 is built. PR 1 and PR 2 build clean
-(plugin and patcher) against the Jellyfin 12.4 server assemblies and `scripts/test-gpu-vendor.sh`
-passes (581 checks) in a .NET 10 SDK container with no GPU. Neither has been run on an NVIDIA or an
-Intel box: the detection is untested against real sysfs, the Intel command line has not been run
-through ffmpeg, and the fdinfo parser has been run only against fixtures written from the kernel
-documentation, not against output captured from a machine.
+(detection and a report-only capability model, section 3), PR 2 (the encoder per vendor and Intel
+load, sections 5.1 and 5.2) and PR 3 (the Vulkan device from the render node, and the NVIDIA-only
+levels withheld on Intel, section 5.3) are built; the rest are the plan, with what is known, what was
+measured, and what is still a guess marked as such.** Nothing in PRs 5 to 8 is built (PR 4 was folded
+into PR 2). The three build clean (plugin and patcher) against the Jellyfin 12.4 server assemblies and
+`scripts/test-gpu-vendor.sh` passes (941 checks, plus 11 in `scripts/test-shim-device.py`) in a .NET 10
+SDK container with no GPU. None has been run on an NVIDIA or an Intel box: the detection is untested
+against real sysfs, the Intel command lines (the encoder, and the render-node device of PR 3) have not
+been run through ffmpeg, and the fdinfo parser has been run only against fixtures written from the
+kernel documentation, not against output captured from a machine.
 
 Today every GPU-specific decision in the engine assumes NVIDIA. This spec does not change that for
 anyone who has an NVIDIA card: with the card present, every ffmpeg command line this plugin builds
@@ -61,8 +63,8 @@ deblock CPU filters, the whole search and library half of the plugin.
 
 Finds out which GPU the server has, records it in a **capability record**, and shows the record in
 the places this plugin already reports what the server did. **In PR 1 nothing reads the record to
-decide anything** (PR 2 changed that for Intel only, section 5.1). No command line, no encoder choice,
-no level list changes, whatever the record says.
+decide anything** (PR 2 and PR 3 changed that for Intel only, sections 5.1 and 5.3). No command line,
+no encoder choice, no level list changes, whatever the record says.
 
 This is deliberate: it is the smallest change that makes the next seven PRs checkable. A later PR
 can be reviewed against a record that has been live on real servers, and the claim "NVIDIA command
@@ -167,6 +169,23 @@ older-kernel layouts. The load route is called through the real controller and i
 NVIDIA, Intel and mixed-box branches are checked. A mutation check (turning off the Intel gate on the
 two decisions) fails seven of these, so they do test what they name.
 
+PR 3 extends it again, in the same two directions. On a no-GPU, an NVIDIA and a mixed machine, for
+every `GpuVendor` value, the Vulkan device is still `vulkan=vk:0`, the QSV device is absent, the
+Vulkan-denoise probe and the AV1 test-encode command are the strings they were, the render-node test
+never runs, the session record carries `vk:0` and no withheld text, and the probe has exactly the 23
+keys it had with the level lists `ShaderLibrary` offers (and the status route has no new key). On Intel
+it asserts the derived device (never `vk:0`), the fallback to `vk:0` when the test start fails and the
+trust-it path when the test is inconclusive, the QSV pin at `renderD136` and above and not at 128 to
+135, a node name that is not a plain render node, two-GPU machines in both orders (Intel first and
+NVIDIA first, `auto`, `nvidia`, `intel`, two Intel GPUs, an AMD node beside an Intel one), that nothing
+Intel emits `nvenc`, `cuda` or `vaapi`, that the probe lists lose exactly the NVIDIA-only levels and
+report each as `needs NVIDIA`, that a session asking for `optix`, `dlpp-2` and `dlss` (or defaulted to
+them) is enhanced without them, with `GpuWithheld` and the summary saying so, and that the same
+sessions on an NVIDIA box run them. A mutation check (the Intel gate off in the device resolution, in
+the level withholding, in the probe lists, and the QSV pin range widened) fails 33, 12, 6 and 9 of
+these. The shim's `render_node` has its own 11 checks in `scripts/test-shim-device.py`, run by the
+script when python3 is present (the SDK container has none, so they were run separately).
+
 ## 4. The series
 
 Each PR is on its own branch, small, and ends with the check that proves it, in the project's own
@@ -243,10 +262,9 @@ it, so on Intel one frame is test-encoded with `av1_qsv` (once, remembered) and 
 `hevc_qsv`, or `h264_qsv` when the client cannot take HEVC. An inconclusive probe (no ffmpeg, a
 timeout) leaves the choice alone, as the NVIDIA guard does.
 
-**Not done here.** The Vulkan device is still `vk:0` (PR 3), so on a box with two GPUs the QSV
-session opens whichever device the QSV runtime picks, not necessarily the one in the record. The
-CUDA-only levels are not yet withheld from the probe on Intel (the Intel build of the patched ffmpeg,
-PR 8, lacks the filters, so the shim already strips them; a withheld-level change belongs with it).
+**Not done here, done in PR 3 (section 5.3).** The Vulkan device was still `vk:0`, and the CUDA-only
+levels were not withheld from the probe on Intel; PR 3 starts the Vulkan device from the render node and
+withholds those levels, with the reason reported.
 
 ### 5.2 Intel GPU load via DRM fdinfo (in PR 2)
 

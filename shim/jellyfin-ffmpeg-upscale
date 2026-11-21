@@ -67,6 +67,11 @@ DEFAULTS = {
     "shader_cache_dir": "/var/cache/jellyfin/gpu-upscale-shaders",
     "upscaler": "ewa_lanczos",
     "encoder": "hevc_nvenc",
+    # Unset keeps "-init_hw_device vulkan=vk:0", the first Vulkan device. On an Intel GPU, or a
+    # server with more than one, name the render node (for example "/dev/dri/renderD129") and the
+    # Vulkan device is derived from it. Nothing here detects a GPU or tests the node: set it only
+    # where you know it, and use an encoder that GPU can run ("hevc_qsv" on Intel).
+    "render_node": None,
     "min_scale_factor": 1.15,     # skip near-identity upscales
     # Below this ratio the fixed-2x network is skipped and the chain is plain scaling plus the
     # sharpener. Measured: libplacebo shrinks a 2x network's output back, and at 1.5x what
@@ -432,6 +437,19 @@ def build_chain(cfg, tw, th, ratio):
     return "format=yuv420p,hwupload,%s,hwdownload,format=yuv420p" % placebo
 
 
+def device_args(cfg):
+    """The Vulkan device arguments: the first Vulkan device, or one derived from render_node.
+
+    Only a plain /dev/dri/renderD<digits> path is used; anything else keeps vk:0 rather than put
+    an unvetted string on the command line.
+    """
+    node = cfg.get("render_node")
+    if isinstance(node, str) and re.fullmatch(r"/dev/dri/renderD[0-9]+", node):
+        return ["-init_hw_device", "drm=dr:" + node, "-init_hw_device", "vulkan=vk@dr",
+                "-filter_hw_device", "vk"]
+    return ["-init_hw_device", "vulkan=vk:0", "-filter_hw_device", "vk"]
+
+
 def rewrite_args(cfg, args, chain):
     """Strip decode-side hwaccel, force a real encoder, install our filter chain."""
     drop_with_value = {"-hwaccel", "-hwaccel_output_format", "-hwaccel_device",
@@ -462,7 +480,7 @@ def rewrite_args(cfg, args, chain):
         # everything after the last -i and before the output file (the last arg).
         out = out[:-1] + ["-vf", chain] + out[-1:]
 
-    return ["-init_hw_device", "vulkan=vk:0", "-filter_hw_device", "vk"] + out
+    return device_args(cfg) + out
 
 
 # Held open, and locked, for as long as this shim runs: the lock is what proves the
