@@ -45,7 +45,7 @@ has to make vendor-aware, or consciously leave NVIDIA-only.
 | `UpscaleEngine.HwaccelArgs` | `-init_hw_device vulkan=vk:0`: the first Vulkan device, whichever GPU that is. Correct on a one-GPU box and on this project's test box; wrong the moment two GPUs are present | PR 3 |
 | `BuildChain`, `GpuResidentEncode` | The end of the chain is `hwmap=derive_device=cuda` (Vulkan frame handed to NVENC as a CUDA frame, `ffmpeg/0006`) | PR 2 |
 | `GpuLoadController` (`GET /JellyfinPlus/Gpu/Load`) | NVENC session count from `nvidia-smi --query-gpu=encoder.stats.sessionCount` | PR 2 (section 5.2) |
-| CUDA-only levels | `optix` denoise, `dlss` / `dlaa`, `dlpp-1..4`, `vsr-rtcuda` need CUDA (and, for DLSS, the NVIDIA runtime the operator fetches) | Offered only when the capability says CUDA is available (PR 2) |
+| CUDA-only levels | `optix` denoise, `dlss` / `dlaa`, `dlpp-1..4`, `vsr-rtcuda` need CUDA (and, for DLSS, the NVIDIA runtime the operator fetches); `fsr2` is fed by NVOFA motion vectors through CUDA | Withheld from the probe on a detected Intel GPU, and reported as "needs NVIDIA" (PR 3, section 5.3) |
 | `vf_ort` | The ONNX Runtime filter creates a CUDA execution provider and falls back to the CPU one (`ffmpeg/vf_ort.c`, option `device` = `cuda` / `cpu`) | PR 5 |
 | `gu_inputs.h` (`vf_fsr2`, `vf_dlss`) | Motion vectors come from NVOFA optical flow (`libnvidia-opticalflow`), through CUDA | PR 6 |
 | Decode | The decoder patches drop `-hwaccel` and `-c:v *_cuvid` so frames reach `hwupload` in system memory; only the CUDA-native levels keep a CUDA hwaccel | PR 7 |
@@ -178,7 +178,7 @@ verified on the real box.
 |---|---|---|---|
 | 1 | Detection and the report-only capability record (section 3) | none | Harness; the record shown live on an NVIDIA box and an Intel box; command lines unchanged |
 | 2 | Encoder per vendor and Intel load (the old PR 2 and PR 4 together, section 5.1 and 5.2): map the negotiated codec to `*_nvenc` or `*_qsv`; a `*_nvenc` setting on an Intel box is treated as auto and said so; Jellyfin's own `*_qsv` choice is kept; `GuardAv1` test-encodes `av1_qsv` on Intel; the GPU-resident encode (`hwmap=derive_device=cuda`) is NVIDIA-only and reported n/a on Intel; `Gpu/Load` gains `vendor`, `encoderSessions`, `gpuBusyPercent` from DRM fdinfo | 1 | Served segment codec and size on each vendor; NVIDIA command byte-identical; busy percentage under a known encode |
-| 3 | The Vulkan device from the render node instead of `vk:0` | 1 | Command on a two-GPU box names the right device; one-GPU command unchanged |
+| 3 | The Vulkan device from the render node instead of `vk:0`, on Intel only (section 5.3); the QSV device pinned to the same node where the encoder would not find it by itself; the NVIDIA-only levels (`optix`, `dlpp-*`, `vsr-rtcuda`, `fsr2`, `dlss`, `dlaa`) withheld from the probe on Intel and reported as "needs NVIDIA"; `MaxConcurrent` 1 for 4K output on a small Intel GPU recommended in docs, default unchanged | 1, 2 | Command on a two-GPU box names the right device; NVIDIA, `none` and one-GPU commands unchanged; the probe on an Intel box lacks the NVIDIA-only levels |
 | 4 | Folded into PR 2 (Intel load via DRM fdinfo, section 5.2) | 1 | see PR 2 |
 | 5 | `vf_ort` OpenVINO execution provider, `NeuralMaxSourceHeight` | 1, 8 | Neural level offered and running on Intel; a served segment |
 | 6 | `gu_inputs` without CUDA | 5 | Motion vectors from a non-NVOFA source, compared by the project's temporal measurements |
@@ -286,16 +286,98 @@ into it. `intel_gpu_top` and perf are never required. Sampling is two reads (the
 300 ms between them, later calls reuse the previous sample when it is 0.5 to 30 s old), the result is
 cached for 5 s and single-flighted, as the NVENC count is, and a failure is null, never an error.
 
-### 5.3 PR 3: the Vulkan device from the render node
+### 5.3 PR 3: the Vulkan device from the render node, and the NVIDIA-only levels on Intel
 
-`-init_hw_device vulkan=vk:0` picks the first Vulkan device. With an Intel and an NVIDIA card both
-present, which is "0" is up to the loader, and the chain can run on the wrong GPU while the record
-says otherwise. The render node in the capability record is the stable handle: a Vulkan device
-reports its DRM render node through `VK_EXT_physical_device_drm`, so the device is chosen by
-matching that, or, where the pinned jellyfin-ffmpeg cannot select by DRM node, by enumerating once
-and caching the index for that node. Which of the two the pinned build supports is **not yet
-checked**; PR 3 starts by checking it on the real binary. When the record has no render node (an
-NVIDIA GPU without `nvidia_drm`), the argument stays `vk:0` exactly as today.
+Two changes, both taken only on the Intel path (`UpscaleEngine.IsIntelPath`: vendor `intel` and an
+Intel GPU seen). NVIDIA, `none` and an Intel setting with no Intel GPU behind it keep every string
+they have today, byte for byte (section 7), so this PR does not touch the NVIDIA device choice
+either: on a box with both vendors and `GpuVendor` `auto` the chain is NVIDIA's and the device stays
+`vk:0` exactly as before (set `GpuVendor` to `intel` to choose the Intel card). That leaves the
+existing wrong-GPU risk on a mixed NVIDIA box where the Vulkan loader lists the Intel card first; it
+is not made worse, and is left for a change that is allowed to alter an NVIDIA command line.
+
+**The device, decided from the jellyfin-ffmpeg 8.1.3 source (this answers open question 2).** The
+pinned build can start the Vulkan device from a DRM render node:
+
+```
+-init_hw_device drm=dr:/dev/dri/renderD129 -init_hw_device vulkan=vk@dr -filter_hw_device vk
+```
+
+- `fftools/ffmpeg_hw.c`, `hw_device_init_from_string`: `type=name:device` creates a device from a
+  path and `type=name@source` derives one from a named device.
+- `libavutil/hwcontext_drm.c`, `drm_device_create`: opens the path read-write and asks libdrm for its
+  version; a path that is not a DRM node is an error.
+- `libavutil/hwcontext_vulkan.c`, `vulkan_device_derive`, case `AV_HWDEVICE_TYPE_DRM` (compiled in
+  with libdrm: jellyfin-ffmpeg's `debian/rules` passes `--enable-libdrm`, as does the Linux builder's
+  libdrm script): it reads the node's PCI device id with `drmGetDevice` and hands it to
+  `find_device`, which picks the Vulkan physical device whose `deviceID` matches.
+- Jellyfin's own server code builds the same shape for its Vulkan path: `MediaBrowser.Controller.dll`
+  (12.4) carries the strings `-init_hw_device drm={0}:{1}` and `-init_hw_device vulkan={0}{1}`, the
+  names `dr`, `vk` and `qs`, and `/dev/dri/renderD128` as its default node. That is read from the
+  assembly's string table, not seen in a run.
+
+Two details of that source matter and are worth stating because they are not what the code's own
+comments suggest. First, the selection is **by PCI device id, not by node**: `vulkan_device_derive`
+also records the node's major and minor from `fstat` of the open descriptor (`st_dev`, which for a
+device file is the filesystem's device, not the node's `st_rdev`), but `find_device` only consults
+that when `VK_EXT_physical_device_drm` is already enabled, and that is a device extension
+(`optional_device_exts`) enabled after `find_device` has chosen, so the branch is skipped and the PCI
+id decides. Two GPUs of different models are told apart correctly; **two identical cards (two A380s)
+are not**: the first in Vulkan's order is taken whichever node was asked for. Second, a derive that
+cannot find a device is an error that ends the session's ffmpeg, a dead stream, not a degraded one.
+
+So the Intel device is checked before it is used. The first time it is needed the engine runs the
+stock ffmpeg once with exactly this device initialisation and a one-frame `hwupload,hwdownload`
+(the pattern `Av1QsvUsable` and `VulkanDenoiseRunsOnPatchedBinary` already follow), remembers the
+answer, and reports it. A failed check falls back to `vk:0` (today's behaviour, so this PR cannot
+turn a working Intel box into a dead one) and says so in the session record; an inconclusive check (no
+ffmpeg found, a timeout) trusts the render node, since nothing else would run either. When the record
+has no usable render node path, the argument is `vk:0`. The node text is only ever the detector's own
+`/dev/dri/renderD<digits>`; anything else is not put on a command line.
+
+**The QSV device (also decided from the source).** Nothing needs to be added in the common case. With
+no QSV device on the command line, `qsvenc_init_session` opens an internal session, and
+`ff_qsv_set_display_handle` (`libavcodec/qsv.c`) creates a VA-API device with `vendor_id=0x8086`;
+`vaapi_device_create` then walks `/dev/dri/renderD128` to `renderD135` (`max_devices = 8`) and takes
+the first node of that vendor. The detector's render node is the first Intel node in numeric order,
+so the two agree for every node from 128 to 135, which is every machine that is not unusual. Above
+that the implicit search never reaches the node, so there (and only there, and only when ffmpeg lists
+a QSV encoder) the arguments gain `-init_hw_device qsv=qs:hw_any,child_device=<node>`, which is what
+`-qsv_device <node>` expands to (`opt_qsv_device`). The encoder takes the one QSV device on the
+command line (`hw_device_setup_for_encode`, `HW_CONFIG_ENCODER_DEVICE(NV12, QSV)`). The one-GPU
+command is therefore unchanged from PR 2 apart from the Vulkan device. What this does not do is let
+an operator choose between two Intel GPUs: the first Intel node wins, as it does in the detector.
+
+**Where it applies.** One function builds the device arguments and both the session command
+(`HwaccelArgs`) and the two engine probes that start a Vulkan or QSV device use it, so a probe tests
+the device a session will use. The shim fallback reads an optional `render_node` from its JSON
+(unset keeps `vulkan=vk:0`); it has no vendor detection and no probe, so it is for an operator who
+knows the node.
+
+**The NVIDIA-only levels.** On the Intel path these are not offered and are not run, and the reason
+is stated, never silent:
+
+| Axis | Withheld | Why |
+|---|---|---|
+| Denoise | `optix`, `optix-temporal` (and the unlisted `optix-hdr`) | OptiX needs CUDA frames |
+| Neural | `dlpp-1` to `dlpp-4`, `vsr-rtcuda` (and the retired `vsr`) | NVIDIA RTX DLPP / VSR libraries over CUDA |
+| Game | `fsr2`, `dlss`, `dlaa` | DLSS is NVIDIA's; `fsr2` is fed by NVOFA motion vectors through CUDA (`gu_inputs.h`), which is PR 6's problem |
+
+Each is removed from the probe lists (`Levels.Denoise`, `Neural`, `Game`, `GameOptionLevels` and the
+label maps), so the client, which builds its menu from the probe, never offers it. A server whose
+dashboard default or a stale client still asks for one gets `off` for that axis and the session says
+so: `SessionRecord.GpuWithheld` and a sentence in the summary ("... NOT run, needs NVIDIA ..."), with
+`NeuralRequested` still naming what was asked. The probe carries `Levels.Withheld` (axis, level,
+`needs NVIDIA`) and the status route the same, **only on the Intel path**, so the NVIDIA probe and
+status are unchanged, and the dashboard's GPU line lists them. Left alone on purpose: the ONNX
+neural levels (`ort`) fall back to ONNX Runtime's CPU provider without CUDA, which is not CUDA-required
+but is almost certainly not real time; PR 5 owns that (OpenVINO and `NeuralMaxSourceHeight`), and until
+then the record's neural description says CUDA is not what ran on Intel.
+
+**Recommended in documentation only: `MaxConcurrent` 1 for 4K output on a small Intel GPU.** The one
+measurement there is (section 6) is a single session, 1080p to 2160p at 38 to 40 fps on an A380.
+That is a margin over real time for one session, nothing is known for two, and the default of 4 would
+admit four. The setting is not changed.
 
 ### 5.4 PR 5: `vf_ort` on OpenVINO, and routing by source height
 
@@ -403,8 +485,7 @@ encode, the neural levels, or more than one session.
 ## 8. Open questions
 
 1. ~~`vaapi` or `qsv` as the Intel encode family~~ Decided for `qsv` from the source (section 5.1); the CPU cost of the yuv420p to nv12 conversion is still unmeasured.
-2. Whether the pinned jellyfin-ffmpeg can select the Vulkan device by DRM node, or the index must be
-   discovered (PR 3).
+2. ~~Whether the pinned jellyfin-ffmpeg can select the Vulkan device by DRM node~~ It can, by derivation from a DRM device, and the selection is by PCI device id, so two identical cards are not told apart (section 5.3). Unverified on a binary and a machine.
 3. The real cause of the VA-API to Vulkan failure; the derived-device explanation is a hypothesis
    (PR 7).
 4. Neural throughput on the A380, and so the default for `NeuralMaxSourceHeight` (PR 5).
