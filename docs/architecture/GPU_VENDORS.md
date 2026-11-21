@@ -4,8 +4,9 @@ Design spec for making the enhancement engine vendor-aware. Written to be implem
 small pull requests, each one landing on its own branch and verified before the next starts. **PR 1
 (detection and a report-only capability model) is built (section 3); the rest are the plan, with
 what is known, what was measured, and what is still a guess marked as such.** Nothing in PRs 2 to 8
-is built. PR 1 compiled and ran nowhere yet: the author had no .NET SDK or server DLLs, so the first
-run of `scripts/test-gpu-vendor.sh` is still to come (section 3.6).
+is built. PR 1 builds clean (plugin and patcher) against the Jellyfin 12.4 server assemblies and
+`scripts/test-gpu-vendor.sh` passes (113 checks) in a .NET 10 SDK container with no GPU. It has not
+been run on an NVIDIA or an Intel box, so the detection itself is untested against real sysfs.
 
 Today every GPU-specific decision in the engine assumes NVIDIA. This spec does not change that for
 anyone who has an NVIDIA card: with the card present, every ffmpeg command line this plugin builds
