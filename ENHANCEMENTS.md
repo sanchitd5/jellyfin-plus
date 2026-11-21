@@ -154,7 +154,7 @@ capability. It is reported in `Levels.Gpu` on the probe, `Gpu` on `GET /Jellyfin
 dashboard's status line), and `Gpu` on each `SessionRecord` (so `Record.Gpu`, and flat `Gpu`, on
 `GET /JellyfinPlus/Session/{id}`).
 
-Four things read it to decide, and only when `Vendor` is `intel` **and** `Detected` is true
+Five things read it to decide, and only when `Vendor` is `intel` **and** `Detected` is true
 (`UpscaleEngine.IsIntelPath`), so every other server, an Intel setting with no Intel GPU included,
 keeps the code path that existed before the setting did:
 
@@ -204,14 +204,44 @@ keeps the code path that existed before the setting did:
   the status reason say so; `NeuralRequested` still names what was asked. `Levels.Withheld` and
   `Withheld` on `GET /JellyfinPlus/Status` list axis, level and `needs NVIDIA`, **only on a detected
   Intel server**, so the NVIDIA probe and status have exactly the keys they had, and the dashboard's
-  GPU line names them. Not withheld: the ONNX neural levels (`ort`); without CUDA they run on ONNX
-  Runtime's CPU provider, which the session summary now says on Intel, and which is not measured for
-  this chain (GPU_VENDORS.md 5.4).
+  GPU line names them. Not withheld: the ONNX neural levels (`ort`), which have their own device
+  (next bullet).
+- **The ONNX neural level's device.** The `ort` filter (`ffmpeg/vf_ort.c`) gained `device=openvino`
+  beside `cuda` (the default) and `cpu`: ONNX Runtime's OpenVINO provider on an Intel GPU
+  (`device_id` is the GPU number, 0 meaning OpenVINO's `GPU`). If the provider will not append, or a
+  session will not build with it, the filter warns and builds a CPU session, as the CUDA branch always
+  did. On a detected Intel server `ShaderLibrary.NeuralFilter` adds `:device=openvino` when
+  `libonnxruntime_providers_openvino.so` is in `ort/lib` (the record's `OpenVinoAvailable`) and
+  `:device=cpu` when it is not; on every other server the node carries no `device` option and is the
+  string it always was. `SessionRecord.NeuralDevice` (`openvino`, `cpu`, `cuda`; null when no ONNX
+  level ran) says what the command **asked for** (whether ONNX Runtime loaded the provider is only in
+  ffmpeg's log), `NeuralDeviceNote` says why it is the CPU on Intel, and both are flat on the session
+  route and in the Recent sessions summary. The OpenVINO runtime is built in by
+  `scripts/build-ffmpeg.sh` with `ORT_EP=openvino` (NEURAL.md; the build needs no OptiX or other NVIDIA SDK,
+  but still installs FFmpeg's nvcodec headers and the CUDA hwmap patches until the Intel build of
+  GPU_VENDORS.md PR 8). Unmeasured on an Intel GPU.
+- **Source-height routing, `NeuralMaxSourceHeight`** (dashboard, Neural and game upscalers; 0, the default,
+  does nothing and every string and the probe stay as they were). Above 0, for the ONNX levels only
+  (not `dlpp-*` or `vsr-rtcuda`): a source whose upright height is at or below it gets the neural level,
+  and a source above it does not. "Gets" means the session's choice or the dashboard's `NeuralLevel`
+  when one is set; when neither names a level, the viewer did not choose Off, the session is being
+  upscaled and no game upscaler is in force, the cheapest installed weight is chosen (on Intel only if
+  the OpenVINO provider is installed: a network on the CPU is never chosen for a viewer, though one
+  asked for by name still runs there). "Does not" means an ONNX level that was asked for is dropped and
+  the shader path runs. `SessionRecord.NeuralRouting` (flat on the session route, and in the summary)
+  says which, and `NeuralRequested` still names what was asked (`off` when the engine chose). The probe
+  gains `Levels.NeuralMaxSourceHeight` only when the value is above 0. 480 is the recommended value on
+  Intel and is not measured; the cost arithmetic is in GPU_VENDORS.md 5.4 and NEURAL.md.
 
-Not done by this: choosing between two Intel GPUs, OpenVINO, hardware decode. The plan for the rest is
+Not done by this: choosing between two Intel GPUs (OpenVINO's own GPU numbering is not mapped to the
+render node either), hardware decode, an Intel ffmpeg build, a client-panel hint when a chosen level
+will be dropped for a tall source. The plan for the rest is
 [GPU_VENDORS.md](docs/architecture/GPU_VENDORS.md). Tests: `scripts/test-gpu-vendor.sh <jfbin>`
 (compiles the real patcher sources, the DRM fdinfo reader and the load controller, and runs
 `scripts/test-shim-device.py` when python3 is present; not run in CI, needs the server's DLLs).
+`scripts/test-vf-ort.sh` compiles `ffmpeg/vf_ort.c` against FFmpeg 8.1.2's headers and the ONNX Runtime
+1.24.1 header and checks the filter's provider calls against a fake ONNX Runtime (gcc and network, no
+GPU; an arm64 container is enough), and, with `ORT_LIB_DIR` and `ORT_MODEL` set, against a real one.
 
 **Sizing on a small Intel GPU.** The one measurement (an Arc A380, one session, 1080p to 2160p with
 FSRCNNX: 38 to 40 fps) leaves little over real time for a single 4K session and says nothing about two.
@@ -228,7 +258,8 @@ to one that GPU can run (`hevc_qsv` on Intel) yourself.
 **Defaults to know.** From `src/Configuration/PluginConfiguration.cs`: `Enabled` true, `TargetHeight`
 1080, `MaxTargetHeight` 2160, `SrLevel` `fsrcnnx`, `MaxConcurrent` 4, `MaxConcurrentSwaps` 4,
 `RequireClientOptIn` false, `ForceTranscode` false, `ForceTranscodeForDirectPlay` false, `Encoder`
-`hevc_nvenc`, `GpuVendor` `auto`, `MinScaleFactor` 1.15, `SrMinScaleFactor` 1.60, `MaxSourceHeight` 1440. Deblur, denoise,
+`hevc_nvenc`, `GpuVendor` `auto`, `MinScaleFactor` 1.15, `SrMinScaleFactor` 1.60, `MaxSourceHeight` 1440,
+`NeuralMaxSourceHeight` 0. Deblur, denoise,
 deblock, neural, game, refine and chroma defaults are all `off`. The README configuration table lists
 `MaxConcurrent` 2 and `RequireClientOptIn` true; the code says 4 and false.
 

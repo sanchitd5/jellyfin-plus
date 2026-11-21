@@ -217,6 +217,13 @@ namespace Jellyfin.Plugin.Plus.Patcher
                 levels["Withheld"] = withheld;
             }
 
+            // Present only when the operator turned routing on, so a server that never set it serves
+            // the probe it always did. The ONNX levels run only for sources at or below this height.
+            if ((cfg?.NeuralMaxSourceHeight ?? 0) > 0)
+            {
+                levels["NeuralMaxSourceHeight"] = cfg.NeuralMaxSourceHeight;
+            }
+
             return levels;
         }
 
@@ -295,6 +302,8 @@ namespace Jellyfin.Plugin.Plus.Patcher
                     ["NeuralLevel"] = "off",
                     ["NeuralApplied"] = false,
                     ["NeuralRequested"] = "off",
+                    ["NeuralDevice"] = null,
+                    ["NeuralRouting"] = null,
                     ["SourceWidth"] = 0,
                     ["SourceHeight"] = 0,
                     ["OutputWidth"] = 0,
@@ -330,6 +339,10 @@ namespace Jellyfin.Plugin.Plus.Patcher
                 // of showing a dropped network exactly like one nobody selected.
                 ["NeuralApplied"] = record.NeuralApplied,
                 ["NeuralRequested"] = record.NeuralRequested ?? "off",
+                // What the ort filter was asked to run on, and what NeuralMaxSourceHeight did: both
+                // null when they did nothing, so a server that never set the height sees only nulls.
+                ["NeuralDevice"] = record.NeuralDevice,
+                ["NeuralRouting"] = record.NeuralRouting,
                 // Flat, not only nested in Record: these four are the single end-to-end proof that
                 // the size axis did anything, and the panel cannot reach them where they are.
                 ["SourceWidth"] = record.SourceWidth,

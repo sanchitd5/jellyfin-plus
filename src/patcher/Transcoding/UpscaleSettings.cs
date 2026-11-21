@@ -177,6 +177,16 @@ namespace Jellyfin.Plugin.Plus.Patcher
         public bool NeuralAllowed { get; set; } = true;
 
         /// <summary>
+        /// Route the ONNX neural levels by upright source height. Mirrors
+        /// PluginConfiguration.NeuralMaxSourceHeight. 0 (the default) changes nothing. Above 0, at or
+        /// below it the neural level is used (chosen automatically only when nothing names one, an
+        /// operator set this, and, on Intel, the OpenVINO provider is installed); above it a neural
+        /// level that was asked for is not run and the shader path is. Read by
+        /// UpscaleEngine.Decide; docs/architecture/GPU_VENDORS.md 5.4.
+        /// </summary>
+        public int NeuralMaxSourceHeight { get; set; }
+
+        /// <summary>
         /// Game temporal upscaler applied by default: off, fsr2, dlss, dlaa. OFF, and it stays
         /// off: these are renderer algorithms fed inputs recorded video cannot supply. See the
         /// block above ShaderLibrary._gameFilters.

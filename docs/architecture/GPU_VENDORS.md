@@ -3,14 +3,17 @@
 Design spec for making the enhancement engine vendor-aware. Written to be implemented as a series of
 small pull requests, each one landing on its own branch and verified before the next starts. **PR 1
 (detection and a report-only capability model, section 3), PR 2 (the encoder per vendor and Intel
-load, sections 5.1 and 5.2) and PR 3 (the Vulkan device from the render node, and the NVIDIA-only
-levels withheld on Intel, section 5.3) are built; the rest are the plan, with what is known, what was
-measured, and what is still a guess marked as such.** Nothing in PRs 5 to 8 is built (PR 4 was folded
-into PR 2). The three build clean (plugin and patcher) against the Jellyfin 12.4 server assemblies and
-`scripts/test-gpu-vendor.sh` passes (941 checks, plus 11 in `scripts/test-shim-device.py`) in a .NET 10
-SDK container with no GPU. None has been run on an NVIDIA or an Intel box: the detection is untested
-against real sysfs, the Intel command lines (the encoder, and the render-node device of PR 3) have not
-been run through ffmpeg, and the fdinfo parser has been run only against fixtures written from the
+load, sections 5.1 and 5.2), PR 3 (the Vulkan device from the render node, and the NVIDIA-only
+levels withheld on Intel, section 5.3) and PR 5 (the ONNX neural level on OpenVINO, routing by source
+height, and the `ORT_EP` build, section 5.4) are built; the rest are the plan, with what is known, what
+was measured, and what is still a guess marked as such.** Nothing in PRs 6 to 8 is built (PR 4 was
+folded into PR 2). The four build clean (plugin and patcher) against the Jellyfin 12.4 server assemblies
+and `scripts/test-gpu-vendor.sh` passes (1082 checks, plus 11 in `scripts/test-shim-device.py`) in a .NET
+10 SDK container with no GPU; `scripts/test-vf-ort.sh` compiles `ffmpeg/vf_ort.c` against FFmpeg 8.1.2
+and checks its provider calls (28 checks). None has been run on an NVIDIA or an Intel box: the detection is untested
+against real sysfs, the Intel command lines (the encoder, the render-node device of PR 3 and the
+OpenVINO device of PR 5) have not been run through ffmpeg, the OpenVINO provider has been exercised
+only on a machine with no GPU, and the fdinfo parser has been run only against fixtures written from the
 kernel documentation, not against output captured from a machine.
 
 Today every GPU-specific decision in the engine assumes NVIDIA. This spec does not change that for
@@ -185,6 +188,25 @@ sessions on an NVIDIA box run them. A mutation check (the Intel gate off in the 
 the level withholding, in the probe lists, and the QSV pin range widened) fails 33, 12, 6 and 9 of
 these. The shim's `render_node` has its own 11 checks in `scripts/test-shim-device.py`, run by the
 script when python3 is present (the SDK container has none, so they were run separately).
+
+PR 5 extends it in the same two directions, plus the C side. With `NeuralMaxSourceHeight` at 0 and no
+Intel GPU seen, the `ort` node is the string it was (written out by hand) on a no-GPU, an NVIDIA and
+a mixed machine, for every `GpuVendor` value, with the OpenVINO provider file present and absent, and
+on an Intel box the setting did not choose; the probe has no new key. On Intel the node carries
+`device=openvino` with the provider file and `device=cpu` without it, with the plan's and the record's
+device and note and the summary's words; `ShaderLibrary.NeuralFilter` takes only those two values. The
+routing is asserted by value on NVIDIA and on Intel with OpenVINO at 240, 360 and 480 (chosen) and 481
+to 1080 (shader path), for a level asked for by the session and by the dashboard (runs below the line,
+dropped above it, and says so), a viewer who chose Off or upscale Off, a session with nothing to
+upscale, a source stored sideways, the master switch, no weights installed, a CUDA-native level, a game
+upscaler in force, and Intel without the provider (nothing chosen, said, and a named level still
+runs on the CPU); and the probe key appears only above 0. A mutation check (routing on at 0, the
+device argument given to every server, OpenVINO assumed present, the boundary moved by one, the
+CPU choice allowed, the CUDA-native levels routed, a viewer's Off ignored, the probe key always
+present) fails 67, 34, 9, 4, 3, 1, 2 and 17 of these. `scripts/test-vf-ort.sh` compiles `ffmpeg/vf_ort.c` against
+FFmpeg 8.1.2's headers and the ONNX Runtime 1.24.1 header (`-Wall -Wextra -Werror`) and runs
+`init_session` against a fake `OrtApi` for `device=cuda`, `cpu` and `openvino`, with the append failing
+and with the session failing, and checks the CUDA call sequence NVIDIA runs is unchanged.
 
 ## 4. The series
 
@@ -417,10 +439,12 @@ run):
   GPU and an Arc card `GPU` may be the integrated one. **Unverified**, and the reason Intel-with-two-
   GPUs stays "first node wins" (section 5.3).
 - The filter's contract does not change: warn and run on the CPU rather than fail the session. That
-  covers the provider failing to append and now also the session failing to build with it (an
-  OpenVINO device error shows up in `CreateSession`, not in the append), in which case the filter
-  builds a fresh session on the CPU provider once and says so in the log. The CUDA branch is not
-  edited.
+  covers the provider failing to append and also the session failing to build with it, in which case
+  the filter builds a fresh session on the CPU provider once and says so in the log. Run against the
+  real 1.24.1 provider (x86-64 under emulation on an arm64 host, so no GPU), the failure is at the append (`[OpenVINO] Device GPU
+  is not available`), so that is the path that has been seen; the second, in `CreateSession` (a model
+  the provider cannot compile for the device), is covered by a fake and has not been seen. The CUDA
+  branch is not edited.
 - The provider is a separate shared object (`libonnxruntime_providers_openvino.so`) that ONNX Runtime
   loads at run time, so `vf_ort.c` does not link OpenVINO. OpenVINO is Apache-2.0, which is why the
   combined binary is GPLv3 (the OIDN-linking build already is, `scripts/build-ffmpeg.sh` header, and
@@ -510,8 +534,9 @@ today's path, unedited).
   by version and checked against its sha256, and stages the libraries under `<prefix>/ort/lib`, the
   directory the binary's rpath and `OpenVinoAvailable` already name. The core and the provider must be
   the same ORT version, so the headers come from the same version too: the script fetches the
-  `Microsoft.ML.OnnxRuntime` 1.24.1 package from nuget.org (sha256 pinned), takes only
-  `onnxruntime_c_api.h`, and checks `ORT_API_VERSION` against the runtime. One ORT per binary: the
+  `Microsoft.ML.OnnxRuntime` 1.24.1 package from nuget.org, takes only `onnxruntime_c_api.h` and the
+  one header it includes, by range request (`scripts/fetch-ort-header.py`, a sha256 per file), and
+  checks `ORT_API_VERSION` against the runtime. One ORT per binary: the
   CUDA build and the OpenVINO build are different ORT cores, so a server with both vendors builds for
   the one it uses (`GpuVendor`).
 - *What still needs NVIDIA headers.* `nv-codec-headers` (FFmpeg's own MIT headers; the driver is
@@ -537,7 +562,11 @@ the setting is on and its absence when it is 0. For the C side, `scripts/test-vf
 container (a native arm64 container is enough for a compile-only check; it says nothing about x86
 code generation or about running a model), then links the filter's session setup against a fake
 `OrtApi` and checks which provider calls it makes for each `device` value and that an OpenVINO
-failure builds a CPU session instead of ending the filter. It is not a run on an Intel GPU.
+failure builds a CPU session instead of ending the filter. With `ORT_LIB_DIR` and `ORT_MODEL` set it
+also runs the same setup against a real ONNX Runtime and model (`scripts/vf-ort-test/provider_real.c`),
+which is the line to read on the Intel server: `device_name=openvino` there, `device_name=cpu` after a
+warning anywhere the GPU is not usable. It has been run only with no GPU: OpenVINO's CPU device accepted the
+append and built a session, and `device=openvino` fell back to the CPU as above.
 
 ### 5.5 PR 6: `gu_inputs` without CUDA
 

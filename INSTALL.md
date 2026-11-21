@@ -207,6 +207,11 @@ Dashboard → Plugins → **Jellyfin Plus**. Sensible starting point:
 - `SrMinScaleFactor` = 1.60 — below this ratio the SR network is skipped, because fixed-2x networks
   measure at or below plain scaling there. Sharpening and denoise still run
 - `MaxConcurrent` = 2 to start, raise once you have watched real GPU load
+- `NeuralMaxSourceHeight` = 0 (the default). Only for an Intel GPU with the OpenVINO build of the ort
+  filter (docs/filters/NEURAL.md, "Building for Intel"): 480 sends sources of 480p and below to a
+  neural level and everything taller to the shader path. It is the recommended value and it is not
+  measured on any Intel GPU, so set `NeuralLevel` to `realesr-anime-x2`, watch the GPU, and leave it 0
+  until you have measured one
 - `RequireClientOptIn` = true, so nothing is enhanced until a viewer asks
 - `ForceTranscodeForDirectPlay` = false until you have read what it costs
 

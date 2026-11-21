@@ -7,7 +7,7 @@
 # /usr/lib/jellyfin/bin, see CLAUDE.md "Deploying"). The harness compiles the real patcher sources
 # against them (scripts/gpu-vendor-harness), so it needs no GPU and no running Jellyfin.
 #
-# What it proves (docs/architecture/GPU_VENDORS.md, PR 1, PR 2 and PR 3):
+# What it proves (docs/architecture/GPU_VENDORS.md, PR 1, PR 2, PR 3 and PR 5):
 #   - the PCI vendor ids map to the right vendor (0x10de NVIDIA, 0x8086 Intel, anything else none);
 #   - auto picks NVIDIA first, the explicit settings override it, a vendor that was chosen and not
 #     found reports Detected=false instead of claiming a capability;
@@ -28,7 +28,14 @@
 #     that was chosen, the NVIDIA-only levels (optix, dlpp, vsr-rtcuda, fsr2, dlss, dlaa) are
 #     withheld from the probe and not run on Intel, with the reason in the probe and the session
 #     record, and an NVIDIA session with the same request runs them;
-#   - (PR 3) the shim's optional render_node (scripts/test-shim-device.py, when python3 is present).
+#   - (PR 3) the shim's optional render_node (scripts/test-shim-device.py, when python3 is present);
+#   - (PR 5) the ort node is byte-identical on every server that is not a detected Intel one, whatever
+#     the OpenVINO provider file or the setting says; on Intel it asks for device=openvino with the
+#     provider file and device=cpu without it, with the reason in the record; and NeuralMaxSourceHeight
+#     (0 changes nothing, the probe has no new key) routes the ONNX levels by upright source height:
+#     chosen at or below it only when nobody asked and an accelerator is there, dropped above it with
+#     the reason, never for the CUDA-native levels, a viewer's Off, or a source with no upscale.
+#     The C side of the filter is scripts/test-vf-ort.sh (compile check and provider calls), not this.
 #
 # Exit status: 0 every check passed, 1 a check failed, 2 the harness could not be built.
 set -uo pipefail

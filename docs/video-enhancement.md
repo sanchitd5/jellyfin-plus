@@ -34,7 +34,7 @@ stock one rather than over it:
 |---|---|---|
 | `denoise=oidn` | `vf_oidn` | Intel Open Image Denoise runtime (fetched by the build script) |
 | `denoise=optix*` | `vf_optix` | OptiX + Optical Flow SDK **headers** at build time; both libraries are `dlopen`ed from the display driver at runtime, so no CUDA toolkit is needed |
-| `neural=` | `vf_ort` | ONNX Runtime with the CUDA execution provider, plus model weights you export yourself |
+| `neural=` | `vf_ort` | ONNX Runtime with the CUDA execution provider (the OpenVINO provider on an Intel GPU), plus model weights you export yourself |
 | `game=` | `vf_fsr2`, `vf_dlss` | FidelityFX FSR2 sources, NVIDIA NGX SDK, and a depth model for `depth=model` |
 
 **Without that binary nothing breaks.** The server asks it which filters it carries and strips the
@@ -513,6 +513,7 @@ Dashboard → Plugins → Jellyfin Plus. Defaults suit a single busy GPU:
 | `DeblurLevel` / `DeblurAllowed` | `off` / true | RCAS sharpening; SR already sharpens, so default off |
 | `DenoiseLevel` / `DenoiseAllowed` | `off` / true | `light` = nlmeans_vulkan, `strong` = nlmeans_vulkan s=2.0 |
 | `SrMinScaleFactor` | 1.60 | below this ratio the SR network is skipped (see below); 0 disables |
+| `NeuralMaxSourceHeight` | 0 | 0 = off. Above 0, the Real-ESRGAN (`ort`) levels run only for sources at or below this height and a taller source takes the shader path; when nothing names a level the cheapest installed weight is chosen (on Intel only with the OpenVINO provider). 480 is the recommended value on an Intel GPU and is not measured; see [NEURAL.md](filters/NEURAL.md) and [GPU_VENDORS.md](architecture/GPU_VENDORS.md) |
 | `Deband` | true | with `grain=0` |
 | `MinScaleFactor` | 1.15 | skip near-identity upscales entirely |
 | `MaxSourceHeight` | 1440 | never upscale sources taller than this |
