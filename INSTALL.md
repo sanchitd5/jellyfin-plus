@@ -212,6 +212,10 @@ Dashboard → Plugins → **Jellyfin Plus**. Sensible starting point:
   neural level and everything taller to the shader path. It is the recommended value and it is not
   measured on any Intel GPU, so set `NeuralLevel` to `realesr-anime-x2`, watch the GPU, and leave it 0
   until you have measured one
+- `IntelHardwareDecode` = off (the default). Experimental, Intel GPU only, and it needs the patched
+  ffmpeg build: decodes on the GPU instead of the CPU for 8-bit SDR h264 and hevc when the plan has no
+  CPU-side step, and falls back to software decode (with the reason in the session record) otherwise.
+  Not verified on an Intel card yet; leave it off unless you are testing it and can watch a served segment
 - `RequireClientOptIn` = true, so nothing is enhanced until a viewer asks
 - `ForceTranscodeForDirectPlay` = false until you have read what it costs
 

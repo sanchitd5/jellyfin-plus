@@ -76,6 +76,14 @@ namespace Jellyfin.Plugin.Plus.Configuration
         public int NeuralMaxSourceHeight { get; set; }
 
         /// <summary>
+        /// Decode on a detected Intel GPU (VA-API) and map the surfaces to Vulkan, instead of decoding
+        /// in software. Off by default and experimental: only a plan with no CPU-side step and an
+        /// 8-bit SDR progressive source takes it, behind a start-up test, and every other session
+        /// keeps software decode. Not verified on hardware: docs/architecture/GPU_VENDORS.md 5.6.
+        /// </summary>
+        public bool IntelHardwareDecode { get; set; }
+
+        /// <summary>
         /// Game temporal upscaler applied by default: off, fsr2, dlss, dlaa. OFF, and it stays
         /// off: these are renderer algorithms fed inputs recorded video cannot supply. See the
         /// block above ShaderLibrary._gameFilters.

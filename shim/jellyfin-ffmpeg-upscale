@@ -240,10 +240,24 @@ def substitute_missing_encoders(cfg, args):
     return ["aac" if a == "libfdk_aac" else a for a in args]
 
 
+def wants_va_vulkan_bridge(args):
+    """True for the chain the plugin's optional Intel hardware decode builds: a Vulkan device
+    derived from a VA-API one, and a hwmap that derives Vulkan from the decoded VA-API frames.
+
+    No patched filter appears in it, yet only the patched binary carries the hwmap changes
+    (ffmpeg/0008, 0009) that make it work; on the stock binary the same chain ends in
+    "Conversion failed!". Both halves are required so a command that merely names a VA-API
+    device, or a hwmap into Vulkan from some other source, stays on the stock binary."""
+    return "vulkan=vk@va" in args and any("derive_device=vulkan" in a for a in args)
+
+
 def pick_binary(cfg, args):
     """The ffmpeg to run for this command, and the argument list to run it with."""
     wanted = wants_patched(args)
     if not wanted:
+        if wants_va_vulkan_bridge(args) and os.access(PATCHED_FFMPEG, os.X_OK):
+            log(cfg, "routing to the patched ffmpeg build for this session (VA-API to Vulkan hwmap)")
+            return PATCHED_FFMPEG, substitute_missing_encoders(cfg, args)
         return REAL_FFMPEG, args
     if os.access(PATCHED_FFMPEG, os.X_OK):
         missing = [f for f in wanted if f not in patched_has(wanted)]

@@ -55,6 +55,28 @@ check("Jellyfin's own -init_hw_device and -filter_hw_device are replaced, not ke
       ["-init_hw_device", "drm=dr:/dev/dri/renderD128", "-init_hw_device", "vulkan=vk@dr",
        "-filter_hw_device", "vk"] + TAIL, out)
 
+# PR 7: the VA-API to Vulkan bridge chain carries no patched filter, but only the patched binary has
+# the hwmap changes it needs, so it is routed there; the same arguments minus either half are not.
+BRIDGE = ["-init_hw_device", "vaapi=va:/dev/dri/renderD128", "-init_hw_device", "vulkan=vk@va",
+          "-hwaccel", "vaapi", "-hwaccel_output_format", "vaapi", "-filter_hw_device", "vk",
+          "-i", "in.mkv", "-vf", "hwmap=derive_device=vulkan,libplacebo=w=1920:h=1080", "out.m3u8"]
+quiet = dict(shim.DEFAULTS, log=False)
+real_access = shim.os.access
+try:
+    shim.os.access = lambda path, mode: path == shim.PATCHED_FFMPEG
+    check("the bridge chain goes to the patched binary", shim.PATCHED_FFMPEG, shim.pick_binary(quiet, list(BRIDGE))[0])
+    check("a hwmap into Vulkan with no vk@va device stays on stock",
+          shim.REAL_FFMPEG, shim.pick_binary(quiet, [a for a in BRIDGE if a != "vulkan=vk@va"])[0])
+    check("a vk@va device with no hwmap into Vulkan stays on stock",
+          shim.REAL_FFMPEG, shim.pick_binary(quiet, [a.replace("hwmap=derive_device=vulkan,", "") for a in BRIDGE])[0])
+    check("the default software-decode Vulkan chain stays on stock",
+          shim.REAL_FFMPEG, shim.pick_binary(quiet, VK0 + ["-i", "in.mkv", "-vf", "format=yuv420p,hwupload,libplacebo=w=1920:h=1080", "out.m3u8"])[0])
+    shim.os.access = lambda path, mode: False
+    check("with no patched binary the bridge chain is left to stock",
+          shim.REAL_FFMPEG, shim.pick_binary(quiet, list(BRIDGE))[0])
+finally:
+    shim.os.access = real_access
+
 print()
 print("%d failed" % failed)
 sys.exit(1 if failed else 0)

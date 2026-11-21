@@ -242,8 +242,20 @@ Without the file everything is as before. NVIDIA is unchanged. Not compiled or r
 `scripts/test-gu-inputs.sh` is the compile-and-run check of the CUDA-free variant and of the default variant's
 CUDA call order and degrade path against a fake CUDA (stub headers; not the real SDK headers or NVOFA).
 
+**Intel hardware decode, `IntelHardwareDecode` (PR 7; dashboard checkbox, off by default).** Off, or on
+without a detected Intel GPU, every command line, the probe and the session JSON are unchanged. On, with an
+Intel GPU, a passing start-up test (one synthetic frame uploaded to a VA surface, mapped to Vulkan and
+downloaded on the patched binary; an approximation of a decode, not a decode), an upright 8-bit SDR
+progressive h264 or hevc source and a plan with no CPU-side step, the command decodes with VA-API and
+maps to Vulkan (`vk@va`, `hwmap=derive_device=vulkan`, tail `hwdownload,format=nv12`); every other session
+keeps software decode, with the reason in `SessionRecord.HardwareDecodeReason`. The probe gains
+`Levels.IntelHardwareDecode` and the session route `HardwareDecode` / `HardwareDecodeReason` only while the
+setting is on. The shim routes a command carrying `vulkan=vk@va` and `derive_device=vulkan` to the patched
+binary, which alone carries `ffmpeg/0008` and `0009`. Not compiled, not run, and not verified on an Intel
+card: GPU_VENDORS.md 5.6.
+
 Not done by this: choosing between two Intel GPUs (OpenVINO's own GPU numbering is not mapped to the
-render node either), hardware decode, an Intel ffmpeg build, a client-panel hint when a chosen level
+render node either), hardware decode beyond the opt-in above, an Intel ffmpeg build, a client-panel hint when a chosen level
 will be dropped for a tall source. The plan for the rest is
 [GPU_VENDORS.md](docs/architecture/GPU_VENDORS.md). Tests: `scripts/test-gpu-vendor.sh <jfbin>`
 (compiles the real patcher sources, the DRM fdinfo reader and the load controller, and runs
@@ -268,7 +280,7 @@ to one that GPU can run (`hevc_qsv` on Intel) yourself.
 1080, `MaxTargetHeight` 2160, `SrLevel` `fsrcnnx`, `MaxConcurrent` 4, `MaxConcurrentSwaps` 4,
 `RequireClientOptIn` false, `ForceTranscode` false, `ForceTranscodeForDirectPlay` false, `Encoder`
 `hevc_nvenc`, `GpuVendor` `auto`, `MinScaleFactor` 1.15, `SrMinScaleFactor` 1.60, `MaxSourceHeight` 1440,
-`NeuralMaxSourceHeight` 0. Deblur, denoise,
+`NeuralMaxSourceHeight` 0, `IntelHardwareDecode` false. Deblur, denoise,
 deblock, neural, game, refine and chroma defaults are all `off`. The README configuration table lists
 `MaxConcurrent` 2 and `RequireClientOptIn` true; the code says 4 and false.
 

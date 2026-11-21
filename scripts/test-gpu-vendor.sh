@@ -39,6 +39,13 @@
 #   - (PR 6) the fsr2-nocuda marker counts only for a detected Intel GPU; with it fsr2 (not dlss or
 #     dlaa) is offered and runs on Intel and the record says the motion vectors are zero, without it
 #     all three stay withheld, and an NVIDIA machine is unchanged. The C side is scripts/test-gu-inputs.sh.
+#   - (PR 7) IntelHardwareDecode (default off): off, or on without a detected Intel GPU, every command
+#     line, the probe and the session JSON are byte-identical and the start-up test never runs; on
+#     with an Intel GPU, a passing test and a plan with no CPU-side node, the command decodes with
+#     VA-API and maps to Vulkan (golden argument and chain strings); a failed or inconclusive test, a
+#     CPU-side step, HDR, 10-bit, interlaced, sideways or other-codec sources, or an unusable render
+#     node keep software decode with the reason in the record. The shim's routing of the VA-API to
+#     Vulkan chain to the patched binary is scripts/test-shim-device.py. Not run on hardware.
 #
 # Exit status: 0 every check passed, 1 a check failed, 2 the harness could not be built.
 set -uo pipefail

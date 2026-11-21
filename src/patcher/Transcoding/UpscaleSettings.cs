@@ -187,6 +187,13 @@ namespace Jellyfin.Plugin.Plus.Patcher
         public int NeuralMaxSourceHeight { get; set; }
 
         /// <summary>
+        /// Decode on a detected Intel GPU and map the VA-API surfaces to Vulkan. Mirrors
+        /// PluginConfiguration.IntelHardwareDecode. Default off, which changes nothing anywhere.
+        /// Read by UpscaleEngine.DecideHardwareDecode; docs/architecture/GPU_VENDORS.md 5.6.
+        /// </summary>
+        public bool IntelHardwareDecode { get; set; }
+
+        /// <summary>
         /// Game temporal upscaler applied by default: off, fsr2, dlss, dlaa. OFF, and it stays
         /// off: these are renderer algorithms fed inputs recorded video cannot supply. See the
         /// block above ShaderLibrary._gameFilters.

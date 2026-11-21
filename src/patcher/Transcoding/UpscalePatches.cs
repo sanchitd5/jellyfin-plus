@@ -770,7 +770,11 @@ namespace Jellyfin.Plugin.Plus.Patcher
 
                 var kept = UpscaleEngine.KeepNonScalingNodes(ExtractVfBody(__result));
                 string chain = UpscaleEngine.BuildChain(plan);
-                __result = " -vf \"" + (kept.Count > 0 ? string.Join(",", kept) + "," + chain : chain) + "\"";
+                // A hardware-decode chain starts from VA-API surfaces no kept node can read, so
+                // Jellyfin's own nodes follow the download instead of leading the chain.
+                __result = " -vf \"" + (kept.Count == 0 ? chain
+                    : plan.HardwareDecode ? chain + "," + string.Join(",", kept)
+                    : string.Join(",", kept) + "," + chain) + "\"";
 
                 var record = RecordFor(state, verdict, plan, "applied", "filter chain injected");
                 _logger?.LogInformation("JellyfinPlus: {Summary} for {Path}", record.Summary, state.MediaPath);

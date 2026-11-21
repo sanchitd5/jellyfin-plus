@@ -453,6 +453,16 @@
                         Which GPU vendor this server is treated as having. Auto reads the vendor of each render node (/sys/class/drm/renderD*/device/vendor), with /proc/driver/nvidia or nvidia-smi as the tie-breaker, and picks NVIDIA when it is present, so an install that already works is unchanged. It sets what is reported (the line at the top of this page, the player probe, Recent sessions) and, for Intel, the encoder: with an Intel GPU actually found, the encoder is QSV and the GPU-resident hand-off is off. A vendor chosen and not found changes nothing; the NVIDIA behaviour stays. Default Auto.
                     </div>
                     </div>
+
+                    <div class="checkboxContainer checkboxContainer-withDescription">
+                        <label class="emby-checkbox-label">
+                            <input is="emby-checkbox" type="checkbox" id="IntelHardwareDecode" data-config="IntelHardwareDecode" data-kind="bool" data-default="false" />
+                            <span>Decode on the Intel GPU (experimental)</span>
+                        </label>
+                        <div class="fieldDescription checkboxFieldDescription">
+                        Off by default, and only for a detected Intel GPU. When on, a session whose source is 8-bit SDR progressive h264 or hevc and whose enhancements all run on the GPU is decoded with VA-API and handed to the shaders as Vulkan frames, instead of decoded in software. Anything else (a CPU-side step such as deblock, atadenoise, a neural or game upscaler, HDR, 10-bit, interlaced or sideways sources, a failed start-up test) keeps software decode, and Recent sessions says which. Not verified on an Intel Arc card yet; it needs the patched ffmpeg build. Default off.
+                    </div>
+                    </div>
                     </div>
                 </section>
 

@@ -224,6 +224,12 @@ namespace Jellyfin.Plugin.Plus.Patcher
                 levels["NeuralMaxSourceHeight"] = cfg.NeuralMaxSourceHeight;
             }
 
+            // Present only while the operator has hardware decode on, for the same reason.
+            if (cfg != null && cfg.IntelHardwareDecode)
+            {
+                levels["IntelHardwareDecode"] = true;
+            }
+
             return levels;
         }
 
@@ -322,7 +328,7 @@ namespace Jellyfin.Plugin.Plus.Patcher
                 });
             }
 
-            return JsonSerializer.Serialize(new Dictionary<string, object>
+            var session = new Dictionary<string, object>
             {
                 ["PatchActive"] = UpscalePatches.Active,
                 ["Known"] = true,
@@ -378,7 +384,17 @@ namespace Jellyfin.Plugin.Plus.Patcher
                 ["GpuResidentEncode"] = record.GpuResidentEncode,
                 ["Status"] = record.Status,
                 ["Summary"] = record.Summary,
-            });
+            };
+
+            // Present only while IntelHardwareDecode is on, so every other server's session JSON is
+            // exactly what it was.
+            if (record.HardwareDecodeReason != null)
+            {
+                session["HardwareDecode"] = record.HardwareDecode;
+                session["HardwareDecodeReason"] = record.HardwareDecodeReason;
+            }
+
+            return JsonSerializer.Serialize(session);
         }
     }
 }
