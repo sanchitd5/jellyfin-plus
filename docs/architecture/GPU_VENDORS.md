@@ -41,7 +41,7 @@ has to make vendor-aware, or consciously leave NVIDIA-only.
 | `UpscaleEngine.GuardAv1`, `Av1NvencUsable` | Asks `nvidia-smi --query-gpu=compute_cap` whether AV1 can be encoded (8.9 or newer) | PR 2 |
 | `UpscaleEngine.HwaccelArgs` | `-init_hw_device vulkan=vk:0`: the first Vulkan device, whichever GPU that is. Correct on a one-GPU box and on this project's test box; wrong the moment two GPUs are present | PR 3 |
 | `BuildChain`, `GpuResidentEncode` | The end of the chain is `hwmap=derive_device=cuda` (Vulkan frame handed to NVENC as a CUDA frame, `ffmpeg/0006`) | PR 2 |
-| `GpuLoadController` (`GET /JellyfinPlus/Gpu/Load`) | NVENC session count from `nvidia-smi --query-gpu=encoder.stats.sessionCount` | PR 4 |
+| `GpuLoadController` (`GET /JellyfinPlus/Gpu/Load`) | NVENC session count from `nvidia-smi --query-gpu=encoder.stats.sessionCount` | PR 2 (section 5.2) |
 | CUDA-only levels | `optix` denoise, `dlss` / `dlaa`, `dlpp-1..4`, `vsr-rtcuda` need CUDA (and, for DLSS, the NVIDIA runtime the operator fetches) | Offered only when the capability says CUDA is available (PR 2) |
 | `vf_ort` | The ONNX Runtime filter creates a CUDA execution provider and falls back to the CPU one (`ffmpeg/vf_ort.c`, option `device` = `cuda` / `cpu`) | PR 5 |
 | `gu_inputs.h` (`vf_fsr2`, `vf_dlss`) | Motion vectors come from NVOFA optical flow (`libnvidia-opticalflow`), through CUDA | PR 6 |
@@ -158,56 +158,114 @@ verified on the real box.
 | PR | Scope | Depends on | Proof |
 |---|---|---|---|
 | 1 | Detection and the report-only capability record (section 3) | none | Harness; the record shown live on an NVIDIA box and an Intel box; command lines unchanged |
-| 2 | Encoder per vendor: map the negotiated codec to `*_nvenc` or `*_vaapi` / `*_qsv`; `GuardAv1` asks the capability instead of `nvidia-smi` on Intel; `GpuResidentEncode` ends in `hwmap=derive_device=vaapi` on Intel; CUDA-only levels withheld from the probe when the capability says no CUDA | 1 | Served segment codec and size on each vendor; NVIDIA command byte-identical |
+| 2 | Encoder per vendor and Intel load (the old PR 2 and PR 4 together, section 5.1 and 5.2): map the negotiated codec to `*_nvenc` or `*_qsv`; a `*_nvenc` setting on an Intel box is treated as auto and said so; Jellyfin's own `*_qsv` choice is kept; `GuardAv1` test-encodes `av1_qsv` on Intel; the GPU-resident encode (`hwmap=derive_device=cuda`) is NVIDIA-only and reported n/a on Intel; `Gpu/Load` gains `vendor`, `encoderSessions`, `gpuBusyPercent` from DRM fdinfo | 1 | Served segment codec and size on each vendor; NVIDIA command byte-identical; busy percentage under a known encode |
 | 3 | The Vulkan device from the render node instead of `vk:0` | 1 | Command on a two-GPU box names the right device; one-GPU command unchanged |
-| 4 | Intel load via DRM fdinfo, for `Gpu/Load` | 1 | Busy percentage under a known encode |
+| 4 | Folded into PR 2 (Intel load via DRM fdinfo, section 5.2) | 1 | see PR 2 |
 | 5 | `vf_ort` OpenVINO execution provider, `NeuralMaxSourceHeight` | 1, 8 | Neural level offered and running on Intel; a served segment |
 | 6 | `gu_inputs` without CUDA | 5 | Motion vectors from a non-NVOFA source, compared by the project's temporal measurements |
 | 7 | Opt-in Intel hardware decode, with the VA-API to Vulkan derived-device fix | 2, 3 | Frames reach libplacebo from VA-API; off by default |
 | 8 | A `GPU_VENDOR=intel` ffmpeg build and a per-vendor required-filter set | 1 | `-filters` lists the intel set; deploy refuses a binary missing one of it |
 
-Order is not strict (4 is independent of 5 to 8), but 2 and 3 precede anything that changes a
-command line, so the first behaviour change is the smallest one.
+Order is not strict, but 2 and 3 precede anything that changes a command line, so the first
+behaviour change is the smallest one. PR 2 stacks on PR 1's branch, and each later PR on the one
+before it, until the series has been run end to end on real hardware.
 
 ## 5. Design notes for PRs 2 to 8
 
 ### 5.1 PR 2: the encoder per vendor
 
-NVIDIA is unchanged: `*_nvenc`, the `nvidia-smi` AV1 guard, `hwmap=derive_device=cuda`.
+NVIDIA is unchanged: `*_nvenc`, the `nvidia-smi` AV1 guard, `hwmap=derive_device=cuda` when
+`GpuResidentEncode` is on. Every Intel decision below is taken only when the record says the vendor
+is `intel` **and** `Detected` is true (an Intel GPU was actually seen). Anything else, `none` and an
+Intel setting with no Intel GPU included, keeps today's NVIDIA behaviour exactly, so no install that
+works today can be moved by this PR.
 
-Intel encodes through the same iGPU/dGPU media engine whichever API drives it. The choice between
-`*_vaapi` and `*_qsv` is **open and is measured in PR 2**, not decided here. The reason `vaapi` is
-the reported family is the hand-off: this repo's own reading of FFmpeg's `hwcontext_vulkan.c`
-(docs/roadmap/hw-resident-encode-plan.md) found that `vulkan_map_from()` already has a **VA-API**
-case, which is exactly why the NVIDIA direction needed a patch (`ffmpeg/0006`) and the Intel one
-may not: a libplacebo (Vulkan) frame can be mapped to a VA-API frame in stock FFmpeg, so the Intel
-analogue of `GpuResidentEncode` is `hwmap=derive_device=vaapi` into `hevc_vaapi`. That reading is
-from source, not from a run on the A380; PR 2 verifies it, and if it fails the chain ends in
-`hwdownload,format=yuv420p` as the non-resident NVIDIA path does.
+**QSV, not VA-API (the open question 1, decided from the jellyfin-ffmpeg source).** The chain this
+plugin builds ends in system memory (`hwdownload,format=yuv420p`), and the two Intel encoders differ
+in what they accept:
 
-The AV1 guard on Intel asks the encoder list and a one-frame test encode rather than a compute
-capability: the A380 has an AV1 encoder, and a driver that lacks it must fall back the way
-`GuardAv1` falls back to HEVC today. `ChooseEncoder`'s configured-encoder rules (ffmpeg has it, the
-client declared the codec) are vendor-independent and stay.
+- `libavcodec/qsvenc_hevc.c` (and `qsvenc_h264.c`, `qsvenc_av1.c`) take `nv12`, `p010` and other
+  system-memory formats, and `qsvenc_init_session` (`qsvenc.c`) opens its own internal session when
+  the encoder is handed neither a frames context nor a device: no `-init_hw_device` is needed.
+- `libavcodec/vaapi_encode_h265.c` takes only `AV_PIX_FMT_VAAPI`. Feeding it needs a `hwupload` to a
+  VA-API device, but `-filter_hw_device` is `vk` (libplacebo needs the Vulkan device on the graph),
+  `hwupload` can only use that one device or derive from it (`libavfilter/vf_hwupload.c`), and a
+  VA-API device can be derived only from a DRM device (`hwcontext_vaapi.c`, `vaapi_device_derive`),
+  not from Vulkan. Mapping the Vulkan frame back with `hwmap` does not help either: Jellyfin's own
+  chains map back with `hwmap=derive_device=vaapi:mode=write:reverse=1`, which returns to the VA-API
+  device the frame was first mapped from, and a frame made by `hwupload` has no such parent.
 
-The `Encoder` setting's default stays `hevc_nvenc`. A setting naming an encoder the active vendor
-cannot run is refused with a reason in Recent sessions, which is what the configured-encoder path
-already does for a missing encoder.
+So the Intel encode family is `qsv`, and a `*_vaapi` encoder is **not** emitted: it would be a dead
+stream, not a worse picture. When ffmpeg lists no `*_qsv` encoder the family is `software` and the
+chain feeds `libx264` / `libx265` / `libsvtav1` (the same system-memory frames), with the reason in
+Recent sessions. VA-API encode belongs with PR 7, which has to solve the shared-device problem for
+decode in the first place.
 
-### 5.2 PR 4: Intel GPU load via DRM fdinfo
+**Chain tail.** The tail on Intel is the non-resident NVIDIA one, `hwdownload,format=yuv420p`. It
+cannot be `hwdownload,format=nv12`: `hwdownload` yields the sw_format of the Vulkan frames, and
+libplacebo's output format defaults to its input's (`vf_libplacebo.c`, `config_output`), which our
+own `format=yuv420p,hwupload` fixed as yuv420p. QSV wants `nv12`; ffmpeg's output stage appends a
+`format=` filter listing the encoder's pixel formats (`ffmpeg_filter.c`) and the graph inserts a
+`scale` for the difference (`avfiltergraph.c`, auto-inserted conversion). The cost is one CPU
+yuv420p to nv12 pass per frame, which is not measured. `GpuResidentEncode` is ignored on Intel, the
+session record says `GpuResidentEncode` is n/a, and `Pipeline` reads plain `Vulkan`.
 
-NVIDIA's `Gpu/Load` counts NVENC sessions from `nvidia-smi`. Intel has no equivalent counter, but
-the kernel exports per-client engine time: `/proc/<pid>/fdinfo/<fd>` of an open DRM file carries
-`drm-driver:`, `drm-client-id:` and per-engine busy time in nanoseconds (`drm-engine-video:`,
-`drm-engine-render:`, `drm-engine-copy:` for i915; Xe reports cycles instead). Busy percentage is the
-change in busy time over wall time between two samples, per engine, summed across clients (deduplicate
-by `drm-client-id`, since one client can hold several fds to the same file).
+**`ChooseEncoder`.** On Intel the negotiated codec maps to `h264_qsv` / `hevc_qsv` / `av1_qsv`
+(auto, and the fallback when the configured encoder is refused). A configured `*_nvenc` encoder
+(the setting defaults to `hevc_nvenc`) is treated as auto and the encoder reason says so. A
+configured `*_vaapi` encoder is refused with a reason. The other configured-encoder guards (ffmpeg
+lists it, the client declared its codec) are vendor-independent and unchanged. When Jellyfin has
+already chosen the encoder (its own hardware acceleration is set to QSV), a QSV or software choice
+of Jellyfin's is kept; one that cannot take this chain (`*_vaapi`, `*_nvenc`) is replaced, with the
+reason.
 
-Boundaries to check, not assume: Jellyfin runs as an unprivileged user and can read `fdinfo` only for
-its own processes, which is what is wanted (its ffmpeg children) but means other workloads on the GPU
-are invisible; the sampling interval must be short and the result cached, as `Gpu/Load` already
-caches the NVENC count; and the i915 and Xe field names differ and must be read per `drm-driver`.
-`NvencSessions` stays as it is for NVIDIA; the response gains an engine-busy field for Intel.
+**`GuardAv1`.** `av1_qsv` is listed by any build that compiles it, but only Arc and newer can open
+it, so on Intel one frame is test-encoded with `av1_qsv` (once, remembered) and a failure swaps to
+`hevc_qsv`, or `h264_qsv` when the client cannot take HEVC. An inconclusive probe (no ffmpeg, a
+timeout) leaves the choice alone, as the NVIDIA guard does.
+
+**Not done here.** The Vulkan device is still `vk:0` (PR 3), so on a box with two GPUs the QSV
+session opens whichever device the QSV runtime picks, not necessarily the one in the record. The
+CUDA-only levels are not yet withheld from the probe on Intel (the Intel build of the patched ffmpeg,
+PR 8, lacks the filters, so the shim already strips them; a withheld-level change belongs with it).
+
+### 5.2 Intel GPU load via DRM fdinfo (in PR 2)
+
+NVIDIA's `Gpu/Load` counts NVENC sessions from `nvidia-smi`, and that field (`nvencSessions`) stays
+exactly as it is. The response gains three additive fields, `vendor`, `encoderSessions` and
+`gpuBusyPercent`, plus `gpuIdlePercent` and `loadSource`. On NVIDIA `encoderSessions` equals
+`nvencSessions` and the other two are null; the NVIDIA path spawns the same process as before.
+
+Intel has no session counter, but the kernel exports per-client engine time in
+`/proc/<pid>/fdinfo/<fd>` of an open DRM file (Documentation/gpu/drm-usage-stats.rst). The two
+drivers differ and are read by `drm-driver`:
+
+| Driver | Per-client fields | Classes |
+|---|---|---|
+| `i915` | `drm-engine-<class>: <n> ns` (busy time), `drm-engine-capacity-<class>: <n>` (engines in the class, printed when more than one) | `render`, `copy`, `video`, `video-enhance` |
+| `xe` | `drm-cycles-<class>: <n>` (busy GPU cycles), `drm-total-cycles-<class>: <n>` (the cycles the engine had available) | `rcs`, `bcs`, `vcs`, `vecs`, `ccs` |
+
+Both carry `drm-client-id` and `drm-pdev`; one client can appear on several fds and in several
+processes (inherited), so clients are deduplicated by `(drm-pdev, drm-client-id)`. The classes are
+mapped to render, copy, video, video-enhance and compute so the maths is one code path.
+
+Busy percentage is the change between two samples: i915 divides the summed busy nanoseconds of a
+class by `elapsed x capacity`; xe divides the summed busy cycles by the change in
+`drm-total-cycles`. `gpuBusyPercent` is the busiest class (clamped to 0-100). `encoderSessions` is
+the number of distinct clients whose video-engine time moved in the window, which on this plugin's
+chain (software decode) is encode; a hardware-decoding client would count too, and the doc says so.
+Only clients present in both samples are counted, so an encode that starts and ends inside one window
+is missed.
+
+Boundaries, all unverified on hardware: Jellyfin runs unprivileged and can read `fdinfo` only of its
+own processes, which is what is wanted (its ffmpeg children) but means another container's use of
+the GPU is invisible; so a second figure that is not about processes is added when sysfs gives it
+without any privilege: `gpuIdlePercent`, the least-idle GT's share of the window spent in RC6
+(`gt/gt*/rc6_residency_ms` for i915, `tile*/gt*/gtidle/idle_residency_ms` for xe). RC6 idle is
+"the GT slept", not "the engines were busy", so it is reported beside the busy figure, not folded
+into it. `intel_gpu_top` and perf are never required. Sampling is two reads (the first call waits
+300 ms between them, later calls reuse the previous sample when it is 0.5 to 30 s old), the result is
+cached for 5 s and single-flighted, as the NVENC count is, and a failure is null, never an error.
 
 ### 5.3 PR 3: the Vulkan device from the render node
 
@@ -324,7 +382,7 @@ encode, the neural levels, or more than one session.
 
 ## 8. Open questions
 
-1. `vaapi` or `qsv` as the Intel encode family (PR 2, measured).
+1. ~~`vaapi` or `qsv` as the Intel encode family~~ Decided for `qsv` from the source (section 5.1); the CPU cost of the yuv420p to nv12 conversion is still unmeasured.
 2. Whether the pinned jellyfin-ffmpeg can select the Vulkan device by DRM node, or the index must be
    discovered (PR 3).
 3. The real cause of the VA-API to Vulkan failure; the derived-device explanation is a hypothesis
@@ -332,4 +390,4 @@ encode, the neural levels, or more than one session.
 4. Neural throughput on the A380, and so the default for `NeuralMaxSourceHeight` (PR 5).
 5. A non-CUDA flow source for `gu_inputs` that survives the temporal measurements (PR 6), or the
    decision that Intel does not get the game upscalers.
-6. Where Xe-driver fdinfo differs from i915 on the target kernel (PR 4).
+6. Where Xe-driver fdinfo differs from i915 on the target kernel (PR 2, section 5.2; the fixtures in the harness are written from the kernel documentation, not captured from a machine).
