@@ -151,6 +151,16 @@ esbuild) support natively.
 | `src/Transcoding/GpuFdinfo.cs` | `DrmFdinfo` (`Parse` one fdinfo file of an i915 or xe DRM client, `Scan` a /proc tree for the clients on a render node, `Compute` busy percent and video-engine clients from two samples), `GpuIdleResidency` (`Read`/`IdlePercent` of the sysfs RC6 and GT-idle counters); BCL only, compiled by the test harness; used by `GpuLoadController` |
 | `src/Transcoding/CpuBudget.cs` | `CpuBudget` (`Cores`, `PlaybackCores`, `BackgroundDegree`, pure `ContainerCores`/`PlaybackCoresFor`/`Budget`/`ParseStatTicks`; one 2 s /proc sampler of ffmpeg CPU), `DynamicGate` (async gate whose limit is re-read on every acquire/release) |
 
+## Intel image and bench (docs/architecture/GPU_VENDORS.md, 5.8)
+
+| file | what it is |
+|---|---|
+| `docker/intel/Dockerfile` | the production Jellyfin image plus the `GPU_VENDOR=intel` ffmpeg, plugin, patcher, shim, shaders and injected web client; pinned base digest, FSR2 commit and .NET SDK sha512; fails the build on a missing filter, an unresolved library or a changed stock ffmpeg |
+| `docker/intel/stage-plugin.sh` | the image-time half of `proxmox-build.sh`: publishes the plugin and patcher against the image's own Jellyfin assemblies and writes `meta.json` |
+| `docker/intel/Dockerfile.dockerignore` | keeps `.git`, `docs`, build output and `web/node_modules` out of the build context |
+| `scripts/bench-intel.sh` | the 13-row Intel Arc matrix: `--dry-run` prints the plan, a run needs `BENCH_ASSERT_QUIET=1`; sources `scripts/ffmpeg-vendor.sh` |
+| `scripts/test_bench_intel.py` | the plan goldens, refusals, a stub run, mutants and the Dockerfile's static checks |
+
 ## Entry point
 
 | module | exports | imports |

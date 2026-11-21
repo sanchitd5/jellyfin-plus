@@ -1,0 +1,11 @@
+.git
+.github
+.workbench
+.claude
+docs
+out
+out-patcher
+web/node_modules
+web/jellyfin-plus.js
+**/bin
+**/obj

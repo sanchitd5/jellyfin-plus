@@ -288,6 +288,12 @@ Two traps:
 The shim stands down automatically while the plugin's patches are active
 (`plugin_patch_active: true` in `/etc/jellyfin-upscale.json`).
 
+On Kubernetes with an Intel Arc, `docker/intel/Dockerfile` does these steps at image build time
+instead (read-only root filesystem, shim and web inject baked in); see
+`docs/architecture/GPU_VENDORS.md`, 5.8 for the layout, the mounts the Deployment needs and
+`scripts/bench-intel.sh`, the end-to-end matrix. The image is for the person who built it: it links
+GPL components and is never published.
+
 ---
 
 ## Troubleshooting
