@@ -233,6 +233,15 @@ keeps the code path that existed before the setting did:
   gains `Levels.NeuralMaxSourceHeight` only when the value is above 0. 480 is the recommended value on
   Intel and is not measured; the cost arithmetic is in GPU_VENDORS.md 5.4 and NEURAL.md.
 
+**fsr2 without CUDA (PR 6).** `gu_inputs.h` builds with `-DGU_NO_NVOF` (no CUDA, no NVOFA: zero motion
+vectors, empty reactive mask, jitter still measured) and falls back to the same zero flow when CUDA will not
+start. `ORT_EP=openvino WITH_FSR2=1 scripts/build-ffmpeg.sh` builds it (patch `ffmpeg/0016`) and leaves
+`<prefix>/fsr2-nocuda`; with that file and a detected Intel GPU `GpuCapability.NoCudaGameAvailable` is true,
+the probe offers `fsr2` (not `dlss`/`dlaa`) and `SessionRecord.GameMotionNote` says the vectors are zero.
+Without the file everything is as before. NVIDIA is unchanged. Not compiled or run on an Intel GPU;
+`scripts/test-gu-inputs.sh` is the compile-and-run check of the CUDA-free variant and of the default variant's
+CUDA call order and degrade path against a fake CUDA (stub headers; not the real SDK headers or NVOFA).
+
 Not done by this: choosing between two Intel GPUs (OpenVINO's own GPU numbering is not mapped to the
 render node either), hardware decode, an Intel ffmpeg build, a client-panel hint when a chosen level
 will be dropped for a tall source. The plan for the rest is

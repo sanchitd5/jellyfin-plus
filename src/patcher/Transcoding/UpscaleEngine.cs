@@ -165,6 +165,12 @@ namespace Jellyfin.Plugin.Plus.Patcher
         public string NeuralDeviceNote { get; set; }
 
         /// <summary>
+        /// Set when a game level ran on an Intel server, where the filter has no CUDA and so no
+        /// optical flow: the motion vectors it is given are zero. Null everywhere else.
+        /// </summary>
+        public string GameMotionNote { get; set; }
+
+        /// <summary>
         /// What NeuralMaxSourceHeight did to this session: a neural level chosen because the source
         /// is small, a neural level not run because the source is too tall, or why nothing was
         /// chosen. Null when the setting is 0 or did nothing to this session.
@@ -395,6 +401,9 @@ namespace Jellyfin.Plugin.Plus.Patcher
 
             /// <summary>Why NeuralDevice is "cpu" on an Intel server, or null.</summary>
             public string NeuralDeviceNote { get; set; }
+
+            /// <summary>Why the game level's motion vectors are zero (Intel, no CUDA), or null. See SessionRecord.GameMotionNote.</summary>
+            public string GameMotionNote { get; set; }
 
             /// <summary>What NeuralMaxSourceHeight did to this session, or null. See SessionRecord.NeuralRouting.</summary>
             public string NeuralRouting { get; set; }
@@ -637,6 +646,7 @@ namespace Jellyfin.Plugin.Plus.Patcher
                 NeuralDeviceNote = plan.Act && plan.NeuralApplied ? plan.NeuralDeviceNote : null,
                 NeuralRouting = plan.Act ? plan.NeuralRouting : null,
                 GameLevel = plan.Act && plan.GameApplied ? plan.GameLevel : "off",
+                GameMotionNote = plan.Act && plan.GameApplied ? plan.GameMotionNote : null,
                 GameJitter = plan.Act && plan.GameApplied ? plan.GameJitter : null,
                 GameDepth = plan.Act && plan.GameApplied ? plan.GameDepth : null,
                 GameReactive = plan.Act && plan.GameApplied ? plan.GameReactive : null,
@@ -957,6 +967,10 @@ namespace Jellyfin.Plugin.Plus.Patcher
                     + ", depth " + (r.GameDepth ?? "?")
                     + (r.GameDepthDowngraded ? " - the depth weights are not installed, so flat is what ran" : string.Empty)
                     + ", reactive " + (r.GameReactive ?? "?") + ")");
+                if (!string.IsNullOrEmpty(r.GameMotionNote))
+                {
+                    parts.Add(r.GameMotionNote);
+                }
             }
 
             // Never silent. The viewer asked for a denoise and did not get it, and the reason is
@@ -1568,9 +1582,10 @@ namespace Jellyfin.Plugin.Plus.Patcher
                     gameLevel = ShaderLibrary.IsGameLevel(gameDefault) ? gameDefault : "off";
                 }
 
-                // dlss and dlaa are NVIDIA's and fsr2 takes NVOFA motion vectors through CUDA, so none
-                // of the three runs on an Intel GPU (GPU_VENDORS.md 5.3, and 5.5 for the way back).
-                gameLevel = Withhold(plan, onIntel, "game", gameLevel, ShaderLibrary.IsNvidiaOnlyGame(gameLevel));
+                // dlss and dlaa are NVIDIA's, and fsr2 takes NVOFA motion vectors through CUDA, so on an
+                // Intel GPU none of the three runs, except fsr2 on a binary built to run without CUDA
+                // (GPU_VENDORS.md 5.5): NvidiaOnly says which.
+                gameLevel = Withhold(plan, onIntel, "game", gameLevel, NvidiaOnly("Game", gameLevel));
 
                 // fsr2/dlss/dlaa are Vulkan (vf_dlss.c's own header, "through NGX's Vulkan path");
                 // this session's CUDA-native branch has no Vulkan device at all, so a game level
@@ -1602,6 +1617,11 @@ namespace Jellyfin.Plugin.Plus.Patcher
                     out bool gameDepthDowngraded);
                 plan.GameLevel = gameUsed;
                 plan.GameApplied = plan.GameFilter != null;
+                if (plan.GameApplied && onIntel)
+                {
+                    plan.GameMotionNote = GameMotionZeroNote;
+                }
+
                 plan.GameJitter = gameJitter;
                 plan.GameDepth = gameDepth;
                 plan.GameReactive = gameReactive;
@@ -2217,9 +2237,32 @@ namespace Jellyfin.Plugin.Plus.Patcher
                 case "Neural":
                     return ShaderLibrary.IsNvidiaOnlyNeural(level);
                 case "Game":
-                    return ShaderLibrary.IsNvidiaOnlyGame(level);
+                    return ShaderLibrary.IsNvidiaOnlyGame(level)
+                        && !(ShaderLibrary.IsCudaFreeGame(level) && NoCudaGameNow());
                 default:
                     return false;
+            }
+        }
+
+        /// <summary>What a game level's record says about its motion vectors on an Intel server.</summary>
+        internal const string GameMotionZeroNote =
+            "motion vectors are zero: this ffmpeg's fsr2 runs without CUDA, so there is no optical flow"
+            + " and the reactive mask is empty (jitter is still measured)";
+
+        /// <summary>
+        /// Whether the patched ffmpeg's fsr2 was built to run without CUDA, on a detected Intel GPU.
+        /// False everywhere else, so no other server's list or command changes. Never throws.
+        /// </summary>
+        internal static bool NoCudaGameNow()
+        {
+            try
+            {
+                GpuCapability cap = GpuDetector.Current(Settings?.GpuVendor, Settings?.NeuralModelDirectory);
+                return cap.Vendor == GpuVendors.Intel && cap.Detected && cap.NoCudaGameAvailable;
+            }
+            catch (Exception)
+            {
+                return false;
             }
         }
 

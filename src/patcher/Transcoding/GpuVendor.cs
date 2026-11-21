@@ -128,6 +128,9 @@ namespace Jellyfin.Plugin.Plus.Patcher
         /// <summary>True when an Intel GPU was seen and the patched ffmpeg's ONNX Runtime ships the OpenVINO provider.</summary>
         public bool OpenVinoAvailable { get; set; }
 
+        /// <summary>True when an Intel GPU was seen and the patched ffmpeg's fsr2 was built to run without CUDA (zero motion vectors).</summary>
+        public bool NoCudaGameAvailable { get; set; }
+
         /// <summary>Why the plugin decided this, in a sentence the dashboard can show as it is.</summary>
         public string Reason { get; set; }
 
@@ -318,6 +321,12 @@ namespace Jellyfin.Plugin.Plus.Patcher
         /// </summary>
         public const string OpenVinoProviderFile = "ort/lib/libonnxruntime_providers_openvino.so";
 
+        /// <summary>
+        /// Left by scripts/build-ffmpeg.sh ORT_EP=openvino WITH_FSR2=1: this binary's fsr2 was built
+        /// with GU_NO_NVOF and runs without CUDA. Relative to the directory above the model directory.
+        /// </summary>
+        public const string NoCudaGameMarkerFile = "fsr2-nocuda";
+
         private static readonly object _lock = new object();
         private static Inventory _inventory;
         private static IGpuEnvironment _environment;
@@ -449,6 +458,7 @@ namespace Jellyfin.Plugin.Plus.Patcher
                 cap.EncoderFamily = "qsv";
                 cap.DecodeType = "vaapi";
                 cap.OpenVinoAvailable = intelSeen && OpenVinoProvider(neuralModelDirectory, env);
+                cap.NoCudaGameAvailable = intelSeen && NoCudaGameMarker(neuralModelDirectory, env);
             }
 
             return cap;
@@ -465,6 +475,13 @@ namespace Jellyfin.Plugin.Plus.Patcher
         }
 
         private static bool OpenVinoProvider(string neuralModelDirectory, IGpuEnvironment env)
+            => FileBesideModels(neuralModelDirectory, OpenVinoProviderFile, env);
+
+        private static bool NoCudaGameMarker(string neuralModelDirectory, IGpuEnvironment env)
+            => FileBesideModels(neuralModelDirectory, NoCudaGameMarkerFile, env);
+
+        /// <summary>Whether a file the ffmpeg build leaves under the prefix (the directory above the models) exists.</summary>
+        private static bool FileBesideModels(string neuralModelDirectory, string relative, IGpuEnvironment env)
         {
             try
             {
@@ -472,7 +489,7 @@ namespace Jellyfin.Plugin.Plus.Patcher
                     ? "/usr/lib/jellyfin-ffmpeg-oidn/models"
                     : neuralModelDirectory.Trim();
                 string root = Path.GetDirectoryName(models.TrimEnd('/'));
-                return !string.IsNullOrEmpty(root) && env.FileExists(Path.Combine(root, OpenVinoProviderFile));
+                return !string.IsNullOrEmpty(root) && env.FileExists(Path.Combine(root, relative));
             }
             catch (Exception)
             {

@@ -39,7 +39,9 @@
 # runtime, staged under <prefix>/ort/lib) and onnxruntime_c_api.h with the one header it includes (from
 # Microsoft's NuGet package; ORT_SDK=/path/with/include/ may name headers of the same version instead).
 # An ONNX Runtime carries the CUDA provider or the OpenVINO one, so one binary is one or the other, and it
-# is refused beside WITH_OPTIX, WITH_FSR2, WITH_DLSS and WITH_MAXINE_VSR. Not removed by it, and PR 8 of
+# is refused beside WITH_OPTIX, WITH_DLSS and WITH_MAXINE_VSR. WITH_FSR2=1 (with FSR2_SDK and FSR2_LIB, no
+# NVOF_SDK) is allowed: it applies ffmpeg/0016 and compiles gu_inputs.h with -DGU_NO_NVOF, so fsr2 runs with
+# zero motion vectors and no CUDA, and the build leaves <prefix>/fsr2-nocuda for the plugin to find. Not removed by it, and PR 8 of
 # docs/architecture/GPU_VENDORS.md is where they go: FFmpeg's own nv-codec-headers (MIT, no SDK, no card:
 # the driver is dlopen()ed), the --enable-ffnvcodec/cuda/nvenc configure flags and patches 0006 to 0014
 # are still applied. The Intel GPU plugin needs the host's OpenCL stack (ocl-icd-libopencl1,
@@ -288,9 +290,10 @@ if [[ "$WITH_FSR2" == "1" || "$WITH_DLSS" == "1" ]]; then
 fi
 if [[ "$WITH_ORT" == "1" && "$ORT_EP" == "openvino" ]]; then
     # Intel's ONNX Runtime has no CUDA provider, and 0004 (fsr2, dlss) and 0005 (vsr) stack on 0003, which
-    # this build does not apply. None of these is an Intel filter in any case.
-    [[ "$WITH_OPTIX" != "1" && "$WITH_FSR2" != "1" && "$WITH_DLSS" != "1" && "$WITH_MAXINE_VSR" != "1" ]] \
-        || die "ORT_EP=openvino cannot be built with WITH_OPTIX, WITH_FSR2, WITH_DLSS or WITH_MAXINE_VSR: they need the NVIDIA SDKs and the CUDA ONNX Runtime"
+    # this build does not apply. optix, dlss and vsr are NVIDIA's; fsr2 is the exception, built with 0016
+    # and -DGU_NO_NVOF (no CUDA, so zero motion vectors).
+    [[ "$WITH_OPTIX" != "1" && "$WITH_DLSS" != "1" && "$WITH_MAXINE_VSR" != "1" ]] \
+        || die "ORT_EP=openvino cannot be built with WITH_OPTIX, WITH_DLSS or WITH_MAXINE_VSR: they need the NVIDIA SDKs and the CUDA ONNX Runtime"
     [[ -z "$ORT_LIB_GIVEN" ]] \
         || die "ORT_EP=openvino stages its own runtime from the pinned wheel; unset ORT_LIB (ORT_SDK may still name headers)"
     if [[ -n "$ORT_SDK_GIVEN" ]]; then
@@ -313,7 +316,8 @@ elif [[ "$WITH_ORT" == "1" ]]; then
 fi
 
 # vf_fsr2 and vf_dlss both pull in gu_inputs.h, which includes the Optical Flow headers.
-if [[ "$WITH_FSR2" == "1" || "$WITH_DLSS" == "1" ]]; then
+# The OpenVINO build compiles it with GU_NO_NVOF, which includes none of them.
+if [[ "$WITH_FSR2" == "1" || "$WITH_DLSS" == "1" ]] && [[ "$ORT_EP" != "openvino" ]]; then
     [[ -n "${NVOF_SDK:-}" ]] \
         || die "WITH_FSR2/WITH_DLSS need NVOF_SDK=/path/to/NVIDIAOpticalFlowSDK (see FSR2.md)"
 fi
@@ -321,7 +325,8 @@ fi
 # The headers sit in NvOFInterface/ in a git checkout and at the root of an unpacked release, so
 # resolve it once here rather than guessing one layout and failing the compile on the other.
 NVOF_INC=""
-if [[ -n "${NVOF_SDK:-}" ]]; then
+# NVOF_SDK has a default path, so only the OpenVINO build (GU_NO_NVOF, no NVOF headers) skips this.
+if [[ "$ORT_EP" != "openvino" && -n "${NVOF_SDK:-}" ]]; then
     if [[ -f "$NVOF_SDK/NvOFInterface/nvOpticalFlowCuda.h" ]]; then
         NVOF_INC="$NVOF_SDK/NvOFInterface"
     elif [[ -f "$NVOF_SDK/nvOpticalFlowCuda.h" ]]; then
@@ -659,8 +664,15 @@ if [[ "$WITH_FSR2" == "1" || "$WITH_DLSS" == "1" ]]; then
     cp "$HERE/ffmpeg/gu_inputs.h" libavfilter/
     if [[ "$WITH_FSR2" == "1" ]]; then cp "$HERE/ffmpeg/vf_fsr2.c" libavfilter/; fi
     if [[ "$WITH_DLSS" == "1" ]]; then cp "$HERE/ffmpeg/vf_dlss.c" libavfilter/; fi
-    patch -p1 < "$HERE/ffmpeg/0004-add-fsr2-and-dlss-filters-to-build.patch"
-    export CFLAGS="-I${NVOF_INC} ${CFLAGS:-}"
+    if [[ "$ORT_EP" == "openvino" ]]; then
+        # 0004's context is lines 0002 and 0003 added; 0016 is its fsr2 half against 0001 and 0015.
+        # GU_NO_NVOF leaves CUDA and NVOFA out of gu_inputs.h, so no NVOF_SDK and no ffnvcodec for it.
+        patch -p1 < "$HERE/ffmpeg/0016-add-fsr2-filter-to-build-standalone.patch"
+        export CFLAGS="-DGU_NO_NVOF ${CFLAGS:-}"
+    else
+        patch -p1 < "$HERE/ffmpeg/0004-add-fsr2-and-dlss-filters-to-build.patch"
+        export CFLAGS="-I${NVOF_INC} ${CFLAGS:-}"
+    fi
     if [[ "$WITH_FSR2" == "1" ]]; then
         # Without -DFFX_GCC, ffx_types.h defines FFX_API as __declspec(dllexport) and every FSR2
         # header fails to parse.
@@ -908,6 +920,14 @@ fi
 if [[ "$WITH_FSR2" == "1" ]]; then
     "$PREFIX/ffmpeg" -hide_banner -filters 2>/dev/null | grep -E "\bfsr2\b" \
         && echo "  fsr2: present" || die "fsr2 filter missing from the build"
+    if [[ "$ORT_EP" == "openvino" ]]; then
+        # What the plugin's NoCudaGameAvailable looks for (GpuVendor.cs): this binary's fsr2 runs
+        # without CUDA. Written only after the check above, and removed by an OpenVINO build without it.
+        : > "$PREFIX/fsr2-nocuda"
+        echo "  fsr2: built without CUDA (zero motion vectors), marked $PREFIX/fsr2-nocuda"
+    fi
+elif [[ "$ORT_EP" == "openvino" ]]; then
+    rm -f "$PREFIX/fsr2-nocuda"
 fi
 if [[ "$WITH_DLSS" == "1" ]]; then
     "$PREFIX/ffmpeg" -hide_banner -filters 2>/dev/null | grep -E "\bdlss\b" \

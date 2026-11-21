@@ -1,0 +1,59 @@
+Add the fsr2 filter to the FFmpeg build, standalone (ORT_EP=openvino WITH_FSR2=1 in scripts/build-ffmpeg.sh).
+
+The fsr2 half of 0004-add-fsr2-and-dlss-filters-to-build.patch, written against a tree with 0001 (oidn)
+and 0015 (ort, standalone) applied. 0004's context lines include lines 0002 (OptiX) and 0003 added, so it
+applies only on top of them and so only with the OptiX SDK. vf_fsr2.c reaches CUDA only through
+gu_inputs.h, which the build compiles with -DGU_NO_NVOF (no CUDA, no NVOFA), so this variant needs no
+ffnvcodec: fsr2_filter_deps names the ONNX Runtime header gu_inputs.h includes instead. No dlss, which
+is NVIDIA's. Use this or 0004, never both.
+
+--- a/configure
++++ b/configure
+@@ -2073,6 +2073,7 @@
+     libopus
+     libopenimagedenoise
+     libonnxruntime
++    libffxfsr2
+     libplacebo
+     libpulse
+     libqrencode
+@@ -4155,6 +4155,7 @@
+ libplacebo_filter_deps="libplacebo vulkan"
+ oidn_filter_deps="libopenimagedenoise"
+ ort_filter_deps="libonnxruntime"
++fsr2_filter_deps="libffxfsr2 libonnxruntime vulkan"
+ lv2_filter_deps="lv2"
+ mcdeint_filter_deps="avcodec gpl"
+ metadata_filter_deps="avformat"
+@@ -7361,6 +7361,11 @@
+ }
+ enabled libopenimagedenoise && require libopenimagedenoise OpenImageDenoise/oidn.h oidnNewDevice -lOpenImageDenoise
+ enabled libonnxruntime    && require libonnxruntime onnxruntime_c_api.h OrtGetApiBase -lonnxruntime
++# FidelityFX-FSR2 Vulkan backend, built as a static library out of tree: upstream ships no
++# installable form and its CMake shader step is a Windows .exe.  See FSR2.md.
++enabled libffxfsr2 && { check_headers ffx_fsr2.h || \
++    die "ERROR: ffx_fsr2.h not found (see FSR2.md; FidelityFX-FSR2 is not bundled)"; } && \
++    add_extralibs -lffx_fsr2_vk -lvulkan -lstdc++ -ldl
+ enabled libplacebo        && require_pkg_config libplacebo "libplacebo >= 5.229.0" libplacebo/vulkan.h pl_vulkan_create
+ enabled libpulse          && require_pkg_config libpulse libpulse pulse/pulseaudio.h pa_context_new
+ enabled libqrencode       && require_pkg_config libqrencode libqrencode qrencode.h QRcode_encodeString
+--- a/libavfilter/Makefile
++++ b/libavfilter/Makefile
+@@ -420,6 +420,7 @@
+ OBJS-$(CONFIG_OCIO_FILTER)                   += vf_opencolorio.o ocio_wrapper.o
+ OBJS-$(CONFIG_OIDN_FILTER)                   += vf_oidn.o
+ OBJS-$(CONFIG_ORT_FILTER)                    += vf_ort.o
++OBJS-$(CONFIG_FSR2_FILTER)                   += vf_fsr2.o
+ OBJS-$(CONFIG_OSCILLOSCOPE_FILTER)           += vf_datascope.o
+ OBJS-$(CONFIG_OVERLAY_FILTER)                += vf_overlay.o framesync.o
+ OBJS-$(CONFIG_OVERLAY_CUDA_FILTER)           += vf_overlay_cuda.o framesync.o vf_overlay_cuda.ptx.o \
+--- a/libavfilter/allfilters.c
++++ b/libavfilter/allfilters.c
+@@ -393,6 +393,7 @@
+ extern const FFFilter ff_vf_ocv;
+ extern const FFFilter ff_vf_oidn;
+ extern const FFFilter ff_vf_ort;
++extern const FFFilter ff_vf_fsr2;
+ extern const FFFilter ff_vf_oscilloscope;
+ extern const FFFilter ff_vf_ocio;
+ extern const FFFilter ff_vf_overlay;

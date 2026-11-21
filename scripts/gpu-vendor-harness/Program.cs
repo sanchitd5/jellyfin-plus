@@ -89,6 +89,7 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
             IntelDevices();
             TwoGpuMachines();
             NvidiaOnlyLevels();
+            NoCudaGame();
             NeuralDevice();
             NeuralRouting();
             Fdinfo();
@@ -1059,6 +1060,81 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
                 },
                 BaseRequest = new MediaBrowser.Controller.MediaEncoding.BaseEncodingJobOptions { StreamOptions = streamOptions },
             };
+        }
+
+        // PR 6: fsr2 is offered and run on a detected Intel GPU only when the build left the fsr2-nocuda marker; dlss and dlaa never.
+        private static void NoCudaGame()
+        {
+            UpscaleEngine.EncoderListSource = () => Encoders(FullList);
+            UpscaleEngine.DrmVulkanProbeSource = n => true;
+            UpscaleEngine.Av1QsvProbeSource = () => true;
+            SetFilters("optix", "oidn", "ort", "fsr2", "dlss", "dlpp_rtcuda", "vsr_rtcuda", "libplacebo", "nlmeans_vulkan");
+            string marker = Path.Combine(Rig(), "fsr2-nocuda");
+
+            // The capability: the marker counts on an Intel GPU that was seen, and on nothing else.
+            foreach (string vendor in new[] { "auto", "nvidia", "none", "intel" })
+            {
+                FakeGpuEnvironment nvMarked = Machine("renderD128", "0x10de");
+                nvMarked.Files.Add(marker);
+                Check("NVIDIA with the marker file: no NoCudaGameAvailable [GpuVendor=" + vendor + "]", !GpuDetector.Resolve(vendor, Path.Combine(Rig(), "models"), nvMarked).NoCudaGameAvailable);
+                Check("no GPU with the marker file: no NoCudaGameAvailable [GpuVendor=" + vendor + "]", !GpuDetector.Resolve(vendor, Path.Combine(Rig(), "models"), WithFile(Machine(), marker)).NoCudaGameAvailable);
+            }
+
+            Check("Intel node, no marker: no NoCudaGameAvailable", !GpuDetector.Resolve("auto", Path.Combine(Rig(), "models"), Machine("renderD128", "0x8086")).NoCudaGameAvailable);
+            Check("Intel node + marker: NoCudaGameAvailable", GpuDetector.Resolve("auto", Path.Combine(Rig(), "models"), WithFile(Machine("renderD128", "0x8086"), marker)).NoCudaGameAvailable);
+            Check("Intel chosen, no Intel node, marker: no NoCudaGameAvailable", !GpuDetector.Resolve("intel", Path.Combine(Rig(), "models"), WithFile(Machine("renderD128", "0x10de"), marker)).NoCudaGameAvailable);
+
+            // Without the marker the Intel probe is what PR 3 made it: no game level.
+            GpuDetector.UseEnvironment(Machine("renderD128", "0x8086"));
+            UpscaleEngine.Settings = RigSettings("auto");
+            JsonElement bare = Probe();
+            Equal("Intel, no marker: Game is off alone", "off", string.Join(",", Strings(bare, "Game")));
+            Equal("Intel, no marker: Withheld game", "fsr2,dlss,dlaa", string.Join(",", Keys(bare.GetProperty("Withheld").GetProperty("Game"))));
+            UpscaleEngine.Plan refused = UpscaleEngine.Decide(SessionJob("upscale", "1080", "game", "fsr2"));
+            Equal("Intel, no marker: fsr2 is withheld", "game fsr2", refused.GpuWithheld);
+            Check("Intel, no marker: no fsr2 node and no motion note", !refused.GameApplied && refused.GameFilter == null && refused.GameMotionNote == null);
+
+            // With it, fsr2 is offered and runs, and dlss and dlaa stay withheld.
+            GpuDetector.UseEnvironment(WithFile(Machine("renderD128", "0x8086"), marker));
+            UpscaleEngine.Settings = RigSettings("auto");
+            JsonElement marked = Probe();
+            Check("Intel + marker: Game offers fsr2 and not dlss or dlaa", Strings(marked, "Game").Contains("fsr2") && !Strings(marked, "Game").Contains("dlss") && !Strings(marked, "Game").Contains("dlaa"), string.Join(",", Strings(marked, "Game")));
+            Check("Intel + marker: the game labels follow", Keys(marked.GetProperty("GameLabels")).Contains("fsr2") && !Keys(marked.GetProperty("GameLabels")).Contains("dlss"));
+            Equal("Intel + marker: Withheld game", "dlss,dlaa", string.Join(",", Keys(marked.GetProperty("Withheld").GetProperty("Game"))));
+            Check("Intel + marker: the other withheld axes are untouched", string.Join(",", Keys(marked.GetProperty("Withheld").GetProperty("Denoise"))) == "optix,optix-temporal"
+                && string.Join(",", Keys(marked.GetProperty("Withheld").GetProperty("Neural"))) == "vsr-rtcuda,dlpp-1,dlpp-2,dlpp-3,dlpp-4");
+
+            UpscaleEngine.Plan fsr = UpscaleEngine.Decide(SessionJob("upscale", "1080", "game", "fsr2"));
+            Check("Intel + marker: fsr2 runs, nothing withheld", fsr.Act && fsr.GameApplied && fsr.GpuWithheld == null, fsr.Status + ": " + fsr.Reason + " / " + fsr.GpuWithheld);
+            Check("Intel + marker: the chain carries the fsr2 node", UpscaleEngine.BuildChain(fsr).Contains("fsr2"), UpscaleEngine.BuildChain(fsr));
+            Check("Intel + marker: no CUDA hwaccel", !UpscaleEngine.HwaccelArgs(fsr).Contains("cuda"));
+            SessionRecord fsrRecord = UpscaleEngine.Describe(null, fsr, fsr.Status, fsr.Reason);
+            Check("Intel + marker: the record says the motion vectors are zero", fsrRecord.GameMotionNote == UpscaleEngine.GameMotionZeroNote && fsrRecord.Summary.Contains("motion vectors are zero"), fsrRecord.Summary);
+
+            UpscaleEngine.Plan dlss = UpscaleEngine.Decide(SessionJob("upscale", "1080", "game", "dlss"));
+            Equal("Intel + marker: dlss is still withheld", "game dlss", dlss.GpuWithheld);
+            UpscaleEngine.Plan dlaa = UpscaleEngine.Decide(SessionJob("upscale", "1080", "game", "dlaa"));
+            Equal("Intel + marker: dlaa is still withheld", "game dlaa", dlaa.GpuWithheld);
+            Check("Intel + marker: neither dlss nor dlaa has a node", !dlss.GameApplied && !dlaa.GameApplied && dlss.GameFilter == null && dlaa.GameFilter == null);
+
+            // The marker never reaches an NVIDIA box, and the classification of the levels themselves does not move.
+            GpuDetector.UseEnvironment(WithFile(Machine("renderD128", "0x10de"), marker));
+            UpscaleEngine.Settings = RigSettings("auto");
+            Equal("NVIDIA with the marker file: Game keeps all three", "off,fsr2,dlss,dlaa", string.Join(",", Strings(Probe(), "Game")));
+            UpscaleEngine.Plan nvFsr = UpscaleEngine.Decide(SessionJob("upscale", "1080", "game", "fsr2"));
+            Check("NVIDIA with the marker file: fsr2 runs with no motion note", nvFsr.GameApplied && nvFsr.GpuWithheld == null && nvFsr.GameMotionNote == null, nvFsr.Status + ": " + nvFsr.Reason);
+            Check("the level classification is unchanged", ShaderLibrary.IsNvidiaOnlyGame("fsr2") && ShaderLibrary.IsCudaFreeGame("fsr2") && !ShaderLibrary.IsCudaFreeGame("dlss") && !ShaderLibrary.IsCudaFreeGame("dlaa") && !ShaderLibrary.IsCudaFreeGame("off") && !ShaderLibrary.IsCudaFreeGame(null));
+
+            GpuDetector.UseEnvironment(null);
+            UpscaleEngine.EncoderListSource = null;
+            UpscaleEngine.DrmVulkanProbeSource = null;
+            UpscaleEngine.Av1QsvProbeSource = null;
+        }
+
+        private static FakeGpuEnvironment WithFile(FakeGpuEnvironment env, string path)
+        {
+            env.Files.Add(path);
+            return env;
         }
 
         private static string _neuralRig;

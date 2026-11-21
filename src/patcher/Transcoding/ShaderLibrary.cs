@@ -964,6 +964,14 @@ namespace Jellyfin.Plugin.Plus.Patcher
         public static bool IsNvidiaOnlyGame(string level) =>
             IsGameLevel(level) && !level.Trim().Equals("off", StringComparison.OrdinalIgnoreCase);
 
+        /// <summary>
+        /// The one game level that is not NVIDIA's: fsr2 is vendor-neutral, and what ties it to CUDA
+        /// is the motion-vector source in gu_inputs.h, which a GU_NO_NVOF build replaces with zeros.
+        /// dlss and dlaa stay NVIDIA-only (GPU_VENDORS.md 5.5).
+        /// </summary>
+        public static bool IsCudaFreeGame(string level) =>
+            level != null && level.Trim().Equals("fsr2", StringComparison.OrdinalIgnoreCase);
+
         /// <summary>The full path to a neural level's weights, or null when there is no such level.</summary>
         public static string NeuralModelPath(string level, UpscaleSettings cfg = null)
         {
