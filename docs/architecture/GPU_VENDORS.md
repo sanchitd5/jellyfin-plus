@@ -2,9 +2,10 @@
 
 Design spec for making the enhancement engine vendor-aware. Written to be implemented as a series of
 small pull requests, each one landing on its own branch and verified before the next starts. **PR 1
-(detection and a report-only capability model) is the first and the only one specified to the line;
-the rest are the plan, with what is known, what was measured, and what is still a guess marked as
-such.** Nothing in PRs 2 to 8 is built.
+(detection and a report-only capability model) is built (section 3); the rest are the plan, with
+what is known, what was measured, and what is still a guess marked as such.** Nothing in PRs 2 to 8
+is built. PR 1 compiled and ran nowhere yet: the author had no .NET SDK or server DLLs, so the first
+run of `scripts/test-gpu-vendor.sh` is still to come (section 3.6).
 
 Today every GPU-specific decision in the engine assumes NVIDIA. This spec does not change that for
 anyone who has an NVIDIA card: with the card present, every ffmpeg command line this plugin builds

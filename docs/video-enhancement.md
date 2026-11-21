@@ -518,6 +518,7 @@ Dashboard → Plugins → Jellyfin Plus. Defaults suit a single busy GPU:
 | `MaxSourceHeight` | 1440 | never upscale sources taller than this |
 | `MaxConcurrent` | 4 | beyond this, stock transcoding is used |
 | `Encoder` | `hevc_nvenc` | falls back to the client's codec when unsupported; `av1_nvenc` requires compute 8.9+ (Ada Lovelace), guarded automatically |
+| `GpuVendor` | `auto` | `auto` / `nvidia` / `intel` / `none`. Report only for now: says what the dashboard, the probe and Recent sessions report about the GPU; changes no command (see [GPU_VENDORS.md](architecture/GPU_VENDORS.md)) |
 | `RequireClientOptIn` | false | off (default) = enhance every eligible transcode |
 | `ForceTranscode` | false | turn a would-be stream copy into a real transcode |
 | `ForceTranscodeForDirectPlay` | false | see below — stops clients direct playing eligible material |

@@ -181,6 +181,15 @@ namespace Jellyfin.Plugin.Plus.Patcher
         /// <summary>Why that encoder, in particular whether a configured encoder was refused.</summary>
         public string EncoderReason { get; set; }
 
+        /// <summary>
+        /// The GPU capability record as the plugin saw it when this session's command was built:
+        /// vendor, render node, encoder family, decode type, whether the CUDA-only levels and
+        /// OpenVINO are available. REPORT ONLY: nothing read it to build the command, so it
+        /// describes the server, not a choice made for this session. Null only when the session
+        /// was recorded by a build that predates the field.
+        /// </summary>
+        public GpuCapability Gpu { get; set; }
+
         /// <summary>applied | not-requested | off-by-client | concurrency-cap | subtitle-burn-in | stream-copy | disabled | ineligible.</summary>
         public string Status { get; set; }
 
@@ -578,6 +587,11 @@ namespace Jellyfin.Plugin.Plus.Patcher
                         : (Settings?.GpuResidentEncode == true ? "Vulkan (GPU-resident)" : "Vulkan"),
                 Status = status,
                 Reason = reason,
+
+                // Report only: this is read for the record and for no decision. Current never
+                // throws and asks the machine once per process, so after the first session it costs
+                // the transcode path one small allocation (plus a file-exists check on Intel).
+                Gpu = GpuDetector.Current(Settings?.GpuVendor, Settings?.NeuralModelDirectory),
             };
 
             // GetVideoEncoder and GetVideoProcessingFilterParam are separate call sites and
