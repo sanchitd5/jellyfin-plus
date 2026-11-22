@@ -175,15 +175,18 @@ Vulkan-denoise probe and the AV1 test-encode command are the strings they were, 
 never runs, the session record carries `vk:0` and no withheld text, and the probe has exactly the 23
 keys it had with the level lists `ShaderLibrary` offers (and the status route has no new key). On Intel
 it asserts the derived device (never `vk:0`), the fallback to `vk:0` when the test start fails and the
-trust-it path when the test is inconclusive, the QSV pin at `renderD136` and above and not at 128 to
-135, a node name that is not a plain render node, two-GPU machines in both orders (Intel first and
+trust-it path when the test is inconclusive, the background test (a session call returns at once, two
+callers start one test, a pass is never re-asked, a failure is re-asked only after the retry window),
+the QSV pin to the detected node at every render node, including an AMD card at `renderD128` beside an
+Intel one at `renderD129`, a node name that is not a plain render node, two-GPU machines in both orders (Intel first and
 NVIDIA first, `auto`, `nvidia`, `intel`, two Intel GPUs, an AMD node beside an Intel one), that nothing
 Intel emits `nvenc`, `cuda` or `vaapi`, that the probe lists lose exactly the NVIDIA-only levels and
-report each as `needs NVIDIA`, that a session asking for `optix`, `dlpp-2` and `dlss` (or defaulted to
+report each with its own reason (`needs NVIDIA`, or "not measured on Intel" for the ONNX levels), that a session asking for `optix`, `dlpp-2` and `dlss` (or defaulted to
 them) is enhanced without them, with `GpuWithheld` and the summary saying so, and that the same
 sessions on an NVIDIA box run them. A mutation check (the Intel gate off in the device resolution, in
-the level withholding, in the probe lists, and the QSV pin range widened) fails 33, 12, 6 and 9 of
-these. The shim's `render_node` has its own 11 checks in `scripts/test-shim-device.py`, run by the
+the level withholding and in the probe lists) failed 33, 12 and 6 of the earlier checks; the checks
+added for the review have since been run and passed. The shim's `render_node` has its own 11 checks in
+`scripts/test-shim-device.py`, run by the
 script when python3 is present (the SDK container has none, so they were run separately).
 
 ## 4. The series
@@ -197,7 +200,7 @@ verified on the real box.
 |---|---|---|---|
 | 1 | Detection and the report-only capability record (section 3) | none | Harness; the record shown live on an NVIDIA box and an Intel box; command lines unchanged |
 | 2 | Encoder per vendor and Intel load (the old PR 2 and PR 4 together, section 5.1 and 5.2): map the negotiated codec to `*_nvenc` or `*_qsv`; a `*_nvenc` setting on an Intel box is treated as auto and said so; Jellyfin's own `*_qsv` choice is kept; `GuardAv1` test-encodes `av1_qsv` on Intel; the GPU-resident encode (`hwmap=derive_device=cuda`) is NVIDIA-only and reported n/a on Intel; `Gpu/Load` gains `vendor`, `encoderSessions`, `gpuBusyPercent` from DRM fdinfo | 1 | Served segment codec and size on each vendor; NVIDIA command byte-identical; busy percentage under a known encode |
-| 3 | The Vulkan device from the render node instead of `vk:0`, on Intel only (section 5.3); the QSV device pinned to the same node where the encoder would not find it by itself; the NVIDIA-only levels (`optix`, `dlpp-*`, `vsr-rtcuda`, `fsr2`, `dlss`, `dlaa`) withheld from the probe on Intel and reported as "needs NVIDIA"; `MaxConcurrent` 1 for 4K output on a small Intel GPU recommended in docs, default unchanged | 1, 2 | Command on a two-GPU box names the right device; NVIDIA, `none` and one-GPU commands unchanged; the probe on an Intel box lacks the NVIDIA-only levels |
+| 3 | The Vulkan device from the render node instead of `vk:0`, on Intel only (section 5.3); the QSV device always pinned to the detected node; the NVIDIA-only levels (`optix`, `dlpp-*`, `vsr-rtcuda`, `fsr2`, `dlss`, `dlaa`) and the unmeasured ONNX levels (`realesr-*`) withheld from the probe on Intel, each with its reason; `MaxConcurrent` 1 for 4K output on a small Intel GPU recommended in docs, default unchanged | 1, 2 | Command on a two-GPU box names the right device; NVIDIA, `none` and one-GPU commands unchanged; the probe on an Intel box lacks the NVIDIA-only levels |
 | 4 | Folded into PR 2 (Intel load via DRM fdinfo, section 5.2) | 1 | see PR 2 |
 | 5 | `vf_ort` OpenVINO execution provider, `NeuralMaxSourceHeight` | 1, 8 | Neural level offered and running on Intel; a served segment |
 | 6 | `gu_inputs` without CUDA | 5 | Motion vectors from a non-NVOFA source, compared by the project's temporal measurements |
@@ -344,33 +347,44 @@ id decides. Two GPUs of different models are told apart correctly; **two identic
 are not**: the first in Vulkan's order is taken whichever node was asked for. Second, a derive that
 cannot find a device is an error that ends the session's ffmpeg, a dead stream, not a degraded one.
 
-So the Intel device is checked before it is used. The first time it is needed the engine runs the
-stock ffmpeg once with exactly this device initialisation and a one-frame `hwupload,hwdownload`
-(the pattern `Av1QsvUsable` and `VulkanDenoiseRunsOnPatchedBinary` already follow), remembers the
-answer, and reports it. A failed check falls back to `vk:0` (today's behaviour, so this PR cannot
-turn a working Intel box into a dead one) and says so in the session record; an inconclusive check (no
-ffmpeg found, a timeout) trusts the render node, since nothing else would run either. When the record
-has no usable render node path, the argument is `vk:0`. The node text is only ever the detector's own
-`/dev/dri/renderD<digits>`; anything else is not put on a command line.
+So the Intel device is checked before it is used, **off the session path**. The engine runs the stock
+ffmpeg once per node with exactly this device initialisation and a one-frame `hwupload,hwdownload`
+(the pattern `Av1QsvUsable` and `VulkanDenoiseRunsOnPatchedBinary` already follow). The test takes up
+to 20 s, so no session waits for it: `UpscaleEngine.WarmDevices`, called from `PatcherHost.Apply`
+after `Configure`, starts it at plugin load, only one test runs per node (single-flight, behind a
+short lock that guards the cache entry and never an ffmpeg run), and a session that arrives first
+gets the last known answer or, when there is none yet, the untested node with the record text
+`(test pending)`. A pass is kept for the life of the process. A failure, and an inconclusive result
+(no ffmpeg found, a timeout), are kept for about 5 minutes and then re-tested in the background while
+the stale answer is served, so a transient failure does not pin an Intel server to `vk:0` until
+restart. A failed check falls back to `vk:0` (today's behaviour, so this PR cannot turn a working
+Intel box into a dead one) and says so in the session record; an inconclusive check trusts the render
+node, since nothing else would run either. When the record has no usable render node path, the
+argument is `vk:0`. The node text is only ever the detector's own `/dev/dri/renderD<digits>`;
+anything else is not put on a command line.
 
-**The QSV device (also decided from the source).** Nothing needs to be added in the common case. With
-no QSV device on the command line, `qsvenc_init_session` opens an internal session, and
-`ff_qsv_set_display_handle` (`libavcodec/qsv.c`) creates a VA-API device with `vendor_id=0x8086`;
-`vaapi_device_create` then walks `/dev/dri/renderD128` to `renderD135` (`max_devices = 8`) and takes
-the first node of that vendor. The detector's render node is the first Intel node in numeric order,
-so the two agree for every node from 128 to 135, which is every machine that is not unusual. Above
-that the implicit search never reaches the node, so there (and only there, and only when ffmpeg lists
-a QSV encoder) the arguments gain `-init_hw_device qsv=qs:hw_any,child_device=<node>`, which is what
-`-qsv_device <node>` expands to (`opt_qsv_device`). The encoder takes the one QSV device on the
-command line (`hw_device_setup_for_encode`, `HW_CONFIG_ENCODER_DEVICE(NV12, QSV)`). The one-GPU
-command is therefore unchanged from PR 2 apart from the Vulkan device. What this does not do is let
-an operator choose between two Intel GPUs: the first Intel node wins, as it does in the detector.
+**The QSV device (also decided from the source).** With no QSV device on the command line,
+`qsvenc_init_session` opens an internal session, and `ff_qsv_set_display_handle` (`libavcodec/qsv.c`)
+creates a VA-API device with `vendor_id=0x8086`; `vaapi_device_create` then walks
+`/dev/dri/renderD128` to `renderD135` (`max_devices = 8`) and takes the first node of that vendor.
+That search is not what the engine relies on: it is derived from source, never run, and on a box with
+an AMD GPU at `renderD128` and an Intel one at `renderD129` the detector's node is the only thing
+that names the right card. So whenever ffmpeg lists a QSV encoder the arguments always carry
+`-init_hw_device qsv=qs:hw_any,child_device=<node>`, which is what `-qsv_device <node>` expands to
+(`opt_qsv_device`), with `<node>` the detected one; with no QSV encoder there is no argument and the
+record says `none`. The encoder takes the one QSV device on the command line
+(`hw_device_setup_for_encode`, `HW_CONFIG_ENCODER_DEVICE(NV12, QSV)`). What this does not do is let an
+operator choose between two Intel GPUs: the first Intel node wins, as it does in the detector.
 
 **Where it applies.** One function builds the device arguments and both the session command
 (`HwaccelArgs`) and the two engine probes that start a Vulkan or QSV device use it, so a probe tests
-the device a session will use. The shim fallback reads an optional `render_node` from its JSON
-(unset keeps `vulkan=vk:0`); it has no vendor detection and no probe, so it is for an operator who
-knows the node.
+the device a session will use. A plan resolves that device once (`Plan.Devices`, set in `Decide`) and
+`HwaccelArgs(plan)`, `Describe` and both probe builders take it, so a render-node answer that changes
+between two reads cannot make the session record and its command disagree. The shim fallback reads
+an optional `render_node` from its JSON (unset keeps `vulkan=vk:0`); it has no vendor detection and
+no probe, so it is for an operator who knows the node. It is set by hand in
+`/etc/jellyfin-upscale.json`, is never test-started, and `ShimBridge.Sync` (which merges into the
+existing keys) keeps it across a sync but never writes it.
 
 **The NVIDIA-only levels.** On the Intel path these are not offered and are not run, and the reason
 is stated, never silent:
@@ -386,11 +400,16 @@ label maps), so the client, which builds its menu from the probe, never offers i
 dashboard default or a stale client still asks for one gets `off` for that axis and the session says
 so: `SessionRecord.GpuWithheld` and a sentence in the summary ("... NOT run, needs NVIDIA ..."), with
 `NeuralRequested` still naming what was asked. The probe carries `Levels.Withheld` (axis, level,
-`needs NVIDIA`) and the status route the same, **only on the Intel path**, so the NVIDIA probe and
-status are unchanged, and the dashboard's GPU line lists them. Left alone on purpose: the ONNX
-neural levels (`ort`) fall back to ONNX Runtime's CPU provider without CUDA, which is not CUDA-required
-but is almost certainly not real time; PR 5 owns that (OpenVINO and `NeuralMaxSourceHeight`), and until
-then the record's neural description says CUDA is not what ran on Intel.
+the level's own reason) and the status route the same, **only on the Intel path**, so the NVIDIA probe
+and status are unchanged, and the dashboard's GPU line prints each as `Axis level (reason)`.
+
+The ONNX neural levels (`realesr-anime-x2`, `realesr-anime-x4`, `realesr-general-x4`) are withheld on
+Intel as well, but with a different reason, "not measured on Intel": they do not need CUDA, they fall
+back to ONNX Runtime's CPU provider, which is almost certainly not real time and has never been
+measured for this chain. The Intel `Neural` list is therefore `off`, the session summary names the
+reason per group, and PR 5 (OpenVINO and `NeuralMaxSourceHeight`) is what brings them back. There is
+no setting to opt in: that would need the five-place settings checklist for a level nobody has
+measured, and the withholding goes away with PR 5.
 
 **Recommended in documentation only: `MaxConcurrent` 1 for 4K output on a small Intel GPU.** The one
 measurement there is (section 6) is a single session, 1080p to 2160p at 38 to 40 fps on an A380.

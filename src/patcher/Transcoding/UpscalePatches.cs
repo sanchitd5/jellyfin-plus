@@ -915,7 +915,7 @@ namespace Jellyfin.Plugin.Plus.Patcher
                     return;
                 }
 
-                string encoder = UpscaleEngine.EncoderFor(state, out string encoderReason);
+                string encoder = UpscaleEngine.EncoderFor(state, out string encoderReason, plan.Devices);
                 UpscaleEngine.NoteEncoder(UpscaleEngine.SessionKey(state), encoder, encoderReason);
                 _logger?.LogInformation(
                     "JellyfinPlus: replacing stream copy with {Encoder} for {Path} ({Reason})",
@@ -972,12 +972,12 @@ namespace Jellyfin.Plugin.Plus.Patcher
                 return true;
             }
 
-            if (!ShouldAct(state, out _))
+            if (!ShouldAct(state, out var actPlan))
             {
                 return true;
             }
 
-            string chosen = UpscaleEngine.EncoderFor(state, out string reason);
+            string chosen = UpscaleEngine.EncoderFor(state, out string reason, actPlan?.Devices);
             UpscaleEngine.NoteEncoder(sessionKey, chosen, reason + " (replacing Jellyfin's " + __result + ", which cannot take this chain's frames)");
             _logger?.LogInformation(
                 "JellyfinPlus: encoder {Was} -> {Now} for {Path} ({Reason})",
@@ -997,7 +997,8 @@ namespace Jellyfin.Plugin.Plus.Patcher
         /// </summary>
         private static void ApplyConfiguredEncoderToTranscode(EncodingJobInfo state, UpscaleSettings cfg, ref string __result)
         {
-            string swapped = UpscaleEngine.GuardAv1(state, __result, out string av1Reason);
+            ShouldAct(state, out var guardPlan);
+            string swapped = UpscaleEngine.GuardAv1(state, __result, out string av1Reason, guardPlan?.Devices);
             if (av1Reason != null)
             {
                 UpscaleEngine.NoteEncoder(UpscaleEngine.SessionKey(state), swapped, av1Reason);
@@ -1028,12 +1029,12 @@ namespace Jellyfin.Plugin.Plus.Patcher
                 return;
             }
 
-            if (!ShouldAct(state, out _))
+            if (!ShouldAct(state, out var actPlan))
             {
                 return;
             }
 
-            string chosen = UpscaleEngine.EncoderFor(state, out string reason);
+            string chosen = UpscaleEngine.EncoderFor(state, out string reason, actPlan?.Devices);
             string sessionKey = UpscaleEngine.SessionKey(state);
 
             if (!string.Equals(chosen, configured, StringComparison.OrdinalIgnoreCase))

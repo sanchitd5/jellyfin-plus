@@ -809,15 +809,17 @@
                 return ' GPU: ' + found + node + ' (' + g.Reason + ').';
             }
 
-            // The levels this server's GPU cannot run, as the server reports them: only an Intel
-            // server sends any, and then every one needs NVIDIA. Nothing is said otherwise.
+            // The levels this server's GPU does not offer, as the server reports them (axis -> level
+            // -> reason): only an Intel server sends any. Nothing is said otherwise.
             function withheldText(w) {
                 if (!w) { return ''; }
-                var names = [];
+                var items = [];
                 Object.keys(w).forEach(function (axis) {
-                    Object.keys(w[axis] || {}).forEach(function (level) { names.push(level); });
+                    Object.keys(w[axis] || {}).forEach(function (level) {
+                        items.push(axis + ' ' + level + ' (' + w[axis][level] + ')');
+                    });
                 });
-                return names.length ? ' Not offered on this GPU (needs NVIDIA): ' + names.join(', ') + '.' : '';
+                return items.length ? ' Not offered on this GPU: ' + items.join(', ') + '.' : '';
             }
 
             function loadStatus(page) {

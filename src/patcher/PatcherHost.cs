@@ -22,6 +22,7 @@ namespace Jellyfin.Plugin.Plus.Patcher
         public static string Apply(object logger, string settingsJson)
         {
             Configure(settingsJson);
+            UpscaleEngine.WarmDevices();
             UpscalePatches.Apply(logger as ILogger);
             return UpscalePatches.Status;
         }

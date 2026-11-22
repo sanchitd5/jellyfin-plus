@@ -955,6 +955,15 @@ namespace Jellyfin.Plugin.Plus.Patcher
             && (IsCudaNeuralLevel(level) || level.Trim().Equals(VsrLevel, StringComparison.OrdinalIgnoreCase));
 
         /// <summary>
+        /// The ONNX neural levels (realesr-*): runnable without NVIDIA, but their speed was only measured
+        /// on it, so Intel withholds them until it is measured there (UpscaleEngine.IntelWithholdReason).
+        /// </summary>
+        public static bool IsOnnxNeural(string level) =>
+            level != null
+            && !level.Trim().Equals("off", StringComparison.OrdinalIgnoreCase)
+            && _neuralModels.ContainsKey(level.Trim());
+
+        /// <summary>
         /// Every game temporal upscaler: dlss and dlaa are NVIDIA's, and fsr2 is fed by NVOFA motion
         /// vectors through CUDA (gu_inputs.h), so none of the three runs without an NVIDIA GPU.
         /// </summary>

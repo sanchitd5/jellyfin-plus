@@ -79,6 +79,8 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
 
         private static int Main()
         {
+            // The render-node test runs on the calling thread, so every Devices() call below sees its answer.
+            UpscaleEngine.DrmVulkanInline = true;
             PciIds();
             Settings();
             Decision();
@@ -87,6 +89,7 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
             IntelEncoder();
             IntelChain();
             IntelDevices();
+            DrmProbeCache();
             TwoGpuMachines();
             NvidiaOnlyLevels();
             Fdinfo();
@@ -511,7 +514,7 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
         {
             GpuDetector.UseEnvironment(Machine("renderD128", "0x8086"));
             UpscaleEngine.EncoderListSource = () => Encoders(list);
-            UpscaleEngine.Av1QsvProbeSource = () => true;
+            UpscaleEngine.Av1QsvProbeSource = _ => true;
             UpscaleEngine.DrmVulkanProbeSource = n => true;
             UpscaleEngine.Settings = new UpscaleSettings { Encoder = encoder, GpuVendor = setting };
         }
@@ -543,16 +546,27 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
 
             // AV1 without an AV1 encoder in the GPU: the test encode fails and the choice swaps.
             OnIntel("auto", "auto", FullList);
-            UpscaleEngine.Av1QsvProbeSource = () => false;
+            UpscaleEngine.Av1QsvProbeSource = _ => false;
             Equal("av1_qsv fails its test encode, client takes hevc: hevc_qsv", "hevc_qsv", UpscaleEngine.EncoderFor(Job("av1", "av1", "hevc"), out reason));
             Equal("av1_qsv swap: the reason", "a test encode with av1_qsv failed on this GPU, used hevc_qsv instead of av1_qsv; Encoder set to auto; following the client-negotiated av1 (av1_qsv)", reason);
             Equal("av1_qsv fails its test encode, client takes only h264: h264_qsv", "h264_qsv", UpscaleEngine.EncoderFor(Job("av1", "av1", "h264"), out reason));
-            UpscaleEngine.Av1QsvProbeSource = () => null;
+            UpscaleEngine.Av1QsvProbeSource = _ => null;
             Equal("an inconclusive AV1 test leaves av1_qsv alone", "av1_qsv", UpscaleEngine.EncoderFor(Job("av1", "av1", "hevc"), out reason));
             Equal("GuardAv1 on Intel leaves other encoders alone", "hevc_qsv", UpscaleEngine.GuardAv1(null, "hevc_qsv", out reason));
             Check("GuardAv1 on Intel: nothing swapped, no reason", reason == null);
-            UpscaleEngine.Av1QsvProbeSource = () => false;
+            UpscaleEngine.Av1QsvProbeSource = _ => false;
             Equal("GuardAv1 on Intel swaps a test-encode failure", "hevc_qsv", UpscaleEngine.GuardAv1(null, "av1_qsv", out reason));
+
+            // The plan's DeviceInit is the one the test encode runs on; GuardAv1Intel must not resolve its own.
+            var planDevices = new UpscaleEngine.DeviceInit { QsvArgs = " -init_hw_device qsv=qs:hw_any,child_device=/dev/dri/renderD999" };
+            UpscaleEngine.DeviceInit probed = null;
+            UpscaleEngine.Av1QsvProbeSource = d => { probed = d; return false; };
+            UpscaleEngine.GuardAv1(null, "av1_qsv", out reason, planDevices);
+            Check("GuardAv1 on Intel probes on the plan's DeviceInit, not a fresh Devices()", ReferenceEquals(probed, planDevices));
+            probed = null;
+            UpscaleEngine.EncoderFor(Job("av1", "av1", "hevc"), out reason, planDevices);
+            Check("EncoderFor hands the plan's DeviceInit to GuardAv1", ReferenceEquals(probed, planDevices));
+            UpscaleEngine.Av1QsvProbeSource = _ => false;
 
             // The encoder list decides between QSV and software, and never produces VA-API or NVENC.
             OnIntel("auto", "auto", "libx264", "libx265", "hevc_vaapi", "h264_vaapi");
@@ -667,8 +681,8 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
                 Equal("Intel BuildChain ends in a download, never the CUDA hand-off" + tag,
                     "format=yuv420p,hwupload,libplacebo=w=1920:h=1080:upscaler=ewa_lanczos,hwdownload,format=yuv420p",
                     UpscaleEngine.BuildChain(new UpscaleEngine.Plan { Width = 1920, Height = 1080, UpscaleApplied = true }));
-                Equal("Intel HwaccelArgs starts the Vulkan device from the render node, never vk:0" + tag,
-                    " -init_hw_device drm=dr:/dev/dri/renderD128 -init_hw_device vulkan=vk@dr -filter_hw_device vk",
+                Equal("Intel HwaccelArgs starts the Vulkan device from the render node, never vk:0, and pins QSV to it" + tag,
+                    " -init_hw_device drm=dr:/dev/dri/renderD128 -init_hw_device vulkan=vk@dr -init_hw_device qsv=qs:hw_any,child_device=/dev/dri/renderD128 -filter_hw_device vk",
                     UpscaleEngine.HwaccelArgs(null));
 
                 var plan = new UpscaleEngine.Plan { Act = true, Width = 1920, Height = 1080, SourceWidth = 1280, SourceHeight = 720 };
@@ -695,6 +709,7 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
         private static void IntelDevices()
         {
             const string Drm128 = " -init_hw_device drm=dr:/dev/dri/renderD128 -init_hw_device vulkan=vk@dr";
+            const string Qsv128 = " -init_hw_device qsv=qs:hw_any,child_device=/dev/dri/renderD128";
             var asked = new List<string>();
 
             GpuDetector.UseEnvironment(Machine("renderD128", "0x8086"));
@@ -706,10 +721,10 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
             };
             UpscaleEngine.Settings = new UpscaleSettings { Encoder = "auto", GpuVendor = "auto" };
 
-            Equal("one Intel GPU: HwaccelArgs", Drm128 + " -filter_hw_device vk", UpscaleEngine.HwaccelArgs(null));
+            Equal("one Intel GPU: HwaccelArgs", Drm128 + Qsv128 + " -filter_hw_device vk", UpscaleEngine.HwaccelArgs(null));
             Check("one Intel GPU: never vk:0", !UpscaleEngine.HwaccelArgs(null).Contains("vk:0"));
-            Check("one Intel GPU: the QSV device is not added (the encoder finds the node itself)", UpscaleEngine.Devices().QsvArgs == string.Empty);
-            Equal("one Intel GPU: the encoder's device in the record", "implicit (the first Intel render node, /dev/dri/renderD128)", UpscaleEngine.Devices().QsvText);
+            Equal("one Intel GPU: the QSV device is pinned to the detected node", Qsv128, UpscaleEngine.Devices().QsvArgs);
+            Equal("one Intel GPU: the encoder's device in the record", "/dev/dri/renderD128", UpscaleEngine.Devices().QsvText);
             Equal("one Intel GPU: the Vulkan device in the record", "render node /dev/dri/renderD128", UpscaleEngine.Devices().VulkanText);
             Check("the render-node test was asked about the node, and only that node", asked.Count > 0 && asked.All(n => n == "/dev/dri/renderD128"));
             Equal("the render-node test command",
@@ -718,44 +733,38 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
             Equal("Vulkan-denoise probe tests the session's device",
                 "-hide_banner -loglevel error" + Drm128 + " -filter_hw_device vk -f lavfi -i testsrc=size=64x64:rate=1 -frames:v 1 -vf \"format=yuv420p,hwupload,nlmeans_vulkan,hwdownload,format=yuv420p\" -f null -",
                 UpscaleEngine.VulkanDenoiseProbeArgs());
-            Equal("AV1 QSV test encode is unchanged when the device is implicit",
-                "-hide_banner -loglevel error -f lavfi -i color=c=black:s=640x360:r=1 -frames:v 1 -vf format=nv12 -c:v av1_qsv -f null -",
+            Equal("AV1 QSV test encode uses the pinned QSV device",
+                "-hide_banner -loglevel error" + Qsv128 + " -f lavfi -i color=c=black:s=640x360:r=1 -frames:v 1 -vf format=nv12 -c:v av1_qsv -f null -",
                 UpscaleEngine.Av1QsvProbeArgs());
 
             // A CUDA-native plan cannot reach an Intel server (Decide drops those levels), and if one
             // ever did, the command still carries no CUDA.
             string cuda = UpscaleEngine.HwaccelArgs(new UpscaleEngine.Plan { UsesCudaNeural = true });
-            Equal("Intel: a CUDA-native plan still gets the Vulkan device only", Drm128 + " -filter_hw_device vk", cuda);
+            Equal("Intel: a CUDA-native plan still gets the Vulkan and QSV devices only", Drm128 + Qsv128 + " -filter_hw_device vk", cuda);
 
             // The record says which device the command used.
             var plan = new UpscaleEngine.Plan { Act = true, Width = 1920, Height = 1080, SourceWidth = 1280, SourceHeight = 720 };
             SessionRecord record = UpscaleEngine.Describe(null, plan, "applied", "x");
             Equal("record: VulkanDevice names the node", "render node /dev/dri/renderD128", record.VulkanDevice);
-            Equal("record: QsvDevice says implicit", "implicit (the first Intel render node, /dev/dri/renderD128)", record.QsvDevice);
+            Equal("record: QsvDevice names the pinned node", "/dev/dri/renderD128", record.QsvDevice);
             Check("record: a session that was not enhanced names no device",
                 UpscaleEngine.Describe(null, new UpscaleEngine.Plan(), "not-requested", "x").VulkanDevice == null
                 && UpscaleEngine.Describe(null, new UpscaleEngine.Plan(), "not-requested", "x").QsvDevice == null);
 
             // The test fails: the first Vulkan device, and the record says why. Never a dead stream from this change.
             UpscaleEngine.DrmVulkanProbeSource = n => false;
-            Equal("the render-node test fails: vk:0", " -init_hw_device vulkan=vk:0 -filter_hw_device vk", UpscaleEngine.HwaccelArgs(null));
+            Equal("the render-node test fails: vk:0, QSV still pinned", " -init_hw_device vulkan=vk:0" + Qsv128 + " -filter_hw_device vk", UpscaleEngine.HwaccelArgs(null));
             Equal("the render-node test fails: the record says so", "vk:0 (a test start from /dev/dri/renderD128 failed, so the first Vulkan device)", UpscaleEngine.Devices().VulkanText);
             Equal("the render-node test fails: the Vulkan-denoise probe follows", "-hide_banner -loglevel error -init_hw_device vulkan=vk:0 -filter_hw_device vk -f lavfi -i testsrc=size=64x64:rate=1 -frames:v 1 -vf \"format=yuv420p,hwupload,nlmeans_vulkan,hwdownload,format=yuv420p\" -f null -", UpscaleEngine.VulkanDenoiseProbeArgs());
 
             // The test cannot tell (no ffmpeg, a timeout): the node is trusted, and the record says it was not tested.
             UpscaleEngine.DrmVulkanProbeSource = n => null;
-            Equal("the render-node test is inconclusive: the node is used", Drm128 + " -filter_hw_device vk", UpscaleEngine.HwaccelArgs(null));
+            Equal("the render-node test is inconclusive: the node is used", Drm128 + Qsv128 + " -filter_hw_device vk", UpscaleEngine.HwaccelArgs(null));
             Equal("the render-node test is inconclusive: the record says it was not tested", "render node /dev/dri/renderD128 (not tested: ffmpeg could not be run)", UpscaleEngine.Devices().VulkanText);
             UpscaleEngine.DrmVulkanProbeSource = n => true;
 
-            // Where the QSV device is pinned: only when the encoder's own search (renderD128 to renderD135) cannot find the node.
-            foreach (int number in new[] { 128, 129, 135 })
-            {
-                GpuDetector.UseEnvironment(Machine("renderD" + number, "0x8086"));
-                Equal("renderD" + number + ": QSV left implicit", string.Empty, UpscaleEngine.Devices().QsvArgs);
-            }
-
-            foreach (int number in new[] { 136, 140, 191 })
+            // The QSV device is pinned to the detected node whatever its number: the encoder's own search is not trusted to pick it.
+            foreach (int number in new[] { 128, 129, 135, 136, 140, 191 })
             {
                 string node = "/dev/dri/renderD" + number;
                 GpuDetector.UseEnvironment(Machine("renderD" + number, "0x8086"));
@@ -797,11 +806,159 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
             UpscaleEngine.DrmVulkanProbeSource = null;
         }
 
+        private static bool WaitFor(Func<bool> done)
+        {
+            var clock = System.Diagnostics.Stopwatch.StartNew();
+            while (!done())
+            {
+                if (clock.ElapsedMilliseconds > 5000)
+                {
+                    return false;
+                }
+
+                System.Threading.Thread.Sleep(10);
+            }
+
+            return true;
+        }
+
+        // Review of PR 3: the render-node test runs in the background, true is kept for good, false
+        // and inconclusive results are tested again after a window, and the stale one is served meanwhile.
+        private static void DrmProbeCache()
+        {
+            const string Node = "/dev/dri/renderD128";
+            const string Found = "render node " + Node;
+            const string Failed = "vk:0 (a test start from " + Node + " failed, so the first Vulkan device)";
+            const string Untested = Found + " (not tested: ffmpeg could not be run)";
+            DateTime now = new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+            GpuDetector.UseEnvironment(Machine("renderD128", "0x8086"));
+            UpscaleEngine.EncoderListSource = () => Encoders(FullList);
+            UpscaleEngine.Settings = new UpscaleSettings { Encoder = "auto", GpuVendor = "auto" };
+            UpscaleEngine.DrmVulkanClock = () => now;
+
+            // A session-path call never waits for the test, and concurrent callers share one test.
+            UpscaleEngine.DrmVulkanInline = false;
+            var release = new System.Threading.ManualResetEventSlim(false);
+            var started = new System.Threading.ManualResetEventSlim(false);
+            int asks = 0;
+            UpscaleEngine.DrmVulkanProbeSource = n =>
+            {
+                System.Threading.Interlocked.Increment(ref asks);
+                started.Set();
+                release.Wait(10000);
+                return true;
+            };
+            var timer = System.Diagnostics.Stopwatch.StartNew();
+            UpscaleEngine.DeviceInit first = UpscaleEngine.Devices();
+            timer.Stop();
+            Check("a first call returns at once while the test is blocked", timer.ElapsedMilliseconds < 2000, timer.ElapsedMilliseconds + " ms");
+            Equal("the untested node is used and the record says the test is pending", Found + " (test pending)", first.VulkanText);
+            Equal("...the command uses the node", " -init_hw_device drm=dr:" + Node + " -init_hw_device vulkan=vk@dr", first.VulkanArgs);
+            Check("the test was started in the background", started.Wait(5000));
+            System.Threading.Tasks.Parallel.For(0, 8, _ => UpscaleEngine.Devices());
+            Equal("concurrent callers share one test", "1", asks.ToString());
+            release.Set();
+            Check("the answer arrives and is used", WaitFor(() => UpscaleEngine.Devices().VulkanText == Found));
+            Equal("a true result is one test only", "1", asks.ToString());
+            now = now.AddHours(24);
+            UpscaleEngine.DrmVulkanInline = true;
+            UpscaleEngine.Devices();
+            Equal("a true result is never asked again", "1", asks.ToString());
+
+            // False: kept inside the window, tested again after it, and the stale value is served during the re-test.
+            System.Threading.ManualResetEventSlim gate = null;
+            var retestStarted = new System.Threading.ManualResetEventSlim(false);
+            bool? answer = false;
+            asks = 0;
+            Func<string, bool?> probe = n =>
+            {
+                System.Threading.Interlocked.Increment(ref asks);
+                var g = gate;
+                if (g != null)
+                {
+                    retestStarted.Set();
+                    g.Wait(10000);
+                }
+
+                return answer;
+            };
+            now = new DateTime(2026, 1, 2, 0, 0, 0, DateTimeKind.Utc);
+            UpscaleEngine.DrmVulkanProbeSource = probe;
+            Equal("false: vk:0 and the record says why", Failed, UpscaleEngine.Devices().VulkanText);
+            Equal("false: tested once", "1", asks.ToString());
+            now = now.AddMinutes(4);
+            UpscaleEngine.Devices();
+            Equal("false: not asked again inside the window", "1", asks.ToString());
+            now = now.AddMinutes(2);
+            UpscaleEngine.DrmVulkanInline = false;
+            gate = new System.Threading.ManualResetEventSlim(false);
+            answer = true;
+            timer.Restart();
+            string stale = UpscaleEngine.Devices().VulkanText;
+            timer.Stop();
+            Equal("false: after the window the stale value is served while it is tested again", Failed, stale);
+            Check("false: and the call did not wait for the re-test", timer.ElapsedMilliseconds < 2000, timer.ElapsedMilliseconds + " ms");
+            Check("false: the re-test started in the background", retestStarted.Wait(5000));
+            System.Threading.Tasks.Parallel.For(0, 8, _ => UpscaleEngine.Devices());
+            Equal("false: one re-test however many callers", "2", asks.ToString());
+            gate.Set();
+            Check("false: a later true replaces it", WaitFor(() => UpscaleEngine.Devices().VulkanText == Found));
+            gate = null;
+            now = now.AddHours(24);
+            UpscaleEngine.DrmVulkanInline = true;
+            UpscaleEngine.Devices();
+            Equal("false then true: kept for good", "2", asks.ToString());
+
+            // Inconclusive (null): same window, same replacement.
+            asks = 0;
+            answer = null;
+            UpscaleEngine.DrmVulkanProbeSource = probe;
+            Equal("null: the node is used and the record says it was not tested", Untested, UpscaleEngine.Devices().VulkanText);
+            now = now.AddMinutes(1);
+            UpscaleEngine.Devices();
+            Equal("null: not asked again inside the window", "1", asks.ToString());
+            now = now.AddMinutes(5);
+            answer = true;
+            Equal("null: asked again after the window, and a true replaces it", Found, UpscaleEngine.Devices().VulkanText);
+            Equal("null: two tests in all", "2", asks.ToString());
+
+            // Start-up warming runs the test on Intel and not on NVIDIA.
+            asks = 0;
+            UpscaleEngine.DrmVulkanProbeSource = probe;
+            UpscaleEngine.WarmDevices();
+            Equal("WarmDevices asks the render-node test on an Intel server", "1", asks.ToString());
+            GpuDetector.UseEnvironment(Machine("renderD128", "0x10de"));
+            UpscaleEngine.DrmVulkanProbeSource = probe;
+            asks = 0;
+            UpscaleEngine.WarmDevices();
+            Equal("WarmDevices asks nothing on an NVIDIA server", "0", asks.ToString());
+
+            // One DeviceInit per plan: the command and the record keep the answer the plan was decided with.
+            GpuDetector.UseEnvironment(Machine("renderD128", "0x8086"));
+            answer = true;
+            UpscaleEngine.DrmVulkanProbeSource = probe;
+            var plan = new UpscaleEngine.Plan { Act = true, Width = 1920, Height = 1080, SourceWidth = 1280, SourceHeight = 720, Devices = UpscaleEngine.Devices() };
+            string decided = UpscaleEngine.HwaccelArgs(plan);
+            answer = false;
+            UpscaleEngine.DrmVulkanProbeSource = probe;
+            Equal("a plan keeps its device when the test answer changes", decided, UpscaleEngine.HwaccelArgs(plan));
+            Equal("...and the record names the same device", Found, UpscaleEngine.Describe(null, plan, "applied", "x").VulkanDevice);
+            Check("...while a plan decided now gets vk:0", UpscaleEngine.HwaccelArgs(new UpscaleEngine.Plan()).Contains("vulkan=vk:0"));
+
+            GpuDetector.UseEnvironment(null);
+            UpscaleEngine.EncoderListSource = null;
+            UpscaleEngine.DrmVulkanProbeSource = null;
+            UpscaleEngine.DrmVulkanClock = null;
+            UpscaleEngine.DrmVulkanInline = true;
+        }
+
         // PR 3: a machine with two GPUs gets the node of the vendor that was chosen. Auto is NVIDIA
         // first, and NVIDIA keeps vk:0 byte for byte (the NVIDIA rule); intel moves to the Intel node.
         private static void TwoGpuMachines()
         {
             const string Vk0 = " -init_hw_device vulkan=vk:0 -filter_hw_device vk";
+            const string Qsv128 = " -init_hw_device qsv=qs:hw_any,child_device=/dev/dri/renderD128";
+            const string Qsv129 = " -init_hw_device qsv=qs:hw_any,child_device=/dev/dri/renderD129";
             var asked = new List<string>();
             UpscaleEngine.EncoderListSource = () => Encoders(FullList);
             UpscaleEngine.DrmVulkanProbeSource = n =>
@@ -815,7 +972,7 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
 
             GpuDetector.UseEnvironment(intelFirst);
             UpscaleEngine.Settings = new UpscaleSettings { GpuVendor = "intel" };
-            Equal("Intel at 128, NVIDIA at 129, intel chosen: the Intel node", " -init_hw_device drm=dr:/dev/dri/renderD128 -init_hw_device vulkan=vk@dr -filter_hw_device vk", UpscaleEngine.HwaccelArgs(null));
+            Equal("Intel at 128, NVIDIA at 129, intel chosen: the Intel node", " -init_hw_device drm=dr:/dev/dri/renderD128 -init_hw_device vulkan=vk@dr" + Qsv128 + " -filter_hw_device vk", UpscaleEngine.HwaccelArgs(null));
             UpscaleEngine.Settings = new UpscaleSettings { GpuVendor = "auto" };
             asked.Clear();
             Equal("Intel at 128, NVIDIA at 129, auto: NVIDIA, vk:0 as before", Vk0, UpscaleEngine.HwaccelArgs(null));
@@ -825,9 +982,9 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
 
             GpuDetector.UseEnvironment(nvidiaFirst);
             UpscaleEngine.Settings = new UpscaleSettings { GpuVendor = "intel" };
-            Equal("NVIDIA at 128, Intel at 129, intel chosen: the Intel node, not the first", " -init_hw_device drm=dr:/dev/dri/renderD129 -init_hw_device vulkan=vk@dr -filter_hw_device vk", UpscaleEngine.HwaccelArgs(null));
+            Equal("NVIDIA at 128, Intel at 129, intel chosen: the Intel node, not the first", " -init_hw_device drm=dr:/dev/dri/renderD129 -init_hw_device vulkan=vk@dr" + Qsv129 + " -filter_hw_device vk", UpscaleEngine.HwaccelArgs(null));
             Check("...the test was asked about renderD129", asked.Count > 0 && asked.All(n => n == "/dev/dri/renderD129"));
-            Equal("...its encoder is found by the encoder's own search", "implicit (the first Intel render node, /dev/dri/renderD129)", UpscaleEngine.Devices().QsvText);
+            Equal("...its encoder is pinned to the same node", "/dev/dri/renderD129", UpscaleEngine.Devices().QsvText);
             Equal("...and the record says so", "render node /dev/dri/renderD129", UpscaleEngine.Describe(null, new UpscaleEngine.Plan { Act = true }, "applied", "x").VulkanDevice);
             UpscaleEngine.Settings = new UpscaleSettings { GpuVendor = "auto" };
             Equal("NVIDIA at 128, Intel at 129, auto: vk:0 as before", Vk0, UpscaleEngine.HwaccelArgs(null));
@@ -835,13 +992,13 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
             // Two Intel GPUs: the first Intel node, which is the encoder's own pick too.
             GpuDetector.UseEnvironment(Machine("renderD128", "0x8086", "renderD129", "0x8086"));
             UpscaleEngine.Settings = new UpscaleSettings { GpuVendor = "auto" };
-            Equal("two Intel GPUs: the first Intel node", " -init_hw_device drm=dr:/dev/dri/renderD128 -init_hw_device vulkan=vk@dr -filter_hw_device vk", UpscaleEngine.HwaccelArgs(null));
-            Check("two Intel GPUs: the encoder's implicit search agrees", UpscaleEngine.Devices().QsvArgs == string.Empty);
+            Equal("two Intel GPUs: the first Intel node, for Vulkan and QSV", " -init_hw_device drm=dr:/dev/dri/renderD128 -init_hw_device vulkan=vk@dr" + Qsv128 + " -filter_hw_device vk", UpscaleEngine.HwaccelArgs(null));
 
-            // An AMD node beside the Intel one is skipped, and the Intel node's own number is used.
+            // An AMD node beside the Intel one is skipped, and the QSV device is pinned to the Intel node, not to renderD128.
             GpuDetector.UseEnvironment(Machine("renderD128", "0x1002", "renderD129", "0x8086"));
             UpscaleEngine.Settings = new UpscaleSettings { GpuVendor = "intel" };
-            Equal("AMD at 128, Intel at 129: the Intel node", " -init_hw_device drm=dr:/dev/dri/renderD129 -init_hw_device vulkan=vk@dr -filter_hw_device vk", UpscaleEngine.HwaccelArgs(null));
+            Equal("AMD at 128, Intel at 129: the Intel node for Vulkan and QSV", " -init_hw_device drm=dr:/dev/dri/renderD129 -init_hw_device vulkan=vk@dr" + Qsv129 + " -filter_hw_device vk", UpscaleEngine.HwaccelArgs(null));
+            Check("AMD at 128, Intel at 129: no QSV device on the AMD node", !UpscaleEngine.HwaccelArgs(null).Contains("child_device=/dev/dri/renderD128"));
 
             // Intel chosen with no Intel GPU on the machine: the NVIDIA path, vk:0.
             GpuDetector.UseEnvironment(Machine("renderD128", "0x10de"));
@@ -882,7 +1039,7 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
         {
             UpscaleEngine.EncoderListSource = () => Encoders(FullList);
             UpscaleEngine.DrmVulkanProbeSource = n => true;
-            UpscaleEngine.Av1QsvProbeSource = () => true;
+            UpscaleEngine.Av1QsvProbeSource = _ => true;
             SetFilters("optix", "oidn", "ort", "fsr2", "dlss", "dlpp_rtcuda", "vsr_rtcuda", "libplacebo", "nlmeans_vulkan");
 
             // What the probe held before, for an NVIDIA box with every file in place.
@@ -895,19 +1052,20 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
             JsonElement intel = Probe();
 
             Equal("Intel probe: Denoise", "off,light,strong,max,oidn", string.Join(",", Strings(intel, "Denoise")));
-            Equal("Intel probe: Neural keeps the ONNX level and loses DLPP and VSR", "off,realesr-anime-x2", string.Join(",", Strings(intel, "Neural")));
+            Equal("Intel probe: Neural loses the ONNX level as well as DLPP and VSR", "off", string.Join(",", Strings(intel, "Neural")));
             Equal("Intel probe: Game is off alone", "off", string.Join(",", Strings(intel, "Game")));
             Equal("Intel probe: GameOptionLevels is empty", string.Empty, string.Join(",", Strings(intel, "GameOptionLevels")));
-            Equal("Intel probe: the neural labels follow", "off,realesr-anime-x2", string.Join(",", Keys(intel.GetProperty("NeuralLabels")).OrderBy(n => n, StringComparer.Ordinal)));
+            Equal("Intel probe: the neural labels follow", "off", string.Join(",", Keys(intel.GetProperty("NeuralLabels")).OrderBy(n => n, StringComparer.Ordinal)));
             Equal("Intel probe: the game labels follow", "off", string.Join(",", Keys(intel.GetProperty("GameLabels"))));
 
             JsonElement withheld = intel.GetProperty("Withheld");
             Equal("Intel probe: Withheld, denoise", "optix,optix-temporal", string.Join(",", Keys(withheld.GetProperty("Denoise"))));
-            Equal("Intel probe: Withheld, neural", "vsr-rtcuda,dlpp-1,dlpp-2,dlpp-3,dlpp-4", string.Join(",", Keys(withheld.GetProperty("Neural"))));
+            Equal("Intel probe: Withheld, neural", "realesr-anime-x2,vsr-rtcuda,dlpp-1,dlpp-2,dlpp-3,dlpp-4", string.Join(",", Keys(withheld.GetProperty("Neural"))));
             Equal("Intel probe: Withheld, game", "fsr2,dlss,dlaa", string.Join(",", Keys(withheld.GetProperty("Game"))));
-            Check("Intel probe: every withheld level says needs NVIDIA",
-                Keys(withheld).All(axis => withheld.GetProperty(axis).EnumerateObject().All(l => l.Value.GetString() == "needs NVIDIA")));
-            Check("Intel probe: a level that is offered is not in Withheld", !withheld.GetProperty("Denoise").TryGetProperty("oidn", out _) && !withheld.GetProperty("Neural").TryGetProperty("realesr-anime-x2", out _));
+            Check("Intel probe: every withheld level but the ONNX one says needs NVIDIA",
+                Keys(withheld).All(axis => withheld.GetProperty(axis).EnumerateObject().All(l => l.Name.StartsWith("realesr-") || l.Value.GetString() == "needs NVIDIA")));
+            Equal("Intel probe: the ONNX level has its own reason", "not measured on Intel", withheld.GetProperty("Neural").GetProperty("realesr-anime-x2").GetString());
+            Check("Intel probe: a level that is offered is not in Withheld", !withheld.GetProperty("Denoise").TryGetProperty("oidn", out _));
 
             // Nothing else in the probe moved: every other key is byte-identical to the NVIDIA one.
             string[] moved = { "Denoise", "Neural", "NeuralLabels", "Game", "GameLabels", "GameOptionLevels", "Gpu", "Withheld" };
@@ -1014,16 +1172,52 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
             plan = UpscaleEngine.Decide(SessionJob("upscale", "1080", "denoise", "optix"));
             Check("mixed box, auto (NVIDIA): optix is not withheld", plan.GpuWithheld == null, plan.GpuWithheld);
 
-            // The neural report is honest about what an ONNX level runs on without CUDA.
+            // The ONNX levels are withheld on Intel with their own reason, and run unchanged on NVIDIA.
             GpuDetector.UseEnvironment(Machine("renderD128", "0x8086"));
             UpscaleEngine.Settings = rig;
             plan = UpscaleEngine.Decide(SessionJob("upscale", "1080", "neural", "realesr-anime-x2"));
             record = UpscaleEngine.Describe(null, plan, plan.Status, plan.Reason);
-            Check("Intel: an ONNX neural level is not withheld", plan.GpuWithheld == null && plan.NeuralApplied, plan.Status + ": " + plan.Reason);
-            Check("Intel: and its description does not claim CUDA", record.Summary.Contains("this server's GPU is Intel, so no CUDA and the CPU provider") && !record.Summary.Contains("ONNX Runtime CUDA"), record.Summary);
-            GpuDetector.UseEnvironment(Machine("renderD128", "0x10de"));
+            Check("Intel: an ONNX neural level is withheld, not run", plan.GpuWithheldUnmeasured == "neural realesr-anime-x2" && !plan.NeuralApplied && plan.NeuralFilter == null, plan.Status + ": " + plan.Reason);
+            Check("Intel: it is not counted as needing NVIDIA", plan.GpuWithheld == null, plan.GpuWithheld);
+            Equal("Intel: the neural level asked for is still recorded", "realesr-anime-x2", plan.NeuralRequested);
+            Equal("Intel record: GpuWithheldUnmeasured", "neural realesr-anime-x2", record.GpuWithheldUnmeasured);
+            Check("Intel record: GpuWithheld stays empty for it", record.GpuWithheld == null);
+            Check("Intel record: the summary gives the unmeasured reason, not the NVIDIA one",
+                record.Summary.Contains("neural realesr-anime-x2 NOT run: not measured on Intel") && !record.Summary.Contains("needs an NVIDIA GPU"), record.Summary);
+            Check("Intel record: the summary claims no neural pass", !record.Summary.Contains("Neural SR") && !record.Summary.Contains("ONNX"), record.Summary);
+
+            // Both reasons in one session: each is said under its own wording.
+            plan = UpscaleEngine.Decide(SessionJob("upscale", "1080", "denoise", "optix", "neural", "realesr-anime-x2"));
             record = UpscaleEngine.Describe(null, plan, plan.Status, plan.Reason);
-            Check("NVIDIA: the same level is still described as ONNX Runtime CUDA", record.Summary.Contains("ONNX Runtime CUDA"), record.Summary);
+            Check("Intel: a session with both reasons keeps them apart", plan.GpuWithheld == "denoise optix" && plan.GpuWithheldUnmeasured == "neural realesr-anime-x2", plan.GpuWithheld + " | " + plan.GpuWithheldUnmeasured);
+            Check("Intel record: both sentences are in the summary",
+                record.Summary.Contains("denoise optix NOT run: needs an NVIDIA GPU and this server's is Intel") && record.Summary.Contains("neural realesr-anime-x2 NOT run: not measured on Intel"), record.Summary);
+
+            // Asked for nothing but an ONNX level: left with nothing, and the reason says why.
+            UpscaleEngine.Settings = optIn;
+            plan = UpscaleEngine.Decide(SessionJob("neural", "realesr-anime-x2"));
+            Check("Intel, only an ONNX level asked for: not enhanced", !plan.Act && plan.Status == "not-requested", plan.Status);
+            Check("Intel, only an ONNX level asked for: the reason says why", plan.Reason.Contains("neural realesr-anime-x2 not run: not measured on Intel"), plan.Reason);
+
+            GpuDetector.UseEnvironment(Machine("renderD128", "0x10de"));
+            UpscaleEngine.Settings = rig;
+            plan = UpscaleEngine.Decide(SessionJob("upscale", "1080", "neural", "realesr-anime-x2"));
+            record = UpscaleEngine.Describe(null, plan, plan.Status, plan.Reason);
+            Check("NVIDIA: the same level runs, nothing withheld", plan.NeuralApplied && plan.GpuWithheld == null && plan.GpuWithheldUnmeasured == null, plan.Status + ": " + plan.Reason);
+            Check("NVIDIA: it is still described as ONNX Runtime CUDA", record.Summary.Contains("ONNX Runtime CUDA"), record.Summary);
+            Check("NVIDIA record: no unmeasured text", record.GpuWithheldUnmeasured == null);
+
+            // ShaderLibrary names the ONNX levels, and leaves the NVIDIA-only and unknown ones out.
+            foreach (string level in new[] { "realesr-anime-x2", "realesr-anime-x4", "realesr-general-x4", "REALESR-ANIME-X2" })
+            {
+                Check("neural " + level + " is an ONNX level", ShaderLibrary.IsOnnxNeural(level));
+            }
+
+            Check("off, dlpp-2, vsr-rtcuda, banana and null are not ONNX levels",
+                !ShaderLibrary.IsOnnxNeural("off") && !ShaderLibrary.IsOnnxNeural("dlpp-2") && !ShaderLibrary.IsOnnxNeural("vsr-rtcuda") && !ShaderLibrary.IsOnnxNeural("banana") && !ShaderLibrary.IsOnnxNeural(null));
+            Equal("reason: an ONNX level", "not measured on Intel", UpscaleEngine.IntelWithholdReason("Neural", "realesr-general-x4"));
+            Equal("reason: a CUDA-native level", "needs NVIDIA", UpscaleEngine.IntelWithholdReason("Neural", "dlpp-1"));
+            Check("reason: off and banana have none", UpscaleEngine.IntelWithholdReason("Neural", "off") == null && UpscaleEngine.IntelWithholdReason("Neural", "banana") == null);
 
             GpuDetector.UseEnvironment(null);
             UpscaleEngine.EncoderListSource = null;

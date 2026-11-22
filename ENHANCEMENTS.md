@@ -31,7 +31,7 @@ setting, a control in the page, or "remove the plugin or script".
 | GPU enhancement of transcodes (14 axes) | Both | Enhance panel in the player; transcodes are upscaled, sharpened, denoised on the GPU | Master switch `Enabled` (default true). With `RequireClientOptIn` false (the default) every eligible transcode is enhanced using the dashboard defaults; the viewer can pick Off in the panel |
 | Live apply and A/B swap | Both | Changing a setting mid-playback switches streams without a gap | On. If the swap patch cannot install, live apply falls back to tear-down-and-restart |
 | Direct-play override | Server patch | Eligible direct-play sessions become GPU transcodes on every client | Off. Setting `ForceTranscodeForDirectPlay` |
-| GPU vendor detection, and the Intel encoder | Both | The dashboard status line, the player probe (`Levels.Gpu`) and each Recent session say which GPU vendor the server has and what that vendor's chain can use. With an Intel GPU found, transcodes encode with QSV (`hevc_qsv`, `h264_qsv`, `av1_qsv`) instead of NVENC, the Vulkan device is started from the GPU's render node instead of `vk:0`, the levels that need NVIDIA (`optix`, `dlpp-*`, `vsr-rtcuda`, `fsr2`, `dlss`, `dlaa`) are not offered and say "needs NVIDIA", and the load route reports Intel encoder sessions and busy percent. An NVIDIA server is byte-identical | On; setting `GpuVendor` (`auto` default, `nvidia`, `intel`, `none`). `auto` picks NVIDIA first when it is present; an Intel path needs an Intel GPU that was actually seen, so a vendor chosen and not found changes nothing |
+| GPU vendor detection, and the Intel encoder | Both | The dashboard status line, the player probe (`Levels.Gpu`) and each Recent session say which GPU vendor the server has and what that vendor's chain can use. With an Intel GPU found, transcodes encode with QSV (`hevc_qsv`, `h264_qsv`, `av1_qsv`) instead of NVENC, the Vulkan device is started from the GPU's render node instead of `vk:0`, the levels that need NVIDIA (`optix`, `dlpp-*`, `vsr-rtcuda`, `fsr2`, `dlss`, `dlaa`) and the ONNX levels (`realesr-*`, not measured on Intel) are not offered and each says why, and the load route reports Intel encoder sessions and busy percent. An NVIDIA server is byte-identical | On; setting `GpuVendor` (`auto` default, `nvidia`, `intel`, `none`). `auto` picks NVIDIA first when it is present; an Intel path needs an Intel GPU that was actually seen, so a vendor chosen and not found changes nothing |
 | Tag search | Server patch | Search also matches item tags (substring) | On, no switch |
 | Wildcard search (`*` and `?`) | Server patch | `red*car` finds names and tags with "red" followed later by "car"; `?` is exactly one character | On, no switch; a term without `*` or `?` is searched as before |
 | Search index (FTS5 trigram) | Server patch + plugin services | Name and tag search answered from an index: provider step about 36 ms to 3 ms on an 80k-item library | On; falls back to the plain query whenever the index is missing, stale or unsupported; see section 7.6 |
@@ -180,33 +180,39 @@ keeps the code path that existed before the setting did:
   `-init_hw_device vulkan=vk:0 -filter_hw_device vk`. On Intel, `UpscaleEngine.HwaccelArgs` starts the
   device from the GPU's render node: `-init_hw_device drm=dr:/dev/dri/renderD129 -init_hw_device
   vulkan=vk@dr -filter_hw_device vk` (the form Jellyfin's own Vulkan path builds, and the one the
-  jellyfin-ffmpeg source supports, GPU_VENDORS.md 5.3). The first time it is needed, the stock ffmpeg
-  is run once with that initialisation and one frame through `hwupload,hwdownload`; if that fails the
-  command is `vk:0` as before (so this cannot turn a working Intel server into a dead one) and the
-  record says so, and if it cannot be run at all (no ffmpeg found, a timeout) the node is used and the
-  record says it was not tested. The Vulkan device is chosen by the node's **PCI device id**, not by
-  the node, so two different GPUs are told apart and two identical cards are not. The two engine probes
-  that start a device (the Vulkan-denoise test and the AV1 QSV test encode) use the same device
-  arguments as a session. The QSV encoder needs no device on the command line in the common case: its
-  own session takes the first Intel node of `renderD128` to `renderD135`, which is the node the
-  detector picked; only for a node above `renderD135`, and only when ffmpeg lists a QSV encoder, the
-  command gains `-init_hw_device qsv=qs:hw_any,child_device=<node>`. The device a session used is
-  reported as `VulkanDevice` and `QsvDevice` on the session record (null when not enhanced, `QsvDevice`
-  null off Intel). It is chosen by vendor, not by index: of two Intel GPUs the first node wins, and a
-  box with both vendors on `auto` is NVIDIA's, with `vk:0`, as before (set `GpuVendor` to `intel` to
-  choose the Intel card).
+  jellyfin-ffmpeg source supports, GPU_VENDORS.md 5.3). The stock ffmpeg is run once per node with that
+  initialisation and one frame through `hwupload,hwdownload`, **in the background**: the plugin starts
+  it at load (`UpscaleEngine.WarmDevices`, from `PatcherHost.Apply`), only one test runs per node, and
+  a session never waits for it. Until the answer is known the node is used and the record says
+  `(test pending)`. A pass is kept for the life of the process; a failure, or a test that could not be
+  run at all (no ffmpeg found, a timeout), is re-tested after about 5 minutes while the last answer is
+  served. A failed test means `vk:0` as before (so this cannot turn a working Intel server into a dead
+  one) and the record says so; an inconclusive one trusts the node and the record says it was not
+  tested. The Vulkan device is chosen by the node's **PCI device id**, not by the node, so two
+  different GPUs are told apart and two identical cards are not. The two engine probes that start a
+  device (the Vulkan-denoise test and the AV1 QSV test encode) use the same device arguments as a
+  session, and one session resolves them once (`Plan.Devices`), so its record and its command cannot
+  disagree. When ffmpeg lists a QSV encoder the command always pins the encoder to the detected node:
+  `-init_hw_device qsv=qs:hw_any,child_device=<node>` (the implicit search would take the first Intel
+  node, which a mixed AMD and Intel box does not guarantee); with no QSV encoder there is none. The
+  device a session used is reported as `VulkanDevice` and `QsvDevice` on the session record (null when
+  not enhanced, `QsvDevice` null off Intel). It is chosen by vendor, not by index: of two Intel GPUs
+  the first node wins, and a box with both vendors on `auto` is NVIDIA's, with `vk:0`, as before (set
+  `GpuVendor` to `intel` to choose the Intel card).
 - **The NVIDIA-only levels.** `optix`, `optix-temporal` (and the unlisted `optix-hdr`), `dlpp-1` to
   `dlpp-4`, `vsr-rtcuda`, `fsr2`, `dlss` and `dlaa` are removed from `Levels.Denoise`, `Levels.Neural`,
   `Levels.Game`, `Levels.GameOptionLevels` and the neural and game label maps, so the player panel does
   not offer them. A session or a dashboard default that still names one gets `off` for that axis, and
   `SessionRecord.GpuWithheld` (for example `denoise optix, game dlss`), the Recent sessions summary
   ("... NOT run: needs an NVIDIA GPU and this server's is Intel") and, for a session left with nothing,
-  the status reason say so; `NeuralRequested` still names what was asked. `Levels.Withheld` and
-  `Withheld` on `GET /JellyfinPlus/Status` list axis, level and `needs NVIDIA`, **only on a detected
-  Intel server**, so the NVIDIA probe and status have exactly the keys they had, and the dashboard's
-  GPU line names them. Not withheld: the ONNX neural levels (`ort`); without CUDA they run on ONNX
-  Runtime's CPU provider, which the session summary now says on Intel, and which is not measured for
-  this chain (GPU_VENDORS.md 5.4).
+  the status reason say so; `NeuralRequested` still names what was asked. The ONNX neural levels
+  (`realesr-*`) are withheld on Intel too, with their own reason, "not measured on Intel": without CUDA
+  they would run on ONNX Runtime's CPU provider, which nobody has measured for this chain, so the Intel
+  `Neural` list is `off` until GPU_VENDORS.md 5.4 (PR 5) gives them a GPU provider. There is no setting
+  to opt in; withholding is the smaller change and goes away with that PR. `Levels.Withheld` and
+  `Withheld` on `GET /JellyfinPlus/Status` list axis, level and the level's own reason, **only on a
+  detected Intel server**, so the NVIDIA probe and status have exactly the keys they had, and the
+  dashboard's GPU line prints each as `Axis level (reason)`.
 
 Not done by this: choosing between two Intel GPUs, OpenVINO, hardware decode. The plan for the rest is
 [GPU_VENDORS.md](docs/architecture/GPU_VENDORS.md). Tests: `scripts/test-gpu-vendor.sh <jfbin>`
@@ -222,8 +228,9 @@ Harmony. The plugin tells it to stand down while the patches are active, by writ
 `plugin_patch_active` and the main settings into `/etc/jellyfin-upscale.json` if that file exists
 (`src/Transcoding/ShimBridge.cs`). It has no GPU detection: its Vulkan device is `vk:0` unless
 `/etc/jellyfin-upscale.json` carries `render_node` (for example `/dev/dri/renderD129`, a plain
-`/dev/dri/renderD<digits>` path only), which derives the device from that node, untested; set `encoder`
-to one that GPU can run (`hevc_qsv` on Intel) yourself.
+`/dev/dri/renderD<digits>` path only), which derives the device from that node, never test-started; set
+`encoder` to one that GPU can run (`hevc_qsv` on Intel) yourself. `render_node` is hand-set only:
+`ShimBridge.Sync` merges into the existing file, so it keeps the value, and never writes it.
 
 **Defaults to know.** From `src/Configuration/PluginConfiguration.cs`: `Enabled` true, `TargetHeight`
 1080, `MaxTargetHeight` 2160, `SrLevel` `fsrcnnx`, `MaxConcurrent` 4, `MaxConcurrentSwaps` 4,
