@@ -2383,9 +2383,20 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
                     doc.RootElement.EnumerateObject().Select(p => p.Name).OrderBy(n => n).SequenceEqual(SummaryFields.OrderBy(n => n)), json);
             }
 
+            // The routes are driven on a FAKE Intel machine, so a render node is really in play: on a machine
+            // with no GPU (the real one) a leak of the node path has nothing to leak.
+            UpscaleEngine.EncoderListSource = () => Encoders(FullList);
+            UpscaleEngine.DrmVulkanProbeSource = n => true;
+            GpuDetector.UseEnvironment(Machine("renderD128", "0x8086"));
+            PatcherHost.Configure("{\"GpuVendor\":\"intel\",\"Encoder\":\"auto\"}");
             string sid = "harness-access-" + Guid.NewGuid().ToString("N");
-            UpscaleEngine.Record(new SessionRecord { PlaySessionId = sid, Gpu = full.ToSummary() });
-            PatcherHost.Configure("{\"GpuVendor\":\"auto\"}");
+            var accessPlan = new UpscaleEngine.Plan { Act = true, Status = "applied", Width = 1920, Height = 1080, UpscaleApplied = true };
+            SessionRecord accessRecord = UpscaleEngine.Describe(null, accessPlan, "applied", "x");
+            accessRecord.PlaySessionId = sid;
+            Check("access setup: the session record does hold the render node (VulkanDevice and QsvDevice)",
+                accessRecord.VulkanDevice != null && accessRecord.VulkanDevice.Contains("/dev/dri/renderD128")
+                && accessRecord.QsvDevice != null && accessRecord.QsvDevice.Contains("/dev/dri/renderD128"), accessRecord.VulkanDevice + " | " + accessRecord.QsvDevice);
+            UpscaleEngine.Record(accessRecord);
             foreach (string route in new[] { sid, "harness-no-such-session" })
             {
                 string tag = route == sid ? "recorded session" : "probe";
@@ -2399,18 +2410,34 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
                         PrivateFields.All(f => !gpu.TryGetProperty(f, out _)));
                     if (route == sid)
                     {
-                        JsonElement rec = root.GetProperty("Record").GetProperty("Gpu");
-                        Check("non-elevated recorded session: Record.Gpu omits the private fields", PrivateFields.All(f => !rec.TryGetProperty(f, out _)));
+                        JsonElement rec = root.GetProperty("Record");
+                        Check("non-elevated recorded session: Record.Gpu omits the private fields", PrivateFields.All(f => !rec.GetProperty("Gpu").TryGetProperty(f, out _)));
+                        Check("non-elevated recorded session: Record omits VulkanDevice and QsvDevice",
+                            !rec.TryGetProperty("VulkanDevice", out _) && !rec.TryGetProperty("QsvDevice", out _));
+                        Check("non-elevated recorded session: the flat fields omit them too", !root.TryGetProperty("VulkanDevice", out _) && !root.TryGetProperty("QsvDevice", out _));
                     }
                 }
 
                 Check("non-elevated " + tag + ": no render node path or PCI id anywhere in the body",
-                    !body.Contains("/dev/dri") && !body.Contains("0x10de") && !body.Contains("0x8086"));
+                    !body.Contains("/dev/dri") && !body.Contains("renderD") && !body.Contains("0x10de") && !body.Contains("0x8086"), body);
+            }
+
+            // The elevated Status route is the one place that may carry them (Sessions), and it does.
+            string status = PatcherHost.StatusJson();
+            Check("the elevated Status route still carries the devices of the session", status.Contains("render node /dev/dri/renderD128"));
+            using (JsonDocument doc = JsonDocument.Parse(status))
+            {
+                JsonElement recorded = doc.RootElement.GetProperty("Sessions").EnumerateArray().First(e => e.GetProperty("PlaySessionId").GetString() == sid);
+                Check("Status Sessions: VulkanDevice and QsvDevice are there", recorded.TryGetProperty("VulkanDevice", out _) && recorded.TryGetProperty("QsvDevice", out _));
             }
 
             string history = JsonSerializer.Serialize(UpscaleEngine.ForSession(sid));
-            Check("the history entry (served by Status) carries no device list or render node",
-                !history.Contains("\"Devices\"") && !history.Contains("\"RenderNode\"") && !history.Contains("/dev/dri"), history);
+            Check("the history entry (served by Status) carries no device list", !history.Contains("\"Devices\"") && !history.Contains("\"RenderNode\""), history);
+
+            GpuDetector.UseEnvironment(null);
+            UpscaleEngine.EncoderListSource = null;
+            UpscaleEngine.DrmVulkanProbeSource = null;
+            UpscaleEngine.Settings = new UpscaleSettings();
         }
 
         // Review items 2 and 3: a negative or failed probe is not kept for the life of the process,

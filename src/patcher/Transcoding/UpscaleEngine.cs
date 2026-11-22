@@ -228,13 +228,14 @@ namespace Jellyfin.Plugin.Plus.Patcher
         /// The Vulkan device this session's command initialised: "vk:0" (the first Vulkan device,
         /// every server but a detected Intel one), or the Intel render node it was derived from, with
         /// the reason when the render node was not used (its test device start failed) or could not
-        /// be tested. Null when the session was not enhanced. GPU_VENDORS.md 5.3.
+        /// be tested. Null when the session was not enhanced. GPU_VENDORS.md 5.3. Names the render node,
+        /// so it is served on the administrator-only Status route only (PatcherHost.PublicRecord drops it).
         /// </summary>
         public string VulkanDevice { get; set; }
 
         /// <summary>
         /// Which device the QSV encoder opens, on an Intel GPU only: the render node the command
-        /// pins it to, or why there is none. Null off Intel and when not enhanced.
+        /// pins it to, or why there is none. Null off Intel and when not enhanced. Status route only, like VulkanDevice.
         /// </summary>
         public string QsvDevice { get; set; }
 
