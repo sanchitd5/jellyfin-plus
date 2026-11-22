@@ -234,13 +234,14 @@ namespace Jellyfin.Plugin.Plus.Patcher
         /// The Vulkan device this session's command initialised: "vk:0" (the first Vulkan device,
         /// every server but a detected Intel one), or the Intel render node it was derived from, with
         /// the reason when the render node was not used (its test device start failed) or could not
-        /// be tested. Null when the session was not enhanced. GPU_VENDORS.md 5.3.
+        /// be tested. Null when the session was not enhanced. GPU_VENDORS.md 5.3. Names the render node,
+        /// so it is served on the administrator-only Status route only (PatcherHost.PublicRecord drops it).
         /// </summary>
         public string VulkanDevice { get; set; }
 
         /// <summary>
         /// Which device the QSV encoder opens, on an Intel GPU only: the render node the command
-        /// pins it to, or why there is none. Null off Intel and when not enhanced.
+        /// pins it to, or why there is none. Null off Intel and when not enhanced. Status route only, like VulkanDevice.
         /// </summary>
         public string QsvDevice { get; set; }
 
@@ -3119,15 +3120,25 @@ namespace Jellyfin.Plugin.Plus.Patcher
         }
 
         /// <summary>
-        /// The reason a level is not run on a detected Intel GPU ("needs NVIDIA", or for fsr2 on a
-        /// build made for Intel, its start-up check), or null when it is. The ONNX levels (<see cref="ShaderLibrary.IsOnnxNeural"/>) were withheld here as
-        /// <see cref="NotMeasuredOnIntel"/> while they would only have fallen back to the CPU
-        /// provider; the OpenVINO device (<see cref="NeuralDeviceFor"/>) is what brings them back,
-        /// so they are offered and run on Intel, on OpenVINO or on the CPU with the reason recorded.
+        /// Whether the ONNX levels' OpenVINO path has been MEASURED on a real Intel GPU. False: they stay
+        /// withheld on Intel as <see cref="NotMeasuredOnIntel"/> even though PR 5's path is present. A
+        /// measured bench result on an Arc will lift this (set it true, or delete it with the clause below).
+        /// The tests flip it to exercise the path.
+        /// </summary>
+        internal static bool IntelOnnxMeasured = false;
+
+        /// <summary>
+        /// The reason a level is not run on a detected Intel GPU ("needs NVIDIA", or for fsr2 on a build made for
+        /// Intel, its start-up check; "not measured on Intel" for the ONNX levels), or null when it is.
         /// </summary>
         internal static string IntelWithholdReason(string axis, string level)
         {
-            return NvidiaOnly(axis, level) ? WithheldReason(axis, level) : null;
+            if (NvidiaOnly(axis, level))
+            {
+                return WithheldReason(axis, level);
+            }
+
+            return axis == "Neural" && !IntelOnnxMeasured && ShaderLibrary.IsOnnxNeural(level) ? NotMeasuredOnIntel : null;
         }
 
         /// <summary>

@@ -31,7 +31,7 @@ setting, a control in the page, or "remove the plugin or script".
 | GPU enhancement of transcodes (14 axes) | Both | Enhance panel in the player; transcodes are upscaled, sharpened, denoised on the GPU | Master switch `Enabled` (default true). With `RequireClientOptIn` false (the default) every eligible transcode is enhanced using the dashboard defaults; the viewer can pick Off in the panel |
 | Live apply and A/B swap | Both | Changing a setting mid-playback switches streams without a gap | On. If the swap patch cannot install, live apply falls back to tear-down-and-restart |
 | Direct-play override | Server patch | Eligible direct-play sessions become GPU transcodes on every client | Off. Setting `ForceTranscodeForDirectPlay` |
-| GPU vendor detection, and the Intel encoder | Both | The dashboard status line, the player probe (`Levels.Gpu`) and each Recent session say which GPU vendor the server has and what that vendor's chain can use. With an Intel GPU found, transcodes encode with QSV (`hevc_qsv`, `h264_qsv`, `av1_qsv`) instead of NVENC, the Vulkan device is started from the GPU's render node instead of `vk:0`, the levels that need NVIDIA (`optix`, `dlpp-*`, `vsr-rtcuda`, `fsr2`, `dlss`, `dlaa`) are not offered and each says why (the ONNX levels, `realesr-*`, stay: they run on OpenVINO or the CPU), and the load route reports Intel encoder sessions and busy percent. An NVIDIA server is byte-identical | On; setting `GpuVendor` (`auto` default, `nvidia`, `intel`, `none`). `auto` picks NVIDIA first when it is present; an Intel path needs an Intel GPU that was actually seen, so a vendor chosen and not found changes nothing |
+| GPU vendor detection, and the Intel encoder | Both | The dashboard status line, the player probe (`Levels.Gpu`) and each Recent session say which GPU vendor the server has and what that vendor's chain can use. With an Intel GPU found, transcodes encode with QSV (`hevc_qsv`, `h264_qsv`, `av1_qsv`) instead of NVENC, the Vulkan device is started from the GPU's render node instead of `vk:0`, the levels that need NVIDIA (`optix`, `dlpp-*`, `vsr-rtcuda`, `fsr2`, `dlss`, `dlaa`) and the ONNX levels (`realesr-*`, not measured on Intel) are not offered and each says why, and the load route reports Intel encoder sessions and busy percent. An NVIDIA server is byte-identical | On; setting `GpuVendor` (`auto` default, `nvidia`, `intel`, `none`). `auto` picks NVIDIA first when it is present; an Intel path needs an Intel GPU that was actually seen, so a vendor chosen and not found changes nothing |
 | Tag search | Server patch | Search also matches item tags (substring) | On, no switch |
 | Wildcard search (`*` and `?`) | Server patch | `red*car` finds names and tags with "red" followed later by "car"; `?` is exactly one character | On, no switch; a term without `*` or `?` is searched as before |
 | Search index (FTS5 trigram) | Server patch + plugin services | Name and tag search answered from an index: provider step about 36 ms to 3 ms on an 80k-item library | On; falls back to the plain query whenever the index is missing, stale or unsupported; see section 7.6 |
@@ -222,10 +222,10 @@ keeps the code path that existed before the setting did:
   the status reason say so; `NeuralRequested` still names what was asked. `Levels.Withheld` and
   `Withheld` on `GET /JellyfinPlus/Status` list axis, level and the level's own reason (`needs
   NVIDIA`), **only on a detected Intel server**, so the NVIDIA probe and status have exactly the keys
-  they had, and the dashboard's GPU line prints each as `Axis level (reason)`. Not withheld: the ONNX
-  neural levels (`ort`), which have their own device (next bullet). They were withheld as "not
-  measured on Intel" while they could only have run on ONNX Runtime's CPU provider; the OpenVINO
-  device is what brings them back, and `SessionRecord.GpuWithheldUnmeasured` stays null for them.
+  they had, and the dashboard's GPU line prints each as `Axis level (reason)`. The ONNX neural levels (`ort`) are withheld too, with their own reason, "not measured on Intel"
+  (`SessionRecord.GpuWithheldUnmeasured`): PR 5 gives them a device (next bullet), but that path has not been
+  measured on a real Arc, and they stay withheld until it is (`UpscaleEngine.IntelOnnxMeasured`; a measured bench
+  result will lift it).
 - **The ONNX neural level's device.** The `ort` filter (`ffmpeg/vf_ort.c`) gained `device=openvino`
   beside `cuda` (the default) and `cpu`: ONNX Runtime's OpenVINO provider on an Intel GPU
   (`device_id` is the GPU number, 0 meaning OpenVINO's `GPU`). If the provider will not append, or a
