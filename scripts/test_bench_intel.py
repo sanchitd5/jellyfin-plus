@@ -342,8 +342,11 @@ exit 0
 
 FFPROBE_STUB = '#!/bin/sh\ncase "$*" in *r_frame_rate*) echo 24/1;; *height,codec_name*) echo h264,1080;; *) echo h264;; esac\n'
 
-# `date +%H%M` is the only thing it fakes (FAKE_HM); everything else is the real date.
-DATE_STUB = '#!/bin/sh\nfor a in "$@"; do\n  if [ "$a" = "+%H%M" ] && [ -n "${FAKE_HM:-}" ]; then echo "$FAKE_HM"; exit 0; fi\ndone\nexec "$REAL_DATE" "$@"\n'
+# `date +%H%M` is the only thing it fakes (FAKE_HM); everything else is the real date. With FAKE_TZ_LOG set
+# it appends the TZ the script called it with, so a test can see which zone the gate asked for.
+DATE_STUB = ('#!/bin/sh\nfor a in "$@"; do\n  if [ "$a" = "+%H%M" ] && [ -n "${FAKE_HM:-}" ]; then\n'
+             '    [ -z "${FAKE_TZ_LOG:-}" ] || echo "${TZ:-}" >> "$FAKE_TZ_LOG"\n    echo "$FAKE_HM"; exit 0\n  fi\n'
+             'done\nexec "$REAL_DATE" "$@"\n')
 
 # A fake Jellyfin: serves JSON by URL path from $FAKE_DIR/scenario.json, logs every call (argv, stdin,
 # POST body) to $FAKE_DIR/log.jsonl, and keeps the plugin configuration and started sessions in state.json.
@@ -562,7 +565,13 @@ def test_mutants(tmp):
         check(f"mutant {name} is caught", rc != 0 or bool(plan_failures(out)))
 
     for name, old, new, fn in [
-        ("octal-hhmm", "hm=$((10#$(TZ=Australia/Melbourne date +%H%M)))", "hm=$(TZ=Australia/Melbourne date +%H%M)", gate_failures),
+        ("octal-hhmm", 'hm=$((10#$(TZ="$BLOCK_TZ" date +%H%M)))', 'hm=$(TZ="$BLOCK_TZ" date +%H%M)', gate_failures),
+        ("octal-window-start", "lo=$((10#${item%-*}))", "lo=$((${item%-*}))", gate_failures),
+        ("octal-window-end", "hi=$((10#${item#*-}))", "hi=$((${item#*-}))", gate_failures),
+        ("window-end-inclusive", "hm < BLOCK_HI[i]", "hm <= BLOCK_HI[i]", gate_failures),
+        ("tz-hard-coded", 'TZ="$BLOCK_TZ" date', "TZ=Australia/Melbourne date", window_failures),
+        ("windows-ignored", 'BLOCK_WINDOWS="${BENCH_BLOCK_WINDOWS:-0100-0700,1630-1830}"', 'BLOCK_WINDOWS="0100-0700,1630-1830"', window_failures),
+        ("malformed-accepted", "^[0-9]{4}-[0-9]{4}(,[0-9]{4}-[0-9]{4})*$", "^[0-9-]+(,[0-9-]+)*$", window_failures),
         ("run-fps-lost-failure", '|| { echo 0; rm -f "$log"; return 1; }', "|| true", runfps_failures),
         ("token-on-argv", 'curl -fsS --config - "$@" "$JF_URL$p"', 'curl -fsS -H "X-Emby-Token: $JF_TOKEN" "$@" "$JF_URL$p"', token_failures),
     ]:
@@ -890,6 +899,34 @@ PSI_OK = "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\nfull avg10=0.00 avg60=
 PSI_HOT = PSI_OK.replace("avg60=0.00", "avg60=5.00", 1)
 
 
+# (BENCH_BLOCK_WINDOWS, clock, open?): half-open [start,end), bounds read as decimal (0830 and 0900 are
+# invalid octal), and the owner's real night window ends at 0415.
+WINDOW_CASES = [("0100-0415,1630-1830", "0414", False), ("0100-0415,1630-1830", "0415", True),
+                ("0100-0415,1630-1830", "0100", False), ("0100-0415,1630-1830", "0700", True),
+                ("0100-0415,1630-1830", "0059", True), ("0100-0415,1630-1830", "1629", True),
+                ("0100-0415,1630-1830", "1630", False), ("0100-0415,1630-1830", "1829", False),
+                ("0100-0415,1630-1830", "1830", True),
+                ("0800-0930", "0759", True), ("0800-0930", "0830", False), ("0800-0930", "0900", False),
+                ("0800-0930", "0930", True),
+                ("0830-0900", "0829", True), ("0830-0900", "0830", False), ("0830-0900", "0859", False),
+                ("0830-0900", "0900", True),
+                ("0900-1000", "0830", True), ("0900-1000", "0900", False),
+                ("0000-2400", "2359", False), ("0000-2400", "0000", False), ("2300-2400", "2230", True)]
+
+
+def gate_run(script, w, hm, psi, windows=None, **extra):
+    """One real run of row 13 with the clock faked to hm: 'open', 'closed' (a gate: refusal) or 'rcN'."""
+    env = dict(w.env, BENCH_ASSERT_QUIET="1", FAKE_HM=hm, BENCH_PSI_FILE=psi, **extra)
+    if windows is not None:
+        env["BENCH_BLOCK_WINDOWS"] = windows
+    rc, out, err = run(script, ["--rows", "13"], env)
+    if rc == 0 and "MANUAL" in out:
+        return "open", err
+    if rc == 2 and "gate:" in err:
+        return "closed", err
+    return f"rc{rc}", err
+
+
 def gate_failures(script, tmp, tag):
     """What the time-window and PSI gates get wrong (empty = right). `date +%H%M` is faked per case; the
     leading-zero values 0830, 0900 and 0158 are the ones bash reads as invalid octal."""
@@ -899,14 +936,68 @@ def gate_failures(script, tmp, tag):
     open(psi, "w").write(PSI_OK)
     open(hot, "w").write(PSI_HOT)
     for hm, ok in GATE_CASES:
-        rc, out, err = run(script, ["--rows", "13"], dict(w.env, BENCH_ASSERT_QUIET="1", FAKE_HM=hm, BENCH_PSI_FILE=psi))
-        if ok and not (rc == 0 and "MANUAL" in out):
-            bad.append(f"{hm}:open-but-rc{rc}")
-        if not ok and not (rc == 2 and "gate:" in err):
-            bad.append(f"{hm}:closed-but-rc{rc}")
+        got = gate_run(script, w, hm, psi)[0]
+        if got != ("open" if ok else "closed"):
+            bad.append(f"{hm}:{'open' if ok else 'closed'}-but-{got}")
+    for windows, hm, ok in WINDOW_CASES:
+        got = gate_run(script, w, hm, psi, windows)[0]
+        if got != ("open" if ok else "closed"):
+            bad.append(f"{windows}@{hm}:{'open' if ok else 'closed'}-but-{got}")
     rc, out, err = run(script, ["--rows", "13"], dict(w.env, BENCH_ASSERT_QUIET="1", FAKE_HM="1200", BENCH_PSI_FILE=hot))
     if not (rc == 2 and "PSI" in err):
         bad.append(f"psi:rc{rc}")
+    return bad
+
+
+BAD_WINDOWS = ["abc", "0100-0700,", ",0100-0700", "0100-0700,,1630-1830", "100-700", "0100", "0100-", "-0700",
+               "2500-2600", "0160-0700", "0100-0760", "0100-2401", "2400-2400", "0700-0100", "0100-0100",
+               "01:00-07:00", "0100-0700 1630-1830", "0100-0700, 1630-1830", "0100-0700;1630-1830", "0100–0700"]
+BAD_TZ = ["Australia Melbourne", "Australia/Melbourne;date", "$(date)", "Aus*", "Australia\\Melbourne"]
+
+
+def window_failures(script, tmp, tag):
+    """What BENCH_BLOCK_WINDOWS and BENCH_TZ get wrong beyond the clock cases (empty = right): the plan
+    line, the zone handed to date, the refusal of malformed values in --dry-run and in a real run."""
+    bad = []
+    w = World(tmp, tag)
+    psi = os.path.join(w.root, "psi")
+    open(psi, "w").write(PSI_OK)
+    tail = "memory PSI some avg60 < 1%; BENCH_ASSERT_QUIET=1 (no vzdump"
+
+    for extra, want in [
+        ({}, "plan: gates: window outside 01:00-07:00 and 16:30-18:30 Australia/Melbourne; " + tail),
+        ({"BENCH_BLOCK_WINDOWS": ""}, "plan: gates: window outside 01:00-07:00 and 16:30-18:30 Australia/Melbourne; " + tail),
+        ({"BENCH_BLOCK_WINDOWS": "0100-0415,1630-1830", "BENCH_TZ": "Australia/Adelaide"},
+         "plan: gates: window outside 01:00-04:15 and 16:30-18:30 Australia/Adelaide; " + tail),
+        ({"BENCH_BLOCK_WINDOWS": "0830-0900"}, "plan: gates: window outside 08:30-09:00 Australia/Melbourne; " + tail),
+    ]:
+        rc, out, err = run(script, ["--dry-run"], dict(w.env, **extra))
+        if rc != 0 or not any(l.startswith(want) for l in out.splitlines()):
+            bad.append(f"plan:{extra}:rc{rc}")
+
+    log = os.path.join(w.root, "tz.log")
+    for extra, zone in [({}, "Australia/Melbourne"), ({"BENCH_TZ": "Australia/Adelaide"}, "Australia/Adelaide"),
+                        ({"BENCH_TZ": ""}, "Australia/Melbourne")]:
+        open(log, "w").close()
+        got, err = gate_run(script, w, "0200", psi, FAKE_TZ_LOG=log, **extra)
+        zones = open(log).read().split()
+        if got != "closed" or zones != [zone] or zone not in err:
+            bad.append(f"tz:{extra}:{got}:{zones}")
+
+    for windows in BAD_WINDOWS:
+        rc, out, err = run(script, ["--dry-run"], dict(w.env, BENCH_BLOCK_WINDOWS=windows))
+        if rc != 2 or "BENCH_BLOCK_WINDOWS" not in err or "plan:" in out:
+            bad.append(f"dry:{windows}:rc{rc}")
+        got, err = gate_run(script, w, "1200", psi, windows)
+        if got != "rc2" or "BENCH_BLOCK_WINDOWS" not in err or "gate:" in err:
+            bad.append(f"run:{windows}:{got}")
+    for zone in BAD_TZ:
+        rc, out, err = run(script, ["--dry-run"], dict(w.env, BENCH_TZ=zone))
+        if rc != 2 or "BENCH_TZ" not in err:
+            bad.append(f"dry-tz:{zone}:rc{rc}")
+        got, err = gate_run(script, w, "1200", psi, BENCH_TZ=zone)
+        if got != "rc2" or "BENCH_TZ" not in err:
+            bad.append(f"run-tz:{zone}:{got}")
     return bad
 
 
@@ -947,6 +1038,8 @@ def token_failures(script, tmp, tag):
 def test_gates_and_confirmation(tmp):
     bad = gate_failures(BENCH, tmp, "gates")
     check("the window and PSI gates read HHMM as decimal", not bad, str(bad))
+    bad = window_failures(BENCH, tmp, "windows")
+    check("BENCH_BLOCK_WINDOWS and BENCH_TZ: plan line, zone, malformed values refused", not bad, str(bad))
 
     w = World(tmp, "nogates")
     rc, out, err = w.run(["--no-gates", "--rows", "13"], BENCH_CONFIRM_NO_GATES="")
@@ -955,6 +1048,7 @@ def test_gates_and_confirmation(tmp):
     check("--no-gates with BENCH_CONFIRM_NO_GATES=1 proceeds", rc == 0 and "MANUAL" in out, f"rc={rc} {err}")
     rc, out, err = w.run(["--help"])
     check("--help names --no-gates and its confirmation", rc == 0 and "--no-gates" in out and "BENCH_CONFIRM_NO_GATES" in out, out)
+    check("--help names BENCH_BLOCK_WINDOWS and BENCH_TZ", "BENCH_BLOCK_WINDOWS" in out and "BENCH_TZ" in out, out)
 
 
 def test_hermetic_api(tmp):
