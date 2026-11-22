@@ -468,14 +468,16 @@ CUDA_LLVM_FLAGS=()
 # The same clang already compiles this project's own kernels (see CLANG_CUDA above), and FFmpeg's
 # compat/cuda/cuda_runtime.h stands in for the CUDA SDK, so no toolkit is needed.
 if [[ "$GPU_VENDOR" == "intel" ]]; then
-    APT_PKGS+=(libva-dev libvpl-dev libdrm-dev)
+    APT_PKGS+=(libva-dev libvpl-dev libdrm-dev zlib1g-dev)
     NVCODEC=0
     BRIDGE_TEST_DEFAULT=0
     # 0008 and 0009 are format-negotiation fixes in the generic hwmap filter, not CUDA fixes, and a
     # VA-API to Vulkan chain is the hwmap chain they were written for (GPU_VENDORS.md 5.7).
     VENDOR_PATCHES=(0008-hwmap-chain-format.patch 0009-hwmap-query-formats.patch)
     # libdrm: the Vulkan device taken from the render node (drm=dr:<node>, vulkan=vk@dr) needs it.
-    HWACCEL_FLAGS=(--enable-vaapi --enable-libvpl --enable-libdrm)
+    # zlib: the png encoder and decoder need it, and without zlib1g-dev configure drops them silently.
+    # bench-intel.sh row 7 decodes still_720p.png with this binary.
+    HWACCEL_FLAGS=(--enable-vaapi --enable-libvpl --enable-libdrm --enable-zlib)
 else
     VENDOR_PATCHES=(
         0006-vulkan-to-cuda-hwmap.patch
@@ -1081,6 +1083,11 @@ if [[ "$GPU_VENDOR" == "intel" ]]; then
         grep -qw "$enc" <<<"$encoders_out" \
             && echo "  $enc: present" || die "$enc encoder missing from the build (libvpl-dev, --enable-libvpl)"
     done
+    decoders_out=$("$PREFIX/ffmpeg" -hide_banner -decoders 2>/dev/null) || true
+    grep -qE '^ V.{5} png ' <<<"$encoders_out" \
+        && echo "  png encoder: present" || die "png encoder missing from the build (zlib1g-dev, --enable-zlib)"
+    grep -qE '^ V.{5} png ' <<<"$decoders_out" \
+        && echo "  png decoder: present" || die "png decoder missing from the build (zlib1g-dev, --enable-zlib)"
 fi
 
 # Filters being present says nothing about pixels. The CUDA<->Vulkan bridge (0006-0012) once

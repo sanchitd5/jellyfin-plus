@@ -42,7 +42,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # Not libshaderc-dev: the script builds shaderc from source, the distro one breaks nlmeans_vulkan.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl git python3 build-essential glslang-tools nodejs npm \
-        pkg-config nasm yasm meson ninja-build cmake libx264-dev libxcb1-dev libvulkan-dev libva-dev libvpl-dev libdrm-dev \
+        pkg-config nasm yasm meson ninja-build cmake libx264-dev libxcb1-dev libvulkan-dev libva-dev libvpl-dev libdrm-dev zlib1g-dev \
  && rm -rf /var/lib/apt/lists/*
 
 RUN curl -fsSL "$DOTNET_SDK_URL" -o /tmp/dotnet.tar.gz \
@@ -201,6 +201,8 @@ RUN --mount=type=bind,from=base-pkgs,source=/usr/lib/jellyfin-ffmpeg/ffmpeg,targ
     test -f /usr/lib/jellyfin-ffmpeg-oidn/fsr2-nocuda; \
     "$F" -hide_banner -hwaccels | grep -qx vaapi; \
     "$F" -hide_banner -encoders | grep -q h264_qsv; \
+    "$F" -hide_banner -encoders | grep -qE '^ V.{5} png '; \
+    "$F" -hide_banner -decoders | grep -qE '^ V.{5} png '; \
     cmp /tmp/base-ffmpeg /usr/lib/jellyfin-ffmpeg/ffmpeg; \
     v=$(/usr/local/bin/jellyfin-ffmpeg-upscale -version); \
     echo "$v" | grep -q '^ffmpeg version'; \

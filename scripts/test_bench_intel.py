@@ -591,7 +591,7 @@ def build_apt_checks(df):
     apt = re.search(r"apt-get install[^\n]*?--no-install-recommends(.*?)&&\s*rm -rf", body, re.S)
     pkgs = apt.group(1).replace("\\", " ").split() if apt else []
     check("the build stage has an apt-get install line", bool(pkgs))
-    for pkg in ["libvulkan-dev", "libva-dev", "libvpl-dev", "libdrm-dev", "glslang-tools"]:
+    for pkg in ["libvulkan-dev", "libva-dev", "libvpl-dev", "libdrm-dev", "zlib1g-dev", "glslang-tools"]:
         check(f"the build stage installs {pkg}", pkg in pkgs, str(pkgs))
 
     script = open(os.path.join(HERE, "build-ffmpeg.sh")).read()
@@ -607,6 +607,9 @@ def build_apt_checks(df):
     at = apt.start() if apt else -1
     check("the apt install comes before the FSR2 fetch and compile", 0 <= at < fetch, f"{at} {fetch}")
     check("the distro shaderc is not installed (it broke nlmeans_vulkan)", "libshaderc" not in " ".join(pkgs))
+    check("build-ffmpeg.sh apt-installs zlib1g-dev for intel (png needs zlib)", "zlib1g-dev" in (intel.group(1).split() if intel else []))
+    check("build-ffmpeg.sh passes --enable-zlib for intel", bool(re.search(r"HWACCEL_FLAGS=\([^)]*--enable-zlib", script.split("else\n    VENDOR_PATCHES=(")[0])))
+    check("the nvidia branch of build-ffmpeg.sh is left without zlib changes", "--enable-zlib" not in script.split("else\n    VENDOR_PATCHES=(")[1].split("\nfi\n")[0])
 
     check("every -dev package has a runtime pair listed", not unpaired_dev(pkgs + wanted, DEV_RUNTIME),
           str(unpaired_dev(pkgs + wanted, DEV_RUNTIME)))
@@ -622,6 +625,7 @@ DEV_RUNTIME = {
     "libdrm-dev": "libdrm2",
     "libx264-dev": "libx264-164",
     "libxcb1-dev": "libxcb1",
+    "zlib1g-dev": "zlib1g",
     "glslang-tools": None,
 }
 
@@ -808,7 +812,8 @@ def dockerfile_checks(tmp):
     check("every stage starts from the pinned base", froms and all(f == "${JELLYFIN_IMAGE}" for f in froms), str(froms))
     for needle in ["GPU_VENDOR=intel", "WITH_ORT=1", "ORT_EP=openvino", "WITH_FSR2=1", "FSR2_SDK=", "FSR2_LIB=",
                    "PREFIX=/usr/lib/jellyfin-ffmpeg-oidn", "scripts/build-ffmpeg.sh", "fsr2-nocuda",
-                   "ffmpeg_required_filters intel", "-hwaccels", "h264_qsv", "cmp /tmp/base-ffmpeg",
+                   "ffmpeg_required_filters intel", "-hwaccels", "h264_qsv", "-encoders | grep -qE '^ V.{5} png '",
+                   "-decoders | grep -qE '^ V.{5} png '", "cmp /tmp/base-ffmpeg",
                    "not found", "git rev-parse HEAD", "FSRCNNX_x2_8-0-4-1.glsl", "JELLYFIN_FFMPEG=",
                    "/var/cache/jellyfin/jellyfin-upscale.json", "jellyfin-ffmpeg-upscale"]:
         check(f"Dockerfile carries {needle}", needle in df)
