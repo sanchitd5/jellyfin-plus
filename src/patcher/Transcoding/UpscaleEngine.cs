@@ -985,7 +985,7 @@ namespace Jellyfin.Plugin.Plus.Patcher
             // Same rule, and the reason is a property of the server's GPU, not of the viewer's choice.
             if (!string.IsNullOrEmpty(r.GpuWithheld))
             {
-                parts.Add(r.GpuWithheld + " NOT run: needs an NVIDIA GPU and this server's is Intel");
+                parts.Add(r.GpuWithheld + " NOT run: " + WithheldWhy(r.GpuWithheld));
             }
 
             if (r.UpscaleApplied)
@@ -2227,7 +2227,11 @@ namespace Jellyfin.Plugin.Plus.Patcher
         /// <summary>The reason a withheld level gives, as the probe and the status route serve it.</summary>
         internal const string NeedsNvidia = "needs NVIDIA";
 
-        /// <summary>Whether a level of this axis (Denoise, Neural or Game) needs an NVIDIA GPU. A property of the level alone.</summary>
+        /// <summary>
+        /// Whether a level of this axis (Denoise, Neural or Game) needs an NVIDIA GPU. A property of the
+        /// level alone, except fsr2 on a detected Intel GPU, where it is the CUDA-free build's marker
+        /// and a passed start-up probe (<see cref="NoCudaGameNow"/>) that lift it.
+        /// </summary>
         internal static bool NvidiaOnly(string axis, string level)
         {
             switch (axis)
@@ -2250,10 +2254,11 @@ namespace Jellyfin.Plugin.Plus.Patcher
             + " and the reactive mask is empty (jitter is still measured)";
 
         /// <summary>
-        /// Whether the patched ffmpeg's fsr2 was built to run without CUDA, on a detected Intel GPU.
-        /// False everywhere else, so no other server's list or command changes. Never throws.
+        /// Whether the patched ffmpeg was built to run fsr2 without CUDA (the marker beside the models
+        /// directory), on a detected Intel GPU. False everywhere else. Says nothing about whether fsr2
+        /// actually runs here: that is <see cref="NoCudaGameNow"/>. Never throws.
         /// </summary>
-        internal static bool NoCudaGameNow()
+        internal static bool NoCudaGameBuilt()
         {
             try
             {
@@ -2264,6 +2269,125 @@ namespace Jellyfin.Plugin.Plus.Patcher
             {
                 return false;
             }
+        }
+
+        /// <summary>
+        /// Whether fsr2 is offered and run without CUDA: the build says so and a one-frame fsr2 run on
+        /// this server's GPU has passed. Until that first run lands, and while it keeps failing, fsr2
+        /// stays withheld. False everywhere else, so no other server's list or command changes, and
+        /// the probe is never read (so never started) there. Never throws, never runs the probe.
+        /// </summary>
+        internal static bool NoCudaGameNow()
+        {
+            try
+            {
+                return NoCudaGameBuilt() && Fsr2Probe.Peek()?.Ok == true;
+            }
+            catch (Exception)
+            {
+                return false;
+            }
+        }
+
+        /// <summary>What a one-frame fsr2 run came to. A run that ffmpeg failed is an answer (Ok false); no run at all is null.</summary>
+        internal sealed class Fsr2ProbeResult
+        {
+            public bool Ok { get; set; }
+        }
+
+        /// <summary>How long a failed or missing fsr2 probe stands before the next read schedules another.</summary>
+        internal static readonly TimeSpan Fsr2ProbeRetryAfter = TimeSpan.FromMinutes(5);
+
+        /// <summary>The cache behind <see cref="NoCudaGameNow"/>: Ok is kept for the process, anything else is retried after <see cref="Fsr2ProbeRetryAfter"/>.</summary>
+        internal static CachedProbe<Fsr2ProbeResult> NewFsr2Probe(
+            Func<Fsr2ProbeResult> probe = null, Func<DateTime> now = null, Action<Action> schedule = null) =>
+            new CachedProbe<Fsr2ProbeResult>(probe ?? RunFsr2Probe, r => r.Ok, Fsr2ProbeRetryAfter, now, schedule);
+
+        /// <summary>Replaced by the tests; nothing in production does.</summary>
+        internal static CachedProbe<Fsr2ProbeResult> Fsr2Probe { get; set; } = NewFsr2Probe();
+
+        /// <summary>Starts the fsr2 probe off the calling thread, on a server where it can matter (an Intel GPU and the CUDA-free build). Called once at start-up.</summary>
+        internal static void StartFsr2Probe()
+        {
+            try
+            {
+                if (NoCudaGameBuilt())
+                {
+                    Fsr2Probe.Start();
+                }
+            }
+            catch (Exception)
+            {
+                // the next read of NoCudaGameNow schedules it
+            }
+        }
+
+        /// <summary>
+        /// The command the fsr2 probe runs: one 128x72 frame through the same fsr2 node a session
+        /// builds (jitter, reactive mask and depth at the values that need no flow or model). No
+        /// -init_hw_device: vf_fsr2 opens its own Vulkan device and a session's node does not pick
+        /// one either, so this tests the device a session gets.
+        /// </summary>
+        internal static string Fsr2ProbeArgs() =>
+            "-hide_banner -loglevel error -f lavfi -i testsrc=size=128x72:rate=1 -frames:v 1 "
+            + "-vf \"format=gbrpf32le,fsr2=w=256:h=144:jitter=zero:reactive=none:depth=flat,format=yuv420p\" -f null -";
+
+        private static Fsr2ProbeResult RunFsr2Probe()
+        {
+            string exe = ShaderLibrary.PatchedFfmpegPath();
+            if (string.IsNullOrWhiteSpace(exe) || !File.Exists(exe))
+            {
+                return null;
+            }
+
+            var psi = new System.Diagnostics.ProcessStartInfo(exe, Fsr2ProbeArgs())
+            {
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+            };
+
+            using (var proc = System.Diagnostics.Process.Start(psi))
+            {
+                if (proc == null)
+                {
+                    return null;
+                }
+
+                var outRead = proc.StandardOutput.ReadToEndAsync();
+                var errRead = proc.StandardError.ReadToEndAsync();
+                if (!proc.WaitForExit(20000))
+                {
+                    try
+                    {
+                        proc.Kill();
+                    }
+                    catch (Exception)
+                    {
+                        // Already gone.
+                    }
+
+                    return null;
+                }
+
+                System.Threading.Tasks.Task.WaitAll(new System.Threading.Tasks.Task[] { outRead, errRead }, 5000);
+                return new Fsr2ProbeResult { Ok = proc.ExitCode == 0 };
+            }
+        }
+
+        /// <summary>Why fsr2 is withheld on an Intel server whose ffmpeg was built for it: the probe has not run yet, or it failed.</summary>
+        internal const string Fsr2ProbePending = "waiting for the fsr2 start-up check";
+
+        internal const string Fsr2ProbeFailed = "the fsr2 start-up check failed on this GPU";
+
+        private static string WithheldReason(string axis, string level)
+        {
+            if (axis == "Game" && ShaderLibrary.IsCudaFreeGame(level) && NoCudaGameBuilt())
+            {
+                return Fsr2Probe.Peek() == null ? Fsr2ProbePending : Fsr2ProbeFailed;
+            }
+
+            return NeedsNvidia;
         }
 
         /// <summary>
@@ -2314,7 +2438,7 @@ namespace Jellyfin.Plugin.Plus.Patcher
                     map[axis] = byLevel = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
                 }
 
-                byLevel[level] = NeedsNvidia;
+                byLevel[level] = WithheldReason(axis, level);
             }
         }
 
@@ -2338,7 +2462,28 @@ namespace Jellyfin.Plugin.Plus.Patcher
         private static string WithheldNote(Plan plan) =>
             string.IsNullOrEmpty(plan.GpuWithheld)
                 ? string.Empty
-                : "; " + plan.GpuWithheld + " not run: needs an NVIDIA GPU and this server's is Intel";
+                : "; " + plan.GpuWithheld + " not run: " + WithheldWhy(plan.GpuWithheld);
+
+        /// <summary>The reason a session's withheld list gives: this GPU is Intel, and for fsr2 on a build made for it, that its start-up check has not passed.</summary>
+        private static string WithheldWhy(string withheld)
+        {
+            const string nvidia = "needs an NVIDIA GPU and this server's is Intel";
+            if (string.IsNullOrEmpty(withheld) || !NoCudaGameBuilt())
+            {
+                return nvidia;
+            }
+
+            string[] items = withheld.Split(new[] { ", " }, StringSplitOptions.RemoveEmptyEntries);
+            if (!items.Contains("game fsr2"))
+            {
+                return nvidia;
+            }
+
+            string state = Fsr2Probe.Peek() == null ? "not finished" : "it failed";
+            return items.Length == 1
+                ? "the fsr2 start-up check has not passed on this server's Intel GPU (" + state + ")"
+                : "game fsr2: its start-up check has not passed (" + state + "); the rest need an NVIDIA GPU and this server's is Intel";
+        }
 
         /* ------------------------------------------------------------------ device selection */
 

@@ -23,6 +23,7 @@ namespace Jellyfin.Plugin.Plus.Patcher
         {
             Configure(settingsJson);
             UpscalePatches.Apply(logger as ILogger);
+            UpscaleEngine.StartFsr2Probe();
             return UpscalePatches.Status;
         }
 

@@ -817,14 +817,21 @@
             }
 
             // The levels this server's GPU cannot run, as the server reports them: only an Intel
-            // server sends any, and then every one needs NVIDIA. Nothing is said otherwise.
+            // server sends any, each with the reason the server gives (needs NVIDIA, or for fsr2 on a
+            // build made for it, a start-up check that has not passed). Nothing is said otherwise.
             function withheldText(w) {
                 if (!w) { return ''; }
-                var names = [];
+                var byReason = {}, reasons = [];
                 Object.keys(w).forEach(function (axis) {
-                    Object.keys(w[axis] || {}).forEach(function (level) { names.push(level); });
+                    Object.keys(w[axis] || {}).forEach(function (level) {
+                        var why = w[axis][level] || 'needs NVIDIA';
+                        if (!byReason[why]) { byReason[why] = []; reasons.push(why); }
+                        byReason[why].push(level);
+                    });
                 });
-                return names.length ? ' Not offered on this GPU (needs NVIDIA): ' + names.join(', ') + '.' : '';
+                return reasons.map(function (why) {
+                    return ' Not offered on this GPU (' + why + '): ' + byReason[why].join(', ') + '.';
+                }).join('');
             }
 
             function loadStatus(page) {

@@ -41,8 +41,9 @@
 # An ONNX Runtime carries the CUDA provider or the OpenVINO one, so one binary is one or the other, and it
 # is refused beside WITH_OPTIX, WITH_DLSS and WITH_MAXINE_VSR. WITH_FSR2=1 (with FSR2_SDK and FSR2_LIB, no
 # NVOF_SDK) is allowed: it applies ffmpeg/0016 and compiles gu_inputs.h with -DGU_NO_NVOF, so fsr2 runs with
-# zero motion vectors and no CUDA, and the build leaves <prefix>/fsr2-nocuda for the plugin to find. Not removed by it, and PR 8 of
-# docs/architecture/GPU_VENDORS.md is where they go: FFmpeg's own nv-codec-headers (MIT, no SDK, no card:
+# zero motion vectors and no CUDA, and the build leaves <prefix>/fsr2-nocuda for the plugin to find (every
+# other build removes that file). The rest of the CUDA side is not removed by it (PR 8 of
+# docs/architecture/GPU_VENDORS.md is where it goes): FFmpeg's own nv-codec-headers (MIT, no SDK, no card:
 # the driver is dlopen()ed), the --enable-ffnvcodec/cuda/nvenc configure flags and patches 0006 to 0014
 # are still applied. The Intel GPU plugin needs the host's OpenCL stack (ocl-icd-libopencl1,
 # intel-opencl-icd); this script does not install it. proxmox-build.sh does not know ORT_EP: it requires
@@ -917,17 +918,17 @@ if [[ "$WITH_ORT" == "1" && "$ORT_EP" == "openvino" ]]; then
     echo "  note: whether the Intel GPU is used needs the host's OpenCL runtime (intel-opencl-icd); watch a real" \
          "encode at -v verbose for 'OpenVINO execution provider unavailable', the line that says it ran on the CPU"
 fi
+# What the plugin's NoCudaGameAvailable looks for (GpuVendor.cs): this binary's fsr2 runs without CUDA.
+# Removed by every build, then written only for the CUDA-free fsr2 one and only after its check, so a
+# CUDA build or a failed check never leaves one beside a binary it does not describe.
+rm -f "$PREFIX/fsr2-nocuda"
 if [[ "$WITH_FSR2" == "1" ]]; then
     "$PREFIX/ffmpeg" -hide_banner -filters 2>/dev/null | grep -E "\bfsr2\b" \
         && echo "  fsr2: present" || die "fsr2 filter missing from the build"
     if [[ "$ORT_EP" == "openvino" ]]; then
-        # What the plugin's NoCudaGameAvailable looks for (GpuVendor.cs): this binary's fsr2 runs
-        # without CUDA. Written only after the check above, and removed by an OpenVINO build without it.
         : > "$PREFIX/fsr2-nocuda"
         echo "  fsr2: built without CUDA (zero motion vectors), marked $PREFIX/fsr2-nocuda"
     fi
-elif [[ "$ORT_EP" == "openvino" ]]; then
-    rm -f "$PREFIX/fsr2-nocuda"
 fi
 if [[ "$WITH_DLSS" == "1" ]]; then
     "$PREFIX/ffmpeg" -hide_banner -filters 2>/dev/null | grep -E "\bdlss\b" \

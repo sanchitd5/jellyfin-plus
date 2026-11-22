@@ -1062,7 +1062,22 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
             };
         }
 
-        // PR 6: fsr2 is offered and run on a detected Intel GPU only when the build left the fsr2-nocuda marker; dlss and dlaa never.
+        private static int _fsr2ProbeCalls;
+
+        // Replaces the fsr2 start-up probe with one that counts its calls and answers with `answer`. Its scheduler
+        // runs the work at once, so a Start() lands the answer before the next read; `schedule` overrides that.
+        private static void UseFsr2Probe(Func<UpscaleEngine.Fsr2ProbeResult> answer, Func<DateTime> now = null, Action<Action> schedule = null)
+        {
+            _fsr2ProbeCalls = 0;
+            UpscaleEngine.Fsr2Probe = UpscaleEngine.NewFsr2Probe(() => { _fsr2ProbeCalls++; return answer(); }, now, schedule ?? (work => work()));
+        }
+
+        private static UpscaleEngine.Fsr2ProbeResult Fsr2Passed() => new UpscaleEngine.Fsr2ProbeResult { Ok = true };
+
+        private static UpscaleEngine.Fsr2ProbeResult Fsr2Failed() => new UpscaleEngine.Fsr2ProbeResult { Ok = false };
+
+        // PR 6: fsr2 is offered and run on a detected Intel GPU only when the build left the fsr2-nocuda marker AND a
+        // one-frame fsr2 run on this GPU passed; dlss and dlaa never.
         private static void NoCudaGame()
         {
             UpscaleEngine.EncoderListSource = () => Encoders(FullList);
@@ -1084,19 +1099,27 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
             Check("Intel node + marker: NoCudaGameAvailable", GpuDetector.Resolve("auto", Path.Combine(Rig(), "models"), WithFile(Machine("renderD128", "0x8086"), marker)).NoCudaGameAvailable);
             Check("Intel chosen, no Intel node, marker: no NoCudaGameAvailable", !GpuDetector.Resolve("intel", Path.Combine(Rig(), "models"), WithFile(Machine("renderD128", "0x10de"), marker)).NoCudaGameAvailable);
 
-            // Without the marker the Intel probe is what PR 3 made it: no game level.
+            // Without the marker the Intel probe is what PR 3 made it: no game level, and the fsr2 probe never runs
+            // even though one that would pass is installed.
+            UseFsr2Probe(Fsr2Passed);
             GpuDetector.UseEnvironment(Machine("renderD128", "0x8086"));
             UpscaleEngine.Settings = RigSettings("auto");
+            UpscaleEngine.StartFsr2Probe();
             JsonElement bare = Probe();
             Equal("Intel, no marker: Game is off alone", "off", string.Join(",", Strings(bare, "Game")));
             Equal("Intel, no marker: Withheld game", "fsr2,dlss,dlaa", string.Join(",", Keys(bare.GetProperty("Withheld").GetProperty("Game"))));
             UpscaleEngine.Plan refused = UpscaleEngine.Decide(SessionJob("upscale", "1080", "game", "fsr2"));
             Equal("Intel, no marker: fsr2 is withheld", "game fsr2", refused.GpuWithheld);
             Check("Intel, no marker: no fsr2 node and no motion note", !refused.GameApplied && refused.GameFilter == null && refused.GameMotionNote == null);
+            Equal("Intel, no marker: fsr2 says needs NVIDIA", UpscaleEngine.NeedsNvidia, bare.GetProperty("Withheld").GetProperty("Game").GetProperty("fsr2").GetString());
+            Check("Intel, no marker: the fsr2 probe was never run", _fsr2ProbeCalls == 0, _fsr2ProbeCalls + " calls");
 
-            // With it, fsr2 is offered and runs, and dlss and dlaa stay withheld.
+            // With the marker and a passing probe, fsr2 is offered and runs, and dlss and dlaa stay withheld.
+            UseFsr2Probe(Fsr2Passed);
             GpuDetector.UseEnvironment(WithFile(Machine("renderD128", "0x8086"), marker));
             UpscaleEngine.Settings = RigSettings("auto");
+            UpscaleEngine.StartFsr2Probe();
+            Check("Intel + marker: start-up runs the probe once", _fsr2ProbeCalls == 1, _fsr2ProbeCalls + " calls");
             JsonElement marked = Probe();
             Check("Intel + marker: Game offers fsr2 and not dlss or dlaa", Strings(marked, "Game").Contains("fsr2") && !Strings(marked, "Game").Contains("dlss") && !Strings(marked, "Game").Contains("dlaa"), string.Join(",", Strings(marked, "Game")));
             Check("Intel + marker: the game labels follow", Keys(marked.GetProperty("GameLabels")).Contains("fsr2") && !Keys(marked.GetProperty("GameLabels")).Contains("dlss"));
@@ -1116,16 +1139,80 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
             UpscaleEngine.Plan dlaa = UpscaleEngine.Decide(SessionJob("upscale", "1080", "game", "dlaa"));
             Equal("Intel + marker: dlaa is still withheld", "game dlaa", dlaa.GpuWithheld);
             Check("Intel + marker: neither dlss nor dlaa has a node", !dlss.GameApplied && !dlaa.GameApplied && dlss.GameFilter == null && dlaa.GameFilter == null);
+            Check("Intel + marker: a pass is kept, the probe ran once in all", _fsr2ProbeCalls == 1, _fsr2ProbeCalls + " calls");
 
-            // The marker never reaches an NVIDIA box, and the classification of the levels themselves does not move.
+            // A probe that ran and failed: fsr2 is withheld with its own reason, no node and no motion note.
+            UseFsr2Probe(Fsr2Failed);
+            UpscaleEngine.StartFsr2Probe();
+            JsonElement failed = Probe();
+            Check("Intel + marker, probe failed: Game is off alone", string.Join(",", Strings(failed, "Game")) == "off", string.Join(",", Strings(failed, "Game")));
+            Equal("Intel + marker, probe failed: fsr2 says why", UpscaleEngine.Fsr2ProbeFailed, failed.GetProperty("Withheld").GetProperty("Game").GetProperty("fsr2").GetString());
+            Equal("Intel + marker, probe failed: dlss still says needs NVIDIA", UpscaleEngine.NeedsNvidia, failed.GetProperty("Withheld").GetProperty("Game").GetProperty("dlss").GetString());
+            UpscaleEngine.Plan failedPlan = UpscaleEngine.Decide(SessionJob("upscale", "1080", "game", "fsr2"));
+            Equal("Intel + marker, probe failed: fsr2 is withheld", "game fsr2", failedPlan.GpuWithheld);
+            Check("Intel + marker, probe failed: no fsr2 node and no motion note", !failedPlan.GameApplied && failedPlan.GameFilter == null && failedPlan.GameMotionNote == null);
+            string failedSummary = UpscaleEngine.Describe(null, failedPlan, failedPlan.Status, failedPlan.Reason).Summary ?? string.Empty;
+            Check("Intel + marker, probe failed: the summary does not say needs NVIDIA", !failedSummary.Contains("NVIDIA"), failedSummary);
+            Check("Intel + marker, probe failed: the chain has no fsr2", !UpscaleEngine.BuildChain(failedPlan).Contains("fsr2"));
+
+            // A probe with no answer (ffmpeg missing, killed on the time limit, threw), and one that has not landed yet.
+            UseFsr2Probe(() => null);
+            UpscaleEngine.StartFsr2Probe();
+            JsonElement unanswered = Probe();
+            Equal("Intel + marker, probe null: fsr2 is waiting", UpscaleEngine.Fsr2ProbePending, unanswered.GetProperty("Withheld").GetProperty("Game").GetProperty("fsr2").GetString());
+            Equal("Intel + marker, probe null: fsr2 is withheld", "game fsr2", UpscaleEngine.Decide(SessionJob("upscale", "1080", "game", "fsr2")).GpuWithheld);
+            UseFsr2Probe(() => throw new InvalidOperationException("no ffmpeg"));
+            UpscaleEngine.StartFsr2Probe();
+            Check("Intel + marker, probe threw: fsr2 is withheld", UpscaleEngine.WithheldLevels(UpscaleEngine.Settings)["Game"].ContainsKey("fsr2"));
+            var queued = new List<Action>();
+            UseFsr2Probe(Fsr2Passed, null, queued.Add);
+            Check("Intel + marker, probe pending: fsr2 is withheld and the read did not run it", UpscaleEngine.WithheldLevels(UpscaleEngine.Settings)["Game"].ContainsKey("fsr2") && _fsr2ProbeCalls == 0 && queued.Count == 1, _fsr2ProbeCalls + " calls, " + queued.Count + " queued");
+            Equal("Intel + marker, probe pending: the reason", UpscaleEngine.Fsr2ProbePending, UpscaleEngine.WithheldLevels(UpscaleEngine.Settings)["Game"]["fsr2"]);
+            Equal("Intel + marker, probe pending: the session is withheld", "game fsr2", UpscaleEngine.Decide(SessionJob("upscale", "1080", "game", "fsr2")).GpuWithheld);
+            queued[0]();
+            Check("Intel + marker, probe lands: fsr2 is offered", !UpscaleEngine.WithheldLevels(UpscaleEngine.Settings)["Game"].ContainsKey("fsr2") && UpscaleEngine.NoCudaGameNow());
+
+            // CachedProbe's rules on a fake clock: a pass is kept, a failure is asked again only after the TTL.
+            DateTime clock = new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+            bool pass = false;
+            UseFsr2Probe(() => pass ? Fsr2Passed() : Fsr2Failed(), () => clock);
+            UpscaleEngine.StartFsr2Probe();
+            UpscaleEngine.NoCudaGameNow();
+            Check("probe: a failure is not asked again before the TTL", _fsr2ProbeCalls == 1, _fsr2ProbeCalls + " calls");
+            clock = clock + UpscaleEngine.Fsr2ProbeRetryAfter + TimeSpan.FromSeconds(1);
+            pass = true;
+            Check("probe: the read after the TTL still answers from the failure", !UpscaleEngine.NoCudaGameNow());
+            Check("probe: and it asked again, off the read", _fsr2ProbeCalls == 2, _fsr2ProbeCalls + " calls");
+            Check("probe: the pass is offered", UpscaleEngine.NoCudaGameNow());
+            clock = clock + TimeSpan.FromDays(1);
+            UpscaleEngine.NoCudaGameNow();
+            Check("probe: a pass is kept and never asked again", _fsr2ProbeCalls == 2 && UpscaleEngine.NoCudaGameNow(), _fsr2ProbeCalls + " calls");
+            Check("probe: a throw is an answer of null", UpscaleEngine.NewFsr2Probe(() => throw new InvalidOperationException(), null, work => work()).Peek() == null);
+
+            string probeArgs = UpscaleEngine.Fsr2ProbeArgs();
+            Check("probe: the command runs fsr2 and starts no device of its own", probeArgs.Contains("fsr2=") && !probeArgs.Contains("-init_hw_device") && !probeArgs.Contains("-filter_hw_device"), probeArgs);
+
+            // The marker never reaches an NVIDIA box or a no-GPU box, and the classification of the levels themselves does not move.
+            UseFsr2Probe(Fsr2Passed);
             GpuDetector.UseEnvironment(WithFile(Machine("renderD128", "0x10de"), marker));
             UpscaleEngine.Settings = RigSettings("auto");
+            UpscaleEngine.StartFsr2Probe();
             Equal("NVIDIA with the marker file: Game keeps all three", "off,fsr2,dlss,dlaa", string.Join(",", Strings(Probe(), "Game")));
             UpscaleEngine.Plan nvFsr = UpscaleEngine.Decide(SessionJob("upscale", "1080", "game", "fsr2"));
             Check("NVIDIA with the marker file: fsr2 runs with no motion note", nvFsr.GameApplied && nvFsr.GpuWithheld == null && nvFsr.GameMotionNote == null, nvFsr.Status + ": " + nvFsr.Reason);
+            Check("NVIDIA with the marker file: the fsr2 probe was never run", _fsr2ProbeCalls == 0, _fsr2ProbeCalls + " calls");
+            GpuDetector.UseEnvironment(WithFile(Machine(), marker));
+            UpscaleEngine.Settings = RigSettings("auto");
+            UpscaleEngine.StartFsr2Probe();
+            UpscaleEngine.NoCudaGameNow();
+            Probe();
+            Check("no GPU with the marker file: the fsr2 probe was never run", _fsr2ProbeCalls == 0, _fsr2ProbeCalls + " calls");
+            GpuDetector.UseEnvironment(WithFile(Machine("renderD128", "0x10de"), marker));
+            UpscaleEngine.Settings = RigSettings("auto");
             Check("the level classification is unchanged", ShaderLibrary.IsNvidiaOnlyGame("fsr2") && ShaderLibrary.IsCudaFreeGame("fsr2") && !ShaderLibrary.IsCudaFreeGame("dlss") && !ShaderLibrary.IsCudaFreeGame("dlaa") && !ShaderLibrary.IsCudaFreeGame("off") && !ShaderLibrary.IsCudaFreeGame(null));
 
             GpuDetector.UseEnvironment(null);
+            UpscaleEngine.Fsr2Probe = UpscaleEngine.NewFsr2Probe();
             UpscaleEngine.EncoderListSource = null;
             UpscaleEngine.DrmVulkanProbeSource = null;
             UpscaleEngine.Av1QsvProbeSource = null;

@@ -234,13 +234,16 @@ keeps the code path that existed before the setting did:
   Intel and is not measured; the cost arithmetic is in GPU_VENDORS.md 5.4 and NEURAL.md.
 
 **fsr2 without CUDA (PR 6).** `gu_inputs.h` builds with `-DGU_NO_NVOF` (no CUDA, no NVOFA: zero motion
-vectors, empty reactive mask, jitter still measured) and falls back to the same zero flow when CUDA will not
-start. `ORT_EP=openvino WITH_FSR2=1 scripts/build-ffmpeg.sh` builds it (patch `ffmpeg/0016`) and leaves
-`<prefix>/fsr2-nocuda`; with that file and a detected Intel GPU `GpuCapability.NoCudaGameAvailable` is true,
-the probe offers `fsr2` (not `dlss`/`dlaa`) and `SessionRecord.GameMotionNote` says the vectors are zero.
-Without the file everything is as before. NVIDIA is unchanged. Not compiled or run on an Intel GPU;
-`scripts/test-gu-inputs.sh` is the compile-and-run check of the CUDA-free variant and of the default variant's
-CUDA call order and degrade path against a fake CUDA (stub headers; not the real SDK headers or NVOFA).
+vectors, empty reactive mask, jitter still measured); the default build keeps the hard error when CUDA will not
+start and degrades only a failed NVOFA init. `ORT_EP=openvino WITH_FSR2=1 scripts/build-ffmpeg.sh` builds it
+(patch `ffmpeg/0016`) and leaves `<prefix>/fsr2-nocuda` (any other build removes it); with that file and a
+detected Intel GPU `GpuCapability.NoCudaGameAvailable` is true, and the probe offers `fsr2` (not `dlss`/`dlaa`)
+only once a one-frame fsr2 run of the patched ffmpeg has passed, started at plugin load and never on a request
+(`CachedProbe`: a pass is kept, a failure is retried every 5 minutes). Until then fsr2 is withheld with its own
+reason. `SessionRecord.GameMotionNote` says the vectors are zero. Without the file everything is as before.
+NVIDIA is unchanged. Not compiled or run on an Intel GPU; `scripts/test-gu-inputs.sh` is the compile-and-run
+check of the CUDA-free variant and of the default variant's CUDA call order and hard error against a fake CUDA
+(stub headers; not the real SDK headers or NVOFA), and it applies patches 0001, 0015 and 0016 in order.
 
 Not done by this: choosing between two Intel GPUs (OpenVINO's own GPU numbering is not mapped to the
 render node either), hardware decode, an Intel ffmpeg build, a client-panel hint when a chosen level

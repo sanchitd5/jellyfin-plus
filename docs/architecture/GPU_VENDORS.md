@@ -401,7 +401,7 @@ is stated, never silent:
 |---|---|---|
 | Denoise | `optix`, `optix-temporal` (and the unlisted `optix-hdr`) | OptiX needs CUDA frames |
 | Neural | `dlpp-1` to `dlpp-4`, `vsr-rtcuda` (and the retired `vsr`) | NVIDIA RTX DLPP / VSR libraries over CUDA |
-| Game | `dlss`, `dlaa`; and `fsr2` unless the ffmpeg is the PR 6 CUDA-free build | DLSS is NVIDIA's; `fsr2` is fed by NVOFA motion vectors through CUDA (`gu_inputs.h`), and is offered on Intel only when the build left the `fsr2-nocuda` marker (section 5.5) |
+| Game | `dlss`, `dlaa`; and `fsr2` unless the ffmpeg is the PR 6 CUDA-free build | DLSS is NVIDIA's; `fsr2` is fed by NVOFA motion vectors through CUDA (`gu_inputs.h`), and is offered on Intel only when the build left the `fsr2-nocuda` marker and a one-frame fsr2 probe has passed (section 5.5) |
 
 Each is removed from the probe lists (`Levels.Denoise`, `Neural`, `Game`, `GameOptionLevels` and the
 label maps), so the client, which builds its menu from the probe, never offers it. A server whose
@@ -592,9 +592,10 @@ level that can use them:
 `gu_inputs.h` has a compile switch, `GU_NO_NVOF`, that removes every CUDA and NVOFA line (the
 `ffnvcodec` and Optical Flow headers, the CUDA context, the NVOFA session, the flow and reactive code),
 so the build needs neither nv-codec-headers nor the Optical Flow SDK. Without the switch the NVIDIA path
-is the one it was, plus one change: a CUDA that will not load or start (no `libcuda`, `cuInit` fails)
-now logs a warning and runs with zero flow, as a missing NVOFA already did, instead of failing the
-filter. Zero motion vectors are a known failure, not a noisy one, and the session record says so
+is the one it was: a CUDA that will not load or start (no `libcuda`, `cuInit` fails) is still an error
+that fails the filter, because on an NVIDIA box a silent fall to zero flow would hide a broken driver;
+only a failed NVOFA init degrades to zero flow, as it always did. Zero motion vectors are a known
+failure, not a noisy one, and the session record says so
 (`GameMotionNote`, and a sentence in the summary): with them FSR2 behaves close to a spatial upscaler
 that also accumulates history, so ghosting on moving content is possible and is **not measured**.
 
@@ -603,20 +604,29 @@ that also accumulates history, so ghosting on moving content is possible and is 
 OptiX patches, so an OpenVINO build applies the standalone
 `0016-add-fsr2-filter-to-build-standalone.patch` instead (the same shape as 0015 is for `ort`), which
 registers `fsr2` with no `ffnvcodec` dependency, and compiles with `-DGU_NO_NVOF`. The build leaves a
-marker, `fsr2-nocuda`, beside the models directory's parent, as the OpenVINO build leaves its provider.
+marker, `fsr2-nocuda`, beside the models directory's parent, as the OpenVINO build leaves its provider;
+every other build deletes a stale one.
 
 **The plugin.** `GpuCapability.NoCudaGameAvailable` is true only when an Intel GPU was seen and that
-marker exists. Then, on Intel, `fsr2` is offered and runs; `dlss` and `dlaa` stay withheld ("needs
+marker exists. That is not yet enough to offer `fsr2`: the marker says the build was made for it, not that
+it runs on this GPU. `UpscaleEngine.NoCudaGameNow()` also needs a passing one-frame fsr2 run of the patched
+ffmpeg (a synthetic 128x72 source, no device of its own, so it tests the device a session gets). The run is
+a `CachedProbe`, started once when the patcher loads and never on a request: a pass is kept for the
+process, a failure or no answer (ffmpeg missing, 20 s timeout) is asked again after 5 minutes. Until it
+passes, fsr2 is withheld with its own reason ("waiting for the fsr2 start-up check", then "the fsr2
+start-up check failed on this GPU") instead of "needs NVIDIA", and the config page and session summary
+say so. Once it passes, on Intel `fsr2` is offered and runs; `dlss` and `dlaa` stay withheld ("needs
 NVIDIA"), and without the marker all three stay withheld as PR 3 left them. NVIDIA, no-GPU and
-mixed-box command lines and probes are unchanged.
+mixed-box command lines and probes are unchanged, and the probe never runs there.
 
 **Not verified.** Nothing here has been compiled with a real toolchain or run on an Intel GPU; the
-0016 patch has not been applied to a real FFmpeg tree; whether FSR2 with zero motion vectors looks
-acceptable has not been looked at. `scripts/test-gu-inputs.sh` is the compile-and-run check for the
+0016 patch has not been applied to a real FFmpeg tree here; whether FSR2 with zero motion vectors looks
+acceptable has not been looked at; the start-up probe has not run on an Intel GPU. `scripts/test-gu-inputs.sh` is the compile-and-run check for the
 CUDA-free variant, and also runs the default variant against stub `ffnvcodec` and Optical Flow headers and
-a fake CUDA (the call order, and a CUDA failing at load, `cuInit` or the context push). The stubs prove the
-CUDA call order and the degrade path, not that the real SDK headers compile and not the NVOFA calls; a
-`WITH_FSR2=1` NVIDIA build is that check.
+a fake CUDA (the call order, and a CUDA failing at load, `cuInit`, device lookup, retain or the context
+push, each an error). It also applies 0001, 0015 and 0016 in order to a pristine FFmpeg tree when one is
+given. The stubs prove the CUDA call order and the error path, not that the real SDK headers compile and
+not the NVOFA calls; a `WITH_FSR2=1` NVIDIA build is that check.
 
 ### 5.6 PR 7: opt-in Intel hardware decode, and the VA-API to Vulkan fix
 
