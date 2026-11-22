@@ -669,6 +669,79 @@ def local_libs_checks(df):
     check("mutant: a build stage that copies nothing is caught", bool(local_libs_failures(no_build)))
 
 
+DRIVER_PKGS = ["mesa-vulkan-drivers", "intel-media-va-driver-non-free", "libigdgmm12"]
+NONFREE_SRC = "/etc/apt/sources.list.d/intel-non-free.sources"
+
+
+def final_runs(final):
+    return re.findall(r"^RUN (?:[^\n]*\\\n)*[^\n]*", final, re.M)
+
+
+def driver_failures(df):
+    """What leaves the Arc image without the drivers libvulkan and libva dlopen (bench rows 2-4 and 9 failed).
+
+    runtime-packages.txt comes from ldd of the patched ffmpeg, which never sees a dlopen'd driver, so the
+    final stage must install the Intel Vulkan ICD and the iHD VA driver itself, and a build-time RUN must
+    prove the ICD JSON exists and that both driver libraries resolve every dependency.
+    """
+    bad = []
+    final = df.rpartition("\nFROM ")[2]
+    runs = final_runs(final)
+    install = next((r for r in runs if "apt-get install" in r and "mesa-vulkan-drivers" in r), None)
+    if install is None:
+        bad.append("the final stage has no apt-get install of the Intel drivers")
+    else:
+        for pkg in DRIVER_PKGS:
+            if not re.search(rf"(?<![\w.-]){re.escape(pkg)}(?![\w.-])", install):
+                bad.append(f"the driver install does not name {pkg}")
+        order = [install.find(s) for s in (f"> {NONFREE_SRC}", "apt-get update", "apt-get install", f"rm -f {NONFREE_SRC}")]
+        if "non-free" not in install or min(order) < 0 or order != sorted(order):
+            bad.append("the non-free component must be written, updated, installed from and removed within the one RUN")
+        if "rm -rf /var/lib/apt/lists/*" not in install:
+            bad.append("the driver install does not clean the apt lists")
+    gate = next((r for r in runs if "/usr/share/vulkan/icd.d" in r), None)
+    if gate is None:
+        bad.append("no RUN checks the Intel ICD JSON in /usr/share/vulkan/icd.d")
+    else:
+        if "*intel*.json" not in gate:
+            bad.append("the ICD check does not look for an Intel ICD JSON")
+        if "library_path" not in gate:
+            bad.append("the ICD check does not read the library the JSON names")
+        if "iHD_drv_video.so" not in gate:
+            bad.append("the acceptance does not check iHD_drv_video.so")
+        if len(re.findall(r"ldd ", gate)) < 2 or len(re.findall(r"grep 'not found'", gate)) < 2:
+            bad.append("the acceptance must run ldd on both the ICD library and iHD and fail on 'not found'")
+        if install is not None:
+            if final.find(gate) < final.find(install):
+                bad.append("the driver acceptance runs before the drivers are installed")
+            if final.find(gate) < final.find("RUN ldconfig"):
+                bad.append("the driver acceptance runs before ldconfig")
+    comments = "\n".join(re.findall(r"^#[^\n]*", final, re.M))
+    if not (re.search(r"\bvainfo\b", comments) and re.search(r"\bvulkaninfo\b", comments) and "GPU" in comments):
+        bad.append("no comment says vainfo/vulkaninfo need a GPU so the Arc bench is the real proof")
+    return bad
+
+
+def driver_checks(df, spec):
+    check("the final image installs the Intel drivers and proves they load", not driver_failures(df), str(driver_failures(df)))
+    for pkg in DRIVER_PKGS:
+        check(f"mutant: no {pkg} is caught", bool(driver_failures(df.replace(pkg, "removed-pkg"))))
+    check("mutant: the free iHD package instead of non-free is caught",
+          bool(driver_failures(df.replace("intel-media-va-driver-non-free", "intel-media-va-driver"))))
+    check("mutant: a non-free source left behind is caught", bool(driver_failures(df.replace(f"rm -f {NONFREE_SRC};", "true;"))))
+    check("mutant: no ICD check is caught", bool(driver_failures(df.replace("icd.d", "icd.x"))))
+    check("mutant: no ldd of iHD is caught", bool(driver_failures(df.replace("iHD_drv_video.so", "x.so"))))
+    check("mutant: no ldd of the ICD library is caught", bool(driver_failures(df.replace("library_path", "x"))))
+    check("mutant: no 'not found' gate is caught", bool(driver_failures(df.replace("grep 'not found'", "true"))))
+    check("mutant: no GPU caveat is caught", bool(driver_failures(df.replace("vulkaninfo", "x"))))
+    final = df.rpartition("\nFROM ")[2]
+    gate = next((r for r in final_runs(final) if "/usr/share/vulkan/icd.d" in r), "")
+    early = df.replace(gate, "", 1).replace("COPY --from=build /out/runtime-packages.txt", gate + "\nCOPY --from=build /out/runtime-packages.txt", 1)
+    check("mutant: the driver check before the install is caught", bool(gate) and bool(driver_failures(early)))
+    check("the spec page says why the drivers are installed by name",
+          all(p in spec.partition("### 5.8 ")[2] for p in ["dlopen", *DRIVER_PKGS]))
+
+
 SHIM_PATH = "/usr/local/bin/jellyfin-ffmpeg-upscale"
 
 
@@ -745,6 +818,7 @@ def dockerfile_checks(tmp):
 
     build_apt_checks(df)
     local_libs_checks(df)
+    driver_checks(df, spec)
     shim_interpreter_checks(df)
     entrypoint_checks(df)
     web_step_checks(df)

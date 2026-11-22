@@ -944,6 +944,17 @@ Deployment may override it. The GPU node needs `/dev/dri` and the host's VA-API 
 | .NET 10 SDK | `10.0.404` tarball, checked against its published sha512 (`DOTNET_SDK_SHA512`) |
 | Runtime libraries | not hand-listed: derived from the built binary's `ldd`, minus what the base has, and installed in the final stage; a library the build puts under `/usr/local` (shaderc, which has no package) is copied to `/usr/local/lib` and `ldconfig` runs before the acceptance check |
 
+**Drivers libvulkan and libva `dlopen`.** The derived package list is `ldd`-based, so it cannot see a
+driver the loader opens at run time. The first Arc bench (rows 2, 3, 4 and 9 failed: no Vulkan device
+for libplacebo, `Failed to initialise VAAPI connection`) had none. The final stage therefore installs
+`mesa-vulkan-drivers` (the `anv` ICD), `intel-media-va-driver-non-free` (iHD; the free build lacks the
+HuC-based Arc encode that row 10 needs) and `libigdgmm12` from Debian by name. The `non-free`
+component is enabled for that one RUN only: the source file is written, used and removed in it. The
+build then requires an Intel ICD JSON in `/usr/share/vulkan/icd.d` and no `not found` in `ldd` of the
+ICD's library and of `iHD_drv_video.so`. `vainfo` and `vulkaninfo` need a GPU, so they are not
+build checks: the Arc bench is the proof that the drivers open the device. Which of these was the
+cause of each failure is not established until that bench runs.
+
 **Acceptance, enforced by the build.** `ldd` of the patched ffmpeg shows no `not found`; `-filters`
 lists `oidn ort fsr2 libplacebo xpsnr`; the `fsr2-nocuda` marker exists; `-hwaccels` lists `vaapi`;
 `-encoders` lists `h264_qsv`; the stock ffmpeg is byte-identical to the base's (`cmp`); the shim

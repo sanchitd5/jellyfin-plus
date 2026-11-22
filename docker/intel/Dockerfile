@@ -134,11 +134,34 @@ RUN apt-get update \
  && xargs -a /tmp/runtime-packages.txt apt-get install -y --no-install-recommends python3 jq \
  && rm -rf /var/lib/apt/lists/* /tmp/runtime-packages.txt
 
+# The drivers libvulkan and libva dlopen: the ldd-derived list above cannot see them, so they are named here.
+# iHD is in non-free (the free build lacks Arc's HuC encode, which QSV needs); that component is enabled for
+# this one RUN and the source file is removed before it ends.
+RUN set -eu; \
+    printf 'Types: deb\nURIs: http://deb.debian.org/debian\nSuites: trixie\nComponents: non-free\nSigned-By: /usr/share/keyrings/debian-archive-keyring.pgp\n' > /etc/apt/sources.list.d/intel-non-free.sources; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends mesa-vulkan-drivers intel-media-va-driver-non-free libigdgmm12; \
+    rm -f /etc/apt/sources.list.d/intel-non-free.sources; \
+    rm -rf /var/lib/apt/lists/*
+
 COPY --from=build /usr/lib/jellyfin-ffmpeg-oidn /usr/lib/jellyfin-ffmpeg-oidn
 # The base lists /usr/local/lib in /etc/ld.so.conf.d/libc.conf (checked on the pinned image); the cache
 # is rebuilt here, before the acceptance check below resolves the binary's libraries.
 COPY --from=build /out/local-libs/ /usr/local/lib/
 RUN ldconfig
+# Driver acceptance: an Intel ICD JSON exists and the ICD library and iHD resolve every dependency. vainfo
+# and vulkaninfo need a GPU, which a build does not have, so the Arc bench is the real proof they work.
+RUN set -eu; \
+    icds=$(ls /usr/share/vulkan/icd.d/*intel*.json); \
+    for j in $icds; do \
+        l=$(jq -r .ICD.library_path "$j"); \
+        case "$l" in /*) ;; *) l="/usr/lib/x86_64-linux-gnu/$l" ;; esac; \
+        test -f "$l"; \
+        if ldd "$l" | grep 'not found'; then echo "unresolved libraries in $l" >&2; exit 1; fi; \
+    done; \
+    ihd=/usr/lib/x86_64-linux-gnu/dri/iHD_drv_video.so; \
+    test -f "$ihd"; \
+    if ldd "$ihd" | grep 'not found'; then echo "unresolved libraries in $ihd" >&2; exit 1; fi
 COPY --from=build /out/patcher /usr/lib/jellyfin-plus
 COPY --from=build /out/plugin-dist /usr/lib/jellyfin-plus-dist
 COPY --from=build /usr/share/jellyfin-shaders /usr/share/jellyfin-shaders
