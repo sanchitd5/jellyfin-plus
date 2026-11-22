@@ -134,12 +134,34 @@ operator has actually installed the provider.
 
 ### 3.5 Where it is reported
 
-- **Probe** (`PatcherHost.Levels()`, served as `Levels.Gpu` by `GET /JellyfinPlus/Session/probe`).
+Only the **Status** route is administrator-only. `GET /JellyfinPlus/Session/{id}` is open to any
+authenticated user (it answers for the caller's own session), so everything it serves carries the
+summary alone: `Vendor`, `Detected`, `EncoderFamily`, `CudaOnlyLevelsAvailable`, `OpenVinoAvailable`
+(`GpuSummary`). `Devices`, `RenderNode`, `Reason`, `Setting` and `DecodeType` are never served there
+(AGENTS.md invariant 13).
+
+- **Probe** (`PatcherHost.Levels()`, served as `Levels.Gpu` by `GET /JellyfinPlus/Session/probe`): summary.
   The probe is what the client builds its menu from, so this is where later PRs will filter levels.
-- **Status** (`GET /JellyfinPlus/Status`, `Gpu`), and the dashboard's status line.
+- **Status** (`GET /JellyfinPlus/Status`, `Gpu`), and the dashboard's status line: the full record.
 - **SessionRecord** (`Gpu`), written when the session's command is built, so Recent sessions and
   `GET /JellyfinPlus/Session/{id}` (`Record.Gpu`, and flat `Gpu`) say what the server looked like for
-  that session.
+  that session: summary, one immutable instance shared by every record built under the same detection.
+
+### 3.5.1 The shared probe helper
+
+`CachedProbe<T>` (`src/patcher/CachedProbe.cs`) is how the patcher asks the machine something slow
+from a path that must not wait for it. PRs 2, 3 and 7 reuse it rather than probing under a lock:
+
+- `Start()` runs the probe on the thread pool at plug-in start-up (`PatcherHost.Apply`); `Peek()` is
+  all the transcode path calls, takes a lock for a few field reads and never runs the probe.
+- A conclusive answer (the `conclusive` predicate) is kept for the life of the process. A null,
+  throwing or inconclusive one stands only for `retryAfter` (60 s for GPU detection); the next `Peek()`
+  after that schedules a new probe and returns the last answer meanwhile. This is the fix for
+  `nvidia-smi` failing while the driver loads at boot and pinning the box to `none` until restart.
+- Before the first answer lands the record says so ("GPU detection has not finished; reported as
+  none") rather than guessing.
+- `Reset()` discards the answer and any probe in flight. Tests pass a fake clock and a queue as the
+  scheduler (`scripts/gpu-vendor-harness`).
 
 ### 3.6 Tests
 
@@ -158,7 +180,13 @@ running Jellyfin. It checks:
   `HwaccelArgs` (both forms), `BuildChain` (plain, deband with download, CUDA-native, CUDA-native
   bridged through libplacebo) and `EncoderFor` return the exact strings they returned before the
   setting existed. The expected strings are written out by hand from the code, not computed;
-- that the probe, the status route and `SessionRecord` carry the record.
+- **access:** the probe and a recorded session (what any authenticated user can fetch) carry the five
+  summary fields and none of `Devices`, `RenderNode`, `Reason`, `Setting`, nor a device path or PCI
+  id anywhere in the body; the status route keeps the full record;
+- `CachedProbe<T>` with a fake clock: the probe never runs on the caller, a negative answer is retried
+  after the window and replaced, a conclusive one is never re-asked, a throw is no answer, and a
+  probe in flight across `Reset()` is discarded;
+- `GpuVendor=none` with an NVIDIA card present says the setting overrode detection.
 
 PR 2 extends the same harness (it now compiles the DRM fdinfo reader and the load controller as
 well). The NVIDIA strings above are asserted on a machine with no GPU, an NVIDIA one and a mixed one,
@@ -181,22 +209,26 @@ Vulkan-denoise probe and the AV1 test-encode command are the strings they were, 
 never runs, the session record carries `vk:0` and no withheld text, and the probe has exactly the 23
 keys it had with the level lists `ShaderLibrary` offers (and the status route has no new key). On Intel
 it asserts the derived device (never `vk:0`), the fallback to `vk:0` when the test start fails and the
-trust-it path when the test is inconclusive, the QSV pin at `renderD136` and above and not at 128 to
-135, a node name that is not a plain render node, two-GPU machines in both orders (Intel first and
+trust-it path when the test is inconclusive, the background test (a session call returns at once, two
+callers start one test, a pass is never re-asked, a failure is re-asked only after the retry window),
+the QSV pin to the detected node at every render node, including an AMD card at `renderD128` beside an
+Intel one at `renderD129`, a node name that is not a plain render node, two-GPU machines in both orders (Intel first and
 NVIDIA first, `auto`, `nvidia`, `intel`, two Intel GPUs, an AMD node beside an Intel one), that nothing
 Intel emits `nvenc`, `cuda` or `vaapi`, that the probe lists lose exactly the NVIDIA-only levels and
-report each as `needs NVIDIA`, that a session asking for `optix`, `dlpp-2` and `dlss` (or defaulted to
+report each with its reason (`needs NVIDIA`; the ONNX levels are not withheld once PR 5 gives them a device), that a session asking for `optix`, `dlpp-2` and `dlss` (or defaulted to
 them) is enhanced without them, with `GpuWithheld` and the summary saying so, and that the same
 sessions on an NVIDIA box run them. A mutation check (the Intel gate off in the device resolution, in
-the level withholding, in the probe lists, and the QSV pin range widened) fails 33, 12, 6 and 9 of
-these. The shim's `render_node` has its own 11 checks in `scripts/test-shim-device.py`, run by the
+the level withholding and in the probe lists) failed 33, 12 and 6 of the earlier checks; the checks
+added for the review have since been run and passed. The shim's `render_node` has its own 11 checks in
+`scripts/test-shim-device.py`, run by the
 script when python3 is present (the SDK container has none, so they were run separately).
 
 PR 5 extends it in the same two directions, plus the C side. With `NeuralMaxSourceHeight` at 0 and no
 Intel GPU seen, the `ort` node is the string it was (written out by hand) on a no-GPU, an NVIDIA and
 a mixed machine, for every `GpuVendor` value, with the OpenVINO provider file present and absent, and
 on an Intel box the setting did not choose; the probe has no new key. On Intel the node carries
-`device=openvino` with the provider file and `device=cpu` without it, with the plan's and the record's
+`device=openvino` with the provider file and a binary that lists it (a stub `ffmpeg` beside the model
+directory, through the real probe) and `device=cpu` without either, with the plan's and the record's
 device and note and the summary's words; `ShaderLibrary.NeuralFilter` takes only those two values. The
 routing is asserted by value on NVIDIA and on Intel with OpenVINO at 240, 360 and 480 (chosen) and 481
 to 1080 (shader path), for a level asked for by the session and by the dashboard (runs below the line,
@@ -222,7 +254,7 @@ verified on the real box.
 |---|---|---|---|
 | 1 | Detection and the report-only capability record (section 3) | none | Harness; the record shown live on an NVIDIA box and an Intel box; command lines unchanged |
 | 2 | Encoder per vendor and Intel load (the old PR 2 and PR 4 together, section 5.1 and 5.2): map the negotiated codec to `*_nvenc` or `*_qsv`; a `*_nvenc` setting on an Intel box is treated as auto and said so; Jellyfin's own `*_qsv` choice is kept; `GuardAv1` test-encodes `av1_qsv` on Intel; the GPU-resident encode (`hwmap=derive_device=cuda`) is NVIDIA-only and reported n/a on Intel; `Gpu/Load` gains `vendor`, `encoderSessions`, `gpuBusyPercent` from DRM fdinfo | 1 | Served segment codec and size on each vendor; NVIDIA command byte-identical; busy percentage under a known encode |
-| 3 | The Vulkan device from the render node instead of `vk:0`, on Intel only (section 5.3); the QSV device pinned to the same node where the encoder would not find it by itself; the NVIDIA-only levels (`optix`, `dlpp-*`, `vsr-rtcuda`, `fsr2`, `dlss`, `dlaa`) withheld from the probe on Intel and reported as "needs NVIDIA"; `MaxConcurrent` 1 for 4K output on a small Intel GPU recommended in docs, default unchanged | 1, 2 | Command on a two-GPU box names the right device; NVIDIA, `none` and one-GPU commands unchanged; the probe on an Intel box lacks the NVIDIA-only levels |
+| 3 | The Vulkan device from the render node instead of `vk:0`, on Intel only (section 5.3); the QSV device always pinned to the detected node; the NVIDIA-only levels (`optix`, `dlpp-*`, `vsr-rtcuda`, `fsr2`, `dlss`, `dlaa`) withheld from the probe on Intel, each with its reason (PR 3 also withheld the ONNX levels, `realesr-*`, as "not measured on Intel"; PR 5 lifts that); `MaxConcurrent` 1 for 4K output on a small Intel GPU recommended in docs, default unchanged | 1, 2 | Command on a two-GPU box names the right device; NVIDIA, `none` and one-GPU commands unchanged; the probe on an Intel box lacks the NVIDIA-only levels |
 | 4 | Folded into PR 2 (Intel load via DRM fdinfo, section 5.2) | 1 | see PR 2 |
 | 5 | `vf_ort` OpenVINO execution provider (`device=openvino`, CPU with a reason when the provider is absent); `NeuralMaxSourceHeight` (0 = off) routing the ONNX neural levels by source height; `scripts/build-ffmpeg.sh` `ORT_EP=cuda\|openvino` with a standalone build patch that no longer needs the OptiX chain (section 5.4) | 1 (8 only for the required-filter set) | Harness for the routing and the `device` option; `scripts/test-vf-ort.sh` compiles the filter and checks its provider calls; on Intel, a served segment larger than the source with `NeuralDevice` `openvino` |
 | 6 | `gu_inputs` without CUDA | 5 | Motion vectors from a non-NVOFA source, compared by the project's temporal measurements |
@@ -283,9 +315,36 @@ of Jellyfin's is kept; one that cannot take this chain (`*_vaapi`, `*_nvenc`) is
 reason.
 
 **`GuardAv1`.** `av1_qsv` is listed by any build that compiles it, but only Arc and newer can open
-it, so on Intel one frame is test-encoded with `av1_qsv` (once, remembered) and a failure swaps to
-`hevc_qsv`, or `h264_qsv` when the client cannot take HEVC. An inconclusive probe (no ffmpeg, a
-timeout) leaves the choice alone, as the NVIDIA guard does.
+it, so on Intel one frame is test-encoded with `av1_qsv` and a failure swaps to `hevc_qsv`, or
+`h264_qsv` when the client cannot take HEVC. The test encode runs in the background, started at
+plugin start-up (and again when its answer lapses), opens the QSV device on the detected render node
+(`-init_hw_device vaapi=va:<node> -init_hw_device qsv=qs@va`, the form Jellyfin's own QSV lines use;
+not run against hardware) and is single-flight; the transcode path only reads its cached answer. A
+usable answer is kept 1 h, a failure 5 min and an inconclusive try (no ffmpeg, a timeout) 1 min, so a
+busy GPU or a timeout does not pin the choice. Until the first answer exists the guard swaps to
+`hevc_qsv` (or `h264_qsv`) as if the test had failed, and the reason says it has not finished: the
+old guard ran the test inline, so a first AV1 session on a GPU without an AV1 encoder never reached
+`av1_qsv`, and the swap-while-pending keeps that. The cost is that a first AV1 session on an Arc card in
+the seconds after start-up gets HEVC; the next one gets AV1. An inconclusive answer (no ffmpeg, a
+timeout) leaves `av1_qsv` alone, as the NVIDIA guard does.
+
+**No encoder.** With neither a `*_qsv` nor a software encoder in ffmpeg's list, `ChooseEncoder`
+returns nothing and Jellyfin's own choice stands; it no longer names a `*_qsv` encoder that would fail
+to open. For a stream copy that is the copy.
+
+**VA-API arguments.** Jellyfin's VA-API-specific options are keyed on the encoder name or emitted
+inside the methods this plugin already hooks (a read of `EncodingHelper` on release-10.11.z; about
+50 KB of it, including an HLS caller, was not read). As a second line, an optional prefix on
+`TranscodeManager.StartFfMpeg` removes `-init_hw_device vaapi=...`, the `-filter_hw_device` and
+`-hwaccel_device` that name it, `-hwaccel vaapi`, `-hwaccel_output_format vaapi`, `-rc_mode` and `-sei`
+from the command line of a session on the Intel path whose encoder is QSV or software. A line that
+still names a VA-API encoder, or opens a QSV device itself, is left whole. If a parameter name of
+`StartFfMpeg` differs Harmony throws at patch time and the patch is reported as failed, which leaves
+command lines as they were. The harness checks the prefix against the real `StartFfMpeg` in the
+server's assembly (`state` and `commandLineArguments` exist, with the right types), runs
+`PatcherHost.Apply` and asserts the prefix is installed. The command-line fixture is reconstructed
+from Jellyfin's source, not captured from a session, and a served segment on a real Arc is not
+verified.
 
 **Not done here, done in PR 3 (section 5.3).** The Vulkan device was still `vk:0`, and the CUDA-only
 levels were not withheld from the probe on Intel; PR 3 starts the Vulkan device from the render node and
@@ -313,7 +372,13 @@ mapped to render, copy, video, video-enhance and compute so the maths is one cod
 
 Busy percentage is the change between two samples: i915 divides the summed busy nanoseconds of a
 class by `elapsed x capacity`; xe divides the summed busy cycles by the change in
-`drm-total-cycles`. `gpuBusyPercent` is the busiest class (clamped to 0-100). `encoderSessions` is
+`drm-total-cycles`. `gpuBusyPercent` is the busiest class (clamped to 0-100). An i915 class that
+prints no capacity line is taken as one engine; when its figure is then over 110% it is a multi-engine
+class that cannot be normalised and is left out of the per-class figures instead of being reported
+as 100. A class left out (that, or an xe class with no elapsed cycles) may be the busiest one, so
+`gpuBusyPercent` is then null, not the busiest of the others: a real i915 file lists every engine
+class, and reading the idle ones as the answer would show a busy encode as 0%. A two-engine class at or under 100% of one engine with no capacity line is
+indistinguishable from a one-engine class and is reported as measured. `encoderSessions` is
 the number of distinct clients whose video-engine time moved in the window, which on this plugin's
 chain (software decode) is encode; a hardware-decoding client would count too, and the doc says so.
 Only clients present in both samples are counted, so an encode that starts and ends inside one window
@@ -325,9 +390,11 @@ the GPU is invisible; so a second figure that is not about processes is added wh
 without any privilege: `gpuIdlePercent`, the least-idle GT's share of the window spent in RC6
 (`gt/gt*/rc6_residency_ms` for i915, `tile*/gt*/gtidle/idle_residency_ms` for xe). RC6 idle is
 "the GT slept", not "the engines were busy", so it is reported beside the busy figure, not folded
-into it. `intel_gpu_top` and perf are never required. Sampling is two reads (the first call waits
-300 ms between them, later calls reuse the previous sample when it is 0.5 to 30 s old), the result is
-cached for 5 s and single-flighted, as the NVENC count is, and a failure is null, never an error.
+into it. `intel_gpu_top` and perf are never required. Sampling is two reads (the first waits 300 ms
+between them, later ones reuse the previous sample when it is 0.5 to 30 s old). The request thread
+never does it: the route returns the cached figure (null when there is none or it is over 60 s old)
+and, once the 5 s cache has lapsed, starts one background refresh, so the first poll after a quiet
+spell reports null and the next one has a figure. A failure is null, never an error.
 
 ### 5.3 PR 3: the Vulkan device from the render node, and the NVIDIA-only levels on Intel
 
@@ -369,33 +436,44 @@ id decides. Two GPUs of different models are told apart correctly; **two identic
 are not**: the first in Vulkan's order is taken whichever node was asked for. Second, a derive that
 cannot find a device is an error that ends the session's ffmpeg, a dead stream, not a degraded one.
 
-So the Intel device is checked before it is used. The first time it is needed the engine runs the
-stock ffmpeg once with exactly this device initialisation and a one-frame `hwupload,hwdownload`
-(the pattern `Av1QsvUsable` and `VulkanDenoiseRunsOnPatchedBinary` already follow), remembers the
-answer, and reports it. A failed check falls back to `vk:0` (today's behaviour, so this PR cannot
-turn a working Intel box into a dead one) and says so in the session record; an inconclusive check (no
-ffmpeg found, a timeout) trusts the render node, since nothing else would run either. When the record
-has no usable render node path, the argument is `vk:0`. The node text is only ever the detector's own
-`/dev/dri/renderD<digits>`; anything else is not put on a command line.
+So the Intel device is checked before it is used, **off the session path**. The engine runs the stock
+ffmpeg once per node with exactly this device initialisation and a one-frame `hwupload,hwdownload`
+(the pattern `Av1QsvUsable` and `VulkanDenoiseRunsOnPatchedBinary` already follow). The test takes up
+to 20 s, so no session waits for it: `UpscaleEngine.WarmDevices`, called from `PatcherHost.Apply`
+after `Configure`, starts it at plugin load, only one test runs per node (single-flight, behind a
+short lock that guards the cache entry and never an ffmpeg run), and a session that arrives first
+gets the last known answer or, when there is none yet, the untested node with the record text
+`(test pending)`. A pass is kept for the life of the process. A failure, and an inconclusive result
+(no ffmpeg found, a timeout), are kept for about 5 minutes and then re-tested in the background while
+the stale answer is served, so a transient failure does not pin an Intel server to `vk:0` until
+restart. A failed check falls back to `vk:0` (today's behaviour, so this PR cannot turn a working
+Intel box into a dead one) and says so in the session record; an inconclusive check trusts the render
+node, since nothing else would run either. When the record has no usable render node path, the
+argument is `vk:0`. The node text is only ever the detector's own `/dev/dri/renderD<digits>`;
+anything else is not put on a command line.
 
-**The QSV device (also decided from the source).** Nothing needs to be added in the common case. With
-no QSV device on the command line, `qsvenc_init_session` opens an internal session, and
-`ff_qsv_set_display_handle` (`libavcodec/qsv.c`) creates a VA-API device with `vendor_id=0x8086`;
-`vaapi_device_create` then walks `/dev/dri/renderD128` to `renderD135` (`max_devices = 8`) and takes
-the first node of that vendor. The detector's render node is the first Intel node in numeric order,
-so the two agree for every node from 128 to 135, which is every machine that is not unusual. Above
-that the implicit search never reaches the node, so there (and only there, and only when ffmpeg lists
-a QSV encoder) the arguments gain `-init_hw_device qsv=qs:hw_any,child_device=<node>`, which is what
-`-qsv_device <node>` expands to (`opt_qsv_device`). The encoder takes the one QSV device on the
-command line (`hw_device_setup_for_encode`, `HW_CONFIG_ENCODER_DEVICE(NV12, QSV)`). The one-GPU
-command is therefore unchanged from PR 2 apart from the Vulkan device. What this does not do is let
-an operator choose between two Intel GPUs: the first Intel node wins, as it does in the detector.
+**The QSV device (also decided from the source).** With no QSV device on the command line,
+`qsvenc_init_session` opens an internal session, and `ff_qsv_set_display_handle` (`libavcodec/qsv.c`)
+creates a VA-API device with `vendor_id=0x8086`; `vaapi_device_create` then walks
+`/dev/dri/renderD128` to `renderD135` (`max_devices = 8`) and takes the first node of that vendor.
+That search is not what the engine relies on: it is derived from source, never run, and on a box with
+an AMD GPU at `renderD128` and an Intel one at `renderD129` the detector's node is the only thing
+that names the right card. So whenever ffmpeg lists a QSV encoder the arguments always carry
+`-init_hw_device qsv=qs:hw_any,child_device=<node>`, which is what `-qsv_device <node>` expands to
+(`opt_qsv_device`), with `<node>` the detected one; with no QSV encoder there is no argument and the
+record says `none`. The encoder takes the one QSV device on the command line
+(`hw_device_setup_for_encode`, `HW_CONFIG_ENCODER_DEVICE(NV12, QSV)`). What this does not do is let an
+operator choose between two Intel GPUs: the first Intel node wins, as it does in the detector.
 
 **Where it applies.** One function builds the device arguments and both the session command
 (`HwaccelArgs`) and the two engine probes that start a Vulkan or QSV device use it, so a probe tests
-the device a session will use. The shim fallback reads an optional `render_node` from its JSON
-(unset keeps `vulkan=vk:0`); it has no vendor detection and no probe, so it is for an operator who
-knows the node.
+the device a session will use. A plan resolves that device once (`Plan.Devices`, set in `Decide`) and
+`HwaccelArgs(plan)`, `Describe` and both probe builders take it, so a render-node answer that changes
+between two reads cannot make the session record and its command disagree. The shim fallback reads
+an optional `render_node` from its JSON (unset keeps `vulkan=vk:0`); it has no vendor detection and
+no probe, so it is for an operator who knows the node. It is set by hand in
+`/etc/jellyfin-upscale.json`, is never test-started, and `ShimBridge.Sync` (which merges into the
+existing keys) keeps it across a sync but never writes it.
 
 **The NVIDIA-only levels.** On the Intel path these are not offered and are not run, and the reason
 is stated, never silent:
@@ -404,18 +482,23 @@ is stated, never silent:
 |---|---|---|
 | Denoise | `optix`, `optix-temporal` (and the unlisted `optix-hdr`) | OptiX needs CUDA frames |
 | Neural | `dlpp-1` to `dlpp-4`, `vsr-rtcuda` (and the retired `vsr`) | NVIDIA RTX DLPP / VSR libraries over CUDA |
-| Game | `dlss`, `dlaa`; and `fsr2` unless the ffmpeg is the PR 6 CUDA-free build | DLSS is NVIDIA's; `fsr2` is fed by NVOFA motion vectors through CUDA (`gu_inputs.h`), and is offered on Intel only when the build left the `fsr2-nocuda` marker (section 5.5) |
+| Game | `dlss`, `dlaa`; and `fsr2` unless the ffmpeg is the PR 6 CUDA-free build | DLSS is NVIDIA's; `fsr2` is fed by NVOFA motion vectors through CUDA (`gu_inputs.h`), and is offered on Intel only when the build left the `fsr2-nocuda` marker and a one-frame fsr2 probe has passed (section 5.5) |
 
 Each is removed from the probe lists (`Levels.Denoise`, `Neural`, `Game`, `GameOptionLevels` and the
 label maps), so the client, which builds its menu from the probe, never offers it. A server whose
 dashboard default or a stale client still asks for one gets `off` for that axis and the session says
 so: `SessionRecord.GpuWithheld` and a sentence in the summary ("... NOT run, needs NVIDIA ..."), with
 `NeuralRequested` still naming what was asked. The probe carries `Levels.Withheld` (axis, level,
-`needs NVIDIA`) and the status route the same, **only on the Intel path**, so the NVIDIA probe and
-status are unchanged, and the dashboard's GPU line lists them. Left alone on purpose: the ONNX
-neural levels (`ort`) fall back to ONNX Runtime's CPU provider without CUDA, which is not CUDA-required
-but is almost certainly not real time; PR 5 owns that (OpenVINO and `NeuralMaxSourceHeight`), and until
-then the record's neural description says CUDA is not what ran on Intel.
+the level's own reason) and the status route the same, **only on the Intel path**, so the NVIDIA probe
+and status are unchanged, and the dashboard's GPU line prints each as `Axis level (reason)`.
+
+The ONNX neural levels (`realesr-anime-x2`, `realesr-anime-x4`, `realesr-general-x4`) were withheld on
+Intel while they could only have fallen back to ONNX Runtime's CPU provider, which is almost certainly
+not real time and was never measured for this chain ("not measured on Intel", `GpuWithheldUnmeasured`).
+PR 5 (OpenVINO and `NeuralMaxSourceHeight`) is what brings them back: they are offered and run on
+Intel, on OpenVINO when the provider and the patched ffmpeg's `ort` device are there and on the CPU
+with the reason recorded otherwise (section 5.4). The unmeasured-withholding plumbing stays for a level
+that is not measured, and nothing uses it now.
 
 **Recommended in documentation only: `MaxConcurrent` 1 for 4K output on a small Intel GPU.** The one
 measurement there is (section 6) is a single session, 1080p to 2160p at 38 to 40 fps on an A380.
@@ -458,8 +541,19 @@ run):
 
 | Intel GPU seen and | The node the engine builds | The record says |
 |---|---|---|
-| the OpenVINO provider file is present (`OpenVinoAvailable`) | `ort=model=...:device=openvino` | `NeuralDevice` `openvino` |
-| it is not | `ort=model=...:device=cpu` | `NeuralDevice` `cpu` and why: the provider is not installed, ONNX Runtime's CPU provider runs, not measured for this chain |
+| the OpenVINO provider file is present (`OpenVinoAvailable`) and the patched ffmpeg's `-h filter=ort` lists `openvino` | `ort=model=...:device=openvino` | `NeuralDevice` `openvino` |
+| the provider file is not present | `ort=model=...:device=cpu` | `NeuralDevice` `cpu` and why: the provider is not installed, ONNX Runtime's CPU provider runs, not measured for this chain |
+| the provider file is present but the binary does not list `openvino` (built before the device existed, or without `ORT_EP=openvino`), or that has not been confirmed yet | `ort=model=...:device=cpu` | `NeuralDevice` `cpu` and why: the ort filter has no openvino device (rebuild with `ORT_EP=openvino`) or the check has not answered yet |
+
+The binary check (`UpscaleEngine.OrtOpenVinoState`) runs `ffmpeg -h filter=ort` on the binary beside the
+configured `NeuralModelDirectory` (`ShaderLibrary.PatchedFfmpegPath(settings)`), and only for a session
+that names a neural level or has `NeuralMaxSourceHeight` set, once, off the request path:
+`Decide` only reads the cache and, when it is empty or expired, starts one background probe and treats the
+device as not confirmed meanwhile (an unknown option kills the stream, so unknown counts as missing, as
+`HasFilter` does). A yes is kept for the life of the process; a no or an inconclusive answer is asked again
+after about 60 s, because the shim picks up a swapped binary without a restart. `PatcherHost.Configure`
+warms it where an Intel server with the provider file would ask. `device=cpu` exists in every build of
+`vf_ort.c`, so it is safe on a stale binary.
 
 Any other server's node carries no `device` option, as today (the filter's default is CUDA). Today an
 Intel server also ends on the CPU, but by way of a failed CUDA attempt and a warning; saying `cpu` is
@@ -481,7 +575,7 @@ CUDA-native levels (`dlpp-*`, `vsr-rtcuda`) are not routed:
   it only happens because an operator set this value. The record says it was chosen, in
   `NeuralRouting`, and `NeuralRequested` stays `off`: the viewer did not ask.
 - **Not on the CPU by choice.** On the Intel path this automatic choice needs the OpenVINO provider
-  (`OpenVinoAvailable`). Without it nothing is chosen and `NeuralRouting` says why, because a network
+  (`OpenVinoAvailable`) and a binary whose ort filter lists openvino. Without them nothing is chosen and `NeuralRouting` says why, because a network
   on the CPU is far from real time and choosing it for a viewer is a dead stream, not a worse picture.
   A level the session or the dashboard asked for by name still runs on the CPU as before, with the
   device reason.
@@ -595,9 +689,10 @@ level that can use them:
 `gu_inputs.h` has a compile switch, `GU_NO_NVOF`, that removes every CUDA and NVOFA line (the
 `ffnvcodec` and Optical Flow headers, the CUDA context, the NVOFA session, the flow and reactive code),
 so the build needs neither nv-codec-headers nor the Optical Flow SDK. Without the switch the NVIDIA path
-is the one it was, plus one change: a CUDA that will not load or start (no `libcuda`, `cuInit` fails)
-now logs a warning and runs with zero flow, as a missing NVOFA already did, instead of failing the
-filter. Zero motion vectors are a known failure, not a noisy one, and the session record says so
+is the one it was: a CUDA that will not load or start (no `libcuda`, `cuInit` fails) is still an error
+that fails the filter, because on an NVIDIA box a silent fall to zero flow would hide a broken driver;
+only a failed NVOFA init degrades to zero flow, as it always did. Zero motion vectors are a known
+failure, not a noisy one, and the session record says so
 (`GameMotionNote`, and a sentence in the summary): with them FSR2 behaves close to a spatial upscaler
 that also accumulates history, so ghosting on moving content is possible and is **not measured**.
 
@@ -606,21 +701,29 @@ that also accumulates history, so ghosting on moving content is possible and is 
 OptiX patches, so an OpenVINO build applies the standalone
 `0016-add-fsr2-filter-to-build-standalone.patch` instead (the same shape as 0015 is for `ort`), which
 registers `fsr2` with no `ffnvcodec` dependency, and compiles with `-DGU_NO_NVOF`. The build leaves a
-marker, `fsr2-nocuda`, beside the models directory's parent, as the OpenVINO build leaves its provider.
-`GPU_VENDOR=intel WITH_FSR2=1` takes the same path (section 5.7).
+marker, `fsr2-nocuda`, beside the models directory's parent, as the OpenVINO build leaves its provider; every
+other build deletes a stale one. `GPU_VENDOR=intel WITH_FSR2=1` takes the same path (section 5.7).
 
 **The plugin.** `GpuCapability.NoCudaGameAvailable` is true only when an Intel GPU was seen and that
-marker exists. Then, on Intel, `fsr2` is offered and runs; `dlss` and `dlaa` stay withheld ("needs
+marker exists. That is not yet enough to offer `fsr2`: the marker says the build was made for it, not that
+it runs on this GPU. `UpscaleEngine.NoCudaGameNow()` also needs a passing one-frame fsr2 run of the patched
+ffmpeg (a synthetic 128x72 source, no device of its own, so it tests the device a session gets). The run is
+a `CachedProbe`, started once when the patcher loads and never on a request: a pass is kept for the
+process, a failure or no answer (ffmpeg missing, 20 s timeout) is asked again after 5 minutes. Until it
+passes, fsr2 is withheld with its own reason ("waiting for the fsr2 start-up check", then "the fsr2
+start-up check failed on this GPU") instead of "needs NVIDIA", and the config page and session summary
+say so. Once it passes, on Intel `fsr2` is offered and runs; `dlss` and `dlaa` stay withheld ("needs
 NVIDIA"), and without the marker all three stay withheld as PR 3 left them. NVIDIA, no-GPU and
-mixed-box command lines and probes are unchanged.
+mixed-box command lines and probes are unchanged, and the probe never runs there.
 
 **Not verified.** Nothing here has been compiled with a real toolchain or run on an Intel GPU; the
-0016 patch has not been applied to a real FFmpeg tree; whether FSR2 with zero motion vectors looks
-acceptable has not been looked at. `scripts/test-gu-inputs.sh` is the compile-and-run check for the
+0016 patch has not been applied to a real FFmpeg tree here; whether FSR2 with zero motion vectors looks
+acceptable has not been looked at; the start-up probe has not run on an Intel GPU. `scripts/test-gu-inputs.sh` is the compile-and-run check for the
 CUDA-free variant, and also runs the default variant against stub `ffnvcodec` and Optical Flow headers and
-a fake CUDA (the call order, and a CUDA failing at load, `cuInit` or the context push). The stubs prove the
-CUDA call order and the degrade path, not that the real SDK headers compile and not the NVOFA calls; a
-`WITH_FSR2=1` NVIDIA build is that check.
+a fake CUDA (the call order, and a CUDA failing at load, `cuInit`, device lookup, retain or the context
+push, each an error). It also applies 0001, 0015 and 0016 in order to a pristine FFmpeg tree when one is
+given. The stubs prove the CUDA call order and the error path, not that the real SDK headers compile and
+not the NVOFA calls; a `WITH_FSR2=1` NVIDIA build is that check.
 
 ### 5.6 PR 7: opt-in Intel hardware decode, and the VA-API to Vulkan fix
 
@@ -649,36 +752,64 @@ condition failed (`HardwareDecodeReason`):
 
 1. the setting is on;
 2. an Intel GPU is detected (`Devices().Intel`, with a render node that has a usable path);
-3. the source is upright 8-bit SDR progressive h264 or hevc (anything Jellyfin would tone-map,
-   deinterlace or rotate adds a CPU-side node);
+3. the source is upright 8-bit SDR progressive 4:2:0 and one of h264 Main, h264 High or hevc Main
+   (`HardwareDecodableSource`: profile and `PixelFormat` are read as well as the codec, so Baseline,
+   Extended, High 10, High 4:2:2, High 4:4:4, hevc Main 10, Rext and Still Picture, and the 4:2:2, 4:4:4
+   and full-range `yuvj` formats stay in software; those decode to software frames or fail on the
+   VA-API surface and would die at the `hwmap`). Anything Jellyfin would tone-map, deinterlace or rotate
+   adds a CPU-side node;
 4. the plan has no CPU-side node: no CUDA neural, CPU deblock, CPU denoise (`atadenoise`), neural or game
    step, and a Vulkan denoise only if the patched binary can compile its shader;
-5. the start-up test passes: one synthetic frame uploaded to a VA surface, mapped to Vulkan and
-   downloaded on the patched binary (`HardwareDecodeProbeArgs`), once per render node and remembered
-   whatever the answer. **This is an approximation:** it exercises the VA-API to Vulkan map, not a
-   real decode, so a passing test does not prove the decoder works.
+5. the patched ffmpeg is installed, checked again for every plan (`ShaderLibrary.PatchedFfmpegPath`, the
+   one definition of the path): stock ffmpeg cannot map VA-API frames to Vulkan;
+6. the start-up test has passed for the source's codec. It runs the production chain
+   (`HardwareDecodeTestChain`, built by `BuildChain` with `HardwareDecode` set) with the production device
+   arguments (`HardwareDecodeDeviceArgs`) on a tiny generated h264 and hevc clip, so the download format
+   (`HardwareSurfaceFormat`) is exercised and not assumed. It runs on a thread-pool thread (`CachedProbe`, started at plugin
+   load by `PrimeHardwareDecode` and by the first plan that finds nothing): a plan only reads the answer,
+   so a session that arrives first decodes in software ("has not finished") and none waits. A pass is kept
+   for the life of the process; a fail or a test that could not run is asked again after 60 s while the
+   last answer stands, so one bad run at boot does not pin the server to software.
 
 When all hold the command is
-`-init_hw_device vaapi=va:<node> -init_hw_device vulkan=vk@va [QSV device] -hwaccel vaapi
+`-init_hw_device vaapi=va:<node> -init_hw_device vulkan=vk@va [QSV device] -hwaccel vaapi -hwaccel_device va
 -hwaccel_output_format vaapi -filter_hw_device vk` and the chain is
 `[setparams=range=tv,]hwmap=derive_device=vulkan,[Vulkan deblock/denoise,]libplacebo...,hwdownload,format=nv12`:
-no `format=yuv420p`, no `hwupload`. Nodes Jellyfin keeps (subtitle overlay and the like) are placed after
-the chain tail rather than before it.
+no `format=yuv420p`, no `hwupload`. Nodes Jellyfin keeps (`JoinChain`: the subtitle overlay and the like,
+all CPU nodes) run before the chain in software decode and after its `hwdownload` under hardware decode,
+so they follow the upscale on this path; the golden harness case pins both orders.
 
 Premises inferred from the source and not seen to work (P3 to P6): that `ffmpeg/0008` and `0009` make
 the VA-API to Vulkan `hwmap` negotiate; that `vk@va` derives a device the decoder's frames can be mapped
-into; that VA-API frames cannot enter a CPU node (hence the plan condition); and that the downloaded
-format is `nv12` (one constant, `HardwareDecodeFormat`).
+into; and that VA-API frames cannot enter a CPU node (hence the plan condition). The downloaded
+format is derived from the gated source pixel format (`HardwareSurfaceFormat`: `yuv420p` gives `nv12`,
+anything else has no hardware decode) and stored on the plan as `HardwareDecodeFormat`.
 
 The shim: stock jellyfin-ffmpeg failed `hwmap=derive_device=vulkan` from VA-API ("Conversion failed!"
 on the A380), and `0008`/`0009` exist only in the patched binary, so `pick_binary` routes a command
 carrying `vulkan=vk@va` and `derive_device=vulkan` to the patched binary
 (`scripts/test-shim-device.py`). That is a routing change beyond the setting itself.
 
-Byte-identical, by harness: with the setting off, or on without a detected Intel GPU (NVIDIA, no GPU,
-mixed auto), every command line, the probe JSON and the session JSON are what they were; the probe key
-`IntelHardwareDecode` and the record keys `HardwareDecode` and `HardwareDecodeReason` exist only
-while the setting is on.
+One source for the binary path: the plugin plans hardware decode only after seeing the patched binary
+(`ShaderLibrary.PatchedFfmpegPath`), the shim routes to its own `PATCHED_FFMPEG`, and
+`proxmox-build.sh` installs to `FFMPEG_PREFIX`; `scripts/test_shim_patched_path.py` fails when the three
+disagree. The shim cannot read the plugin's answer, so if the binary has gone between the plan and the
+launch it logs a warning naming the path and falls back to stock ffmpeg, which fails that session with
+"Conversion failed". Not written to `/etc/jellyfin-upscale.json`: that is a maintainer's call. Residual
+risk: a session with no PlaySessionId is decided afresh on every request.
+
+Identical, by harness: with the setting off, or on without a detected Intel GPU (NVIDIA, no GPU, mixed
+auto), every command line, the probe JSON and the session JSON equal those of the setting off, and
+`HardwareDecodeReason` is null. The probe key `IntelHardwareDecode` is served only while the setting is on
+and an Intel GPU is detected, and the record keys `HardwareDecode` and `HardwareDecodeReason` exist only
+then. (The decision itself still runs `Devices()`, which starts the DRM Vulkan test in the
+background the first time; that is existing behaviour, not byte-identical in cost.)
+
+`Devices()` never waits on the DRM Vulkan test any more (it runs in the background, PR 3's review, and a
+false or null result is re-tested after 5 minutes), so neither the decision nor `PrimeHardwareDecode`, which
+calls it on its own background task, blocks on it.
+NOT VERIFIED on an Arc: that the test-decode passes, that the gate's profiles are the ones the driver
+decodes, that `-hwaccel_device va` is accepted with `vk@va`, and that `nv12` is the format a real Arc downloads (the map is derived from the gated 4:2:0 source, not measured).
 
 ### 5.7 PR 8: a `GPU_VENDOR=intel` build, and the per-vendor required filters
 
@@ -727,6 +858,16 @@ and `WITH_ORT=1` first. `proxmox-build.sh` does not turn the NVIDIA-only switche
 checks the built binary's `-filters` against the vendor's set and restores `<binary>.prev` on a miss,
 as before.
 
+**Switching vendors, and libvpl-dev.** Both scripts install over `<prefix>/ffmpeg`, so `GPU_VENDOR=intel`
+over a binary whose `-filters` lists `optix` (an NVIDIA build) is refused, naming `ALLOW_VENDOR_SWITCH`,
+before `proxmox-build.sh` takes its `.prev` snapshot and before `build-ffmpeg.sh` does any work.
+`ALLOW_VENDOR_SWITCH=1` is the explicit override; a missing or unrunnable binary, an `nvidia` build and
+an Intel binary are not affected. The check is `ffmpeg_vendor_switch_guard` in `scripts/ffmpeg-vendor.sh`.
+The Intel preflight also asks `apt-cache policy libvpl-dev` for a candidate and stops with a message
+naming the package when there is none (it is skipped where `apt-cache` is absent), instead of failing
+in `apt-get` after the preflight. `BUILD` (the `mktemp -d` build tree) is created only after the plan
+exit, with its cleanup trap, so a refusal or a kill in the preflight leaks nothing.
+
 **`PLAN_ONLY=1`.** `GPU_VENDOR=intel PLAN_ONLY=1 scripts/build-ffmpeg.sh` runs the preflight, skips the
 root and disk checks, prints `plan:` lines (vendor, apt list, nv-codec-headers, patches, hwaccel flags,
 CUDA-LLVM flags, required filters, bridge-test default, and a `plan: fsr2:` line naming patch 0016,
@@ -748,16 +889,21 @@ them.
 `PLAN_ONLY=1` for both vendors (goldens including intel with `WITH_FSR2=1`, each refusal, nothing
 written to disk, the unknown vendor), the real `proxmox-build.sh` against a stub repo and a fake
 `ffmpeg` (a missing required filter restores `.prev` for each vendor, `fsr2` is required on Intel only
-with `WITH_FSR2=1`, an unknown vendor is refused before anything is touched), and static wiring checks
+with `WITH_FSR2=1`, an unknown vendor is refused before anything is touched; the vendor-switch guard
+over a fake binary that lists `optix` in both scripts; the `libvpl-dev` preflight against a stub
+`apt-cache`; a refusal with `BUILD` unset leaves `TMPDIR` empty), and static wiring checks
 (`bash -n`, the arrays are the ones the real run reads, the NVIDIA filter list appears in no build
-script). It also mutates copies of the scripts and requires the test to fail for each of its mutants.
+script, the `${arr[@]+"${arr[@]}"}` expansion of the possibly-empty configure arrays). It also mutates copies of the scripts and requires the test to fail for each of its mutants.
 It needs no root, GPU, network or ffmpeg build.
 
 **Not verified.** No ffmpeg has been built with `GPU_VENDOR=intel`: that libvpl and VA-API configure
 and link, that `-hwaccels` lists `vaapi` and `-encoders` lists `h264_qsv`, `hevc_qsv` and `av1_qsv`
 (the Intel verify step checks it), that 0006..0014 as skipped leave a tree the rest still patches
 (patch stacking was not run), that 0016 applies without 0006 to 0014, and 0008 and 0009 on a VA-API
-chain are all open until a build on an Intel server.
+chain are all open until a build on an Intel server. A served segment on an Arc with 0008 and 0009
+applied is NOT VERIFIED; the revenant Arc end-to-end run settles it. The `libvpl-dev` check has run only
+against a stub `apt-cache`, and the `${arr[@]+...}` expansion only as a text check (no bash older than
+4.4 was available).
 
 ### 5.8 The Intel image, and the 13-row end-to-end matrix
 

@@ -70,7 +70,8 @@ DEFAULTS = {
     # Unset keeps "-init_hw_device vulkan=vk:0", the first Vulkan device. On an Intel GPU, or a
     # server with more than one, name the render node (for example "/dev/dri/renderD129") and the
     # Vulkan device is derived from it. Nothing here detects a GPU or tests the node: set it only
-    # where you know it, and use an encoder that GPU can run ("hevc_qsv" on Intel).
+    # where you know it, and use an encoder that GPU can run ("hevc_qsv" on Intel). Hand-set only:
+    # the plugin's ShimBridge.Sync keeps a value found here but never writes it.
     "render_node": None,
     "min_scale_factor": 1.15,     # skip near-identity upscales
     # Below this ratio the fixed-2x network is skipped and the chain is plain scaling plus the
@@ -255,9 +256,13 @@ def pick_binary(cfg, args):
     """The ffmpeg to run for this command, and the argument list to run it with."""
     wanted = wants_patched(args)
     if not wanted:
-        if wants_va_vulkan_bridge(args) and os.access(PATCHED_FFMPEG, os.X_OK):
-            log(cfg, "routing to the patched ffmpeg build for this session (VA-API to Vulkan hwmap)")
-            return PATCHED_FFMPEG, substitute_missing_encoders(cfg, args)
+        if wants_va_vulkan_bridge(args):
+            if os.access(PATCHED_FFMPEG, os.X_OK):
+                log(cfg, "routing to the patched ffmpeg build for this session (VA-API to Vulkan hwmap)")
+                return PATCHED_FFMPEG, substitute_missing_encoders(cfg, args)
+            # The plugin planned hardware decode on seeing this binary; stock fails this chain.
+            log(cfg, "WARNING: VA-API to Vulkan hwmap needs %s, which is not executable; stock ffmpeg "
+                "will fail this session with Conversion failed" % PATCHED_FFMPEG)
         return REAL_FFMPEG, args
     if os.access(PATCHED_FFMPEG, os.X_OK):
         missing = [f for f in wanted if f not in patched_has(wanted)]

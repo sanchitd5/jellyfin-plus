@@ -32,7 +32,6 @@ namespace Jellyfin.Plugin.Plus
         private static DateTime _nvencAtUtc = DateTime.MinValue;
 
         private static readonly object IntelLock = new object();
-        private static readonly SemaphoreSlim IntelGate = new SemaphoreSlim(1, 1);
         private static IntelLoad _intelCached;
         private static DateTime _intelAtUtc = DateTime.MinValue;
         private static IntelSample _intelPrevious;
@@ -83,7 +82,7 @@ namespace Jellyfin.Plugin.Plus
             if (vendor == "intel")
             {
                 // No NVIDIA GPU to ask: nvencSessions is null, and nvidia-smi is not spawned.
-                IntelLoad intel = await IntelLoadAsync(renderNode).ConfigureAwait(false);
+                IntelLoad intel = IntelLoadNow(renderNode);
                 return new GpuLoad
                 {
                     ActiveTranscodes = active,
@@ -138,54 +137,70 @@ namespace Jellyfin.Plugin.Plus
             public double? IdlePercent { get; set; }
         }
 
-        private static bool TryIntelCached(out IntelLoad value)
+        // A figure older than this is not worth showing: it is reported as unavailable instead.
+        private static readonly TimeSpan IntelStaleAfter = TimeSpan.FromSeconds(60);
+
+        private static int _intelRefreshing;
+        private static Task _intelRefresh = Task.CompletedTask;
+
+        /// <summary>The refresh in flight, or the last one. The tests await it; nothing else reads it.</summary>
+        internal static Task IntelRefreshTask => _intelRefresh;
+
+        // The request thread never walks /proc and never sleeps between samples. It returns the last
+        // figure (null when there is none, or when it is older than IntelStaleAfter) and, once the
+        // 5 s cache has lapsed, starts ONE background refresh, so a poll costs one /proc walk per
+        // window however often it is asked and never waits for it.
+        private static IntelLoad IntelLoadNow(string renderNode)
         {
+            IntelLoad value;
+            DateTime at;
             lock (IntelLock)
             {
                 value = _intelCached;
-                return DateTime.UtcNow - _intelAtUtc < IntelCacheFor;
+                at = _intelAtUtc;
             }
+
+            TimeSpan age = DateTime.UtcNow - at;
+            if (age >= IntelCacheFor)
+            {
+                StartIntelRefresh(renderNode);
+            }
+
+            return age < IntelStaleAfter ? value : null;
         }
 
-        // Single-flight and cached for 5 s, like the NVENC count: a dashboard poll or a back-off
-        // check costs one /proc walk per window however often it is asked.
-        private static async Task<IntelLoad> IntelLoadAsync(string renderNode)
+        private static void StartIntelRefresh(string renderNode)
         {
-            if (TryIntelCached(out var cached))
+            if (Interlocked.CompareExchange(ref _intelRefreshing, 1, 0) != 0)
             {
-                return cached;
+                return;
             }
 
-            await IntelGate.WaitAsync().ConfigureAwait(false);
-            try
+            _intelRefresh = Task.Run(async () =>
             {
-                if (TryIntelCached(out cached))
-                {
-                    return cached;
-                }
-
-                IntelLoad result = null;
                 try
                 {
-                    result = await MeasureIntelAsync(renderNode).ConfigureAwait(false);
-                }
-                catch (Exception)
-                {
-                    // null: unavailable, never an error on a route that exists to be cheap
-                }
+                    IntelLoad result = null;
+                    try
+                    {
+                        result = await MeasureIntelAsync(renderNode).ConfigureAwait(false);
+                    }
+                    catch (Exception)
+                    {
+                        // null: unavailable, never an error on a route that exists to be cheap
+                    }
 
-                lock (IntelLock)
-                {
-                    _intelCached = result;
-                    _intelAtUtc = DateTime.UtcNow;
+                    lock (IntelLock)
+                    {
+                        _intelCached = result;
+                        _intelAtUtc = DateTime.UtcNow;
+                    }
                 }
-
-                return result;
-            }
-            finally
-            {
-                IntelGate.Release();
-            }
+                finally
+                {
+                    Interlocked.Exchange(ref _intelRefreshing, 0);
+                }
+            });
         }
 
         private static IntelSample TakeIntelSample(string renderNode)

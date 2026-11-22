@@ -56,7 +56,8 @@
 # An ONNX Runtime carries the CUDA provider or the OpenVINO one, so one binary is one or the other, and it
 # is refused beside WITH_OPTIX, WITH_DLSS and WITH_MAXINE_VSR. WITH_FSR2=1 (with FSR2_SDK and FSR2_LIB, no
 # NVOF_SDK) is allowed: it applies ffmpeg/0016 and compiles gu_inputs.h with -DGU_NO_NVOF, so fsr2 runs with
-# zero motion vectors and no CUDA, and the build leaves <prefix>/fsr2-nocuda for the plugin to find. With
+# zero motion vectors and no CUDA, and the build leaves <prefix>/fsr2-nocuda for the plugin to find (every
+# other build removes that file). With
 # GPU_VENDOR=nvidia FFmpeg's own nv-codec-headers (MIT, no SDK, no card: the driver is dlopen()ed), the
 # --enable-ffnvcodec/cuda/nvenc configure flags and patches 0006 to 0014 are still applied; GPU_VENDOR=intel
 # is the build without them. The Intel GPU plugin needs the host's OpenCL stack (ocl-icd-libopencl1,
@@ -108,11 +109,9 @@ set -euo pipefail
 FFMPEG_VER="${FFMPEG_VER:-8.1.2}"
 PREFIX="${PREFIX:-/usr/lib/jellyfin-ffmpeg-oidn}"
 PLAN_ONLY="${PLAN_ONLY:-0}"
-BUILD_GIVEN="${BUILD:-}"
-BUILD="${BUILD:-$(mktemp -d)}"
 
 # This script always extracts a fresh ffmpeg-8.1.2.tar.xz into a brand new mktemp -d, every
-# single run (see BUILD's default above and the tar xf below) - there is deliberately no
+# single run (see BUILD's default after the plan exit below and the tar xf below) - there is deliberately no
 # persistent build tree to reuse. Without CCACHE_BASEDIR, that alone defeats ccache almost
 # entirely: -I flags and -g3 debug info bake $BUILD's own random absolute path into every
 # compiler invocation's hash input, so byte-identical source compiled from two different
@@ -138,9 +137,7 @@ BUILD="${BUILD:-$(mktemp -d)}"
 # different-mktemp-root builds this script always produces. CCACHE_NOHASHDIR turns it off.
 # Retested with both set: 1 hit out of 2 on the same two-different-roots scenario - confirmed
 # fixed, not assumed. See livetestbox.md for the two failed attempts this was found through.
-export CCACHE_BASEDIR="$BUILD"
-export CCACHE_SLOPPINESS="include_file_mtime,include_file_ctime"
-export CCACHE_NOHASHDIR=1
+# The three exports sit after BUILD is created, below the plan exit.
 # nvidia (default) or intel; scripts/ffmpeg-vendor.sh holds the per-vendor required filters.
 source "$(dirname "${BASH_SOURCE[0]}")/ffmpeg-vendor.sh"
 GPU_VENDOR="${GPU_VENDOR:-nvidia}"
@@ -200,6 +197,14 @@ if [[ "$GPU_VENDOR" == "intel" ]]; then
     done
     [[ "${BRIDGE_TEST:-0}" != "1" ]] \
         || { echo "GPU_VENDOR=intel cannot run BRIDGE_TEST=1: the test crosses CUDA and Vulkan and an Intel build has no CUDA" >&2; exit 1; }
+    # This script installs over $PREFIX/ffmpeg: a mistyped GPU_VENDOR must not replace an NVIDIA binary.
+    ffmpeg_vendor_switch_guard "$GPU_VENDOR" "$PREFIX/ffmpeg" || exit 1
+    # libvpl-dev is missing on older bases; say so now rather than when apt-get fails further in.
+    if command -v apt-cache >/dev/null 2>&1; then
+        vpl_candidate="$(apt-cache policy libvpl-dev 2>/dev/null | sed -n 's/^ *Candidate: //p')"
+        [[ -n "$vpl_candidate" && "$vpl_candidate" != "(none)" ]] \
+            || { echo "GPU_VENDOR=intel needs libvpl-dev from apt (QSV), and apt-cache policy shows no candidate: enable the repository that ships it, or build on a newer base" >&2; exit 1; }
+    fi
 fi
 # RETIRED 2026-09-23: Maxine VFX `vsr` (vf_vsr.c, patch 0005). NvVFX_Load hangs and NVIDIA ships no
 # TensorRT models for it, so it never produced a frame; a stuck test process held the GPU for days.
@@ -261,6 +266,8 @@ VFXLIBS_DIR="${VFXLIBS_DIR:-/root/gameupscale/vfx/pywheel-libs}"
 # are checked against ORT_OPENVINO_API (the minor of the version, ORT_API_VERSION). The hashes are of
 # the wheel as pypi.org lists it and of the two headers inside Microsoft.ML.OnnxRuntime 1.24.1 on
 # nuget.org. Bump all of them together or the build refuses.
+# The soname staged in the lib loop below (libopenvino.so.2541) belongs to this wheel too: the wheel URL,
+# the sha256 and that soname change together.
 ORT_OPENVINO_VER="1.24.1"
 ORT_OPENVINO_API="24"
 ORT_OPENVINO_WHEEL="onnxruntime_openvino-1.24.1-cp312-cp312-manylinux_2_28_x86_64.whl"
@@ -505,9 +512,18 @@ if [[ "$PLAN_ONLY" == "1" ]]; then
     if [[ "$WITH_FSR2" == "1" && "$ORT_EP" == "openvino" ]]; then
         echo "plan: fsr2: no CUDA: patch ${FSR2_NOCUDA_PATCH%%-*}, cflag $FSR2_NOCUDA_CFLAG, marker $FSR2_NOCUDA_MARKER"
     fi
-    [[ -n "$BUILD_GIVEN" ]] || rmdir "$BUILD" 2>/dev/null || true
     exit 0
 fi
+
+# Created only now, so a refusal or a kill in the preflight above has no directory to leak; the trap
+# comes with it and covers everything below, apt included.
+BUILD="${BUILD:-$(mktemp -d)}"
+cleanup () { [[ "$KEEP_BUILD" == "1" ]] || rm -rf "$BUILD"; }
+trap cleanup EXIT
+# Why these three: the comment under the PLAN_ONLY default at the top of this file.
+export CCACHE_BASEDIR="$BUILD"
+export CCACHE_SLOPPINESS="include_file_mtime,include_file_ctime"
+export CCACHE_NOHASHDIR=1
 
 say "installing build dependencies"
 export DEBIAN_FRONTEND=noninteractive
@@ -517,9 +533,6 @@ apt-get install -y -qq --no-install-recommends "${APT_PKGS[@]}" >/dev/null
 # The distro shaderc, if some earlier run installed it, would still be found by pkg-config and
 # would win on include order. Remove it rather than hope /usr/local sorts first.
 apt-get remove -y -qq libshaderc-dev libshaderc1 >/dev/null 2>&1 || true
-
-cleanup () { [[ "$KEEP_BUILD" == "1" ]] || rm -rf "$BUILD"; }
-trap cleanup EXIT
 
 # mktemp -d already made its own directory; this is here for a caller-supplied BUILD.
 mkdir -p "$BUILD"
@@ -918,8 +931,9 @@ PKG_CONFIG_PATH="/usr/local/lib/x86_64-linux-gnu/pkgconfig:${PKG_CONFIG_PATH:-}"
     --enable-gpl --enable-version3 \
     --enable-vulkan --enable-libplacebo --enable-libshaderc --enable-libx264 \
     "${HWACCEL_FLAGS[@]}" \
-    "${CUDA_LLVM_FLAGS[@]}" \
-    "${OIDN_FLAGS[@]}" "${OPTIX_FLAGS[@]}" "${ORT_FLAGS[@]}" "${GAME_FLAGS[@]}" "${VSR_FLAGS[@]}" \
+    ${CUDA_LLVM_FLAGS[@]+"${CUDA_LLVM_FLAGS[@]}"} \
+    ${OIDN_FLAGS[@]+"${OIDN_FLAGS[@]}"} ${OPTIX_FLAGS[@]+"${OPTIX_FLAGS[@]}"} ${ORT_FLAGS[@]+"${ORT_FLAGS[@]}"} \
+    ${GAME_FLAGS[@]+"${GAME_FLAGS[@]}"} ${VSR_FLAGS[@]+"${VSR_FLAGS[@]}"} \
     --extra-libs="$EXTRA_LIBS"
 
 # By this point configure has already generated config.mak, config_components.h and
@@ -1008,7 +1022,9 @@ if [[ "$WITH_ORT" == "1" ]]; then
         && echo "  ort: present" || die "ort filter missing from the build"
 fi
 if [[ "$WITH_ORT" == "1" && "$ORT_EP" == "openvino" ]]; then
-    "$PREFIX/ffmpeg" -hide_banner -h filter=ort 2>/dev/null | grep -q "openvino" \
+    # Captured first: grep -q closing the pipe early would SIGPIPE ffmpeg, which fails under pipefail.
+    ort_help="$("$PREFIX/ffmpeg" -hide_banner -h filter=ort 2>/dev/null || true)"
+    grep -q "openvino" <<<"$ort_help" \
         && echo "  ort: device=openvino offered" || die "the ort filter in this build has no device=openvino"
     # What the plugin's OpenVinoAvailable looks for (GpuVendor.cs): the provider beside the core.
     [[ -f "$PREFIX/ort/lib/libonnxruntime_providers_openvino.so" ]] \
@@ -1017,17 +1033,17 @@ if [[ "$WITH_ORT" == "1" && "$ORT_EP" == "openvino" ]]; then
     echo "  note: whether the Intel GPU is used needs the host's OpenCL runtime (intel-opencl-icd); watch a real" \
          "encode at -v verbose for 'OpenVINO execution provider unavailable', the line that says it ran on the CPU"
 fi
+# What the plugin's NoCudaGameAvailable looks for (GpuVendor.cs): this binary's fsr2 runs without CUDA.
+# Removed by every build, then written only for the CUDA-free fsr2 one and only after its check, so a
+# CUDA build or a failed check never leaves one beside a binary it does not describe.
+rm -f "$FSR2_NOCUDA_MARKER"
 if [[ "$WITH_FSR2" == "1" ]]; then
     "$PREFIX/ffmpeg" -hide_banner -filters 2>/dev/null | grep -E "\bfsr2\b" \
         && echo "  fsr2: present" || die "fsr2 filter missing from the build"
     if [[ "$ORT_EP" == "openvino" ]]; then
-        # What the plugin's NoCudaGameAvailable looks for (GpuVendor.cs): this binary's fsr2 runs
-        # without CUDA. Written only after the check above, and removed by an OpenVINO build without it.
         : > "$FSR2_NOCUDA_MARKER"
         echo "  fsr2: built without CUDA (zero motion vectors), marked $FSR2_NOCUDA_MARKER"
     fi
-elif [[ "$ORT_EP" == "openvino" ]]; then
-    rm -f "$FSR2_NOCUDA_MARKER"
 fi
 if [[ "$WITH_DLSS" == "1" ]]; then
     "$PREFIX/ffmpeg" -hide_banner -filters 2>/dev/null | grep -E "\bdlss\b" \

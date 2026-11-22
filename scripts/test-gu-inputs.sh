@@ -15,10 +15,13 @@
 #      known shift. It is not a run of fsr2 and not a run on an Intel GPU.
 #   3. and 4. The same two for the DEFAULT variant (CUDA and NVOFA, the code an NVIDIA server runs),
 #      against stub ffnvcodec and Optical Flow headers written here and a fake CUDA: the CUDA call
-#      order, and that a CUDA failing at load, cuInit or the context push now degrades to zero flow
-#      instead of failing init. The stubs declare only what gu_inputs.h touches, so this does not prove
-#      the real SDK headers compile (build-ffmpeg.sh WITH_FSR2=1 on NVIDIA is that check), and the
-#      NVOFA calls themselves are not run (no library: the step is skipped if one is installed).
+#      order, and that a CUDA failing at load, cuInit, cuDeviceGet, the retain or the context push is
+#      still an error from init, with only what was taken released. The stubs declare only what
+#      gu_inputs.h touches, so this does not prove the real SDK headers compile (build-ffmpeg.sh
+#      WITH_FSR2=1 on NVIDIA is that check), and the NVOFA calls themselves are not run (no library:
+#      the step is skipped if one is installed).
+#   5. PATCHES. `git apply` of 0001, 0015 and 0016 in order to the pristine configure, Makefile and
+#      allfilters.c of the tarball, then scripts/test_patch_stack.py --tree on the same files.
 #
 # Builds libavutil from the FFmpeg tarball (about a minute) and needs gcc, make, xz and python3, with
 # network access to nuget.org (the ONNX Runtime header, checked against a pinned sha256; see
@@ -170,7 +173,29 @@ gcc "${DEFAULT_CFLAGS[@]}" -Wall -Wextra -Werror -Wno-missing-field-initializers
 echo "PASS  the default gu_inputs.h compiles clean against stub headers"
 
 echo
-echo "4. the default build against a fake CUDA: call order, and a failing CUDA degrades"
+echo "4. the default build against a fake CUDA: call order, and a failing CUDA is an error"
 gcc "$WORK/with_cuda.o" libavutil/libavutil.a -ldl -lm -lpthread -o "$WORK/with_cuda" \
     || { echo "FAIL  the test does not link"; exit 1; }
 "$WORK/with_cuda" || exit 1
+
+# The patches 0001, 0015 and 0016 touch three files; apply them in order to pristine copies of those.
+if command -v git >/dev/null; then
+    echo
+    echo "5. patches 0001, 0015 and 0016 apply in order to FFmpeg $FFMPEG_VER (git apply)"
+    mkdir -p "$WORK/stack-pristine/libavfilter"
+    for f in configure libavfilter/Makefile libavfilter/allfilters.c; do
+        cp "$SRC/$f" "$WORK/stack-pristine/$f" || exit 2
+    done
+    cp -r "$WORK/stack-pristine" "$WORK/stack" || exit 2
+    (
+        cd "$WORK/stack" || exit 2
+        for p in 0001-add-oidn-filter-to-build 0015-add-ort-filter-to-build-standalone \
+                 0016-add-fsr2-filter-to-build-standalone; do
+            git apply "$REPO/ffmpeg/$p.patch" || { echo "FAIL  $p.patch does not apply"; exit 1; }
+            echo "PASS  $p.patch applies"
+        done
+    ) || exit 1
+    python3 -I "$REPO/scripts/test_patch_stack.py" --tree "$WORK/stack-pristine" || exit 1
+else
+    echo "SKIP  git not found: the patch stack was not applied"
+fi

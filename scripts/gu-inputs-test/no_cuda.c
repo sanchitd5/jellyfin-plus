@@ -136,8 +136,8 @@ int main(void)
  * The stub CUDA loader (test-gu-inputs.sh writes its headers) hands gu_inputs.h function pointers
  * that record their own name. The Optical Flow library is never there, so the NVOFA step always
  * degrades and what is checked is the CUDA call order of the default build: the order an NVIDIA
- * server runs, and what a CUDA that fails at each step now does (carry on with zero flow, free what
- * was taken) instead of failing the filter.
+ * server runs, and that a CUDA that fails at any step is still an error from gu_inputs_init, with
+ * only what was taken released by gu_inputs_uninit.
  */
 
 static char calls[256];
@@ -160,7 +160,14 @@ static CUresult step(const char *name)
 
 static CUresult f_init(unsigned int flags)            { return step("cuInit"); }
 static CUresult f_get(CUdevice *d, int i)             { *d = i; return step("cuDeviceGet"); }
-static CUresult f_retain(CUcontext *c, CUdevice d)   { *c = (CUcontext)(size_t)1; return step("retain"); }
+static CUresult f_retain(CUcontext *c, CUdevice d)
+{
+    CUresult r = step("retain");
+
+    if (r == CUDA_SUCCESS)      /* a real driver leaves *c alone when it fails */
+        *c = (CUcontext)(size_t)1;
+    return r;
+}
 static CUresult f_release(CUdevice d)                 { return step("release"); }
 static CUresult f_push(CUcontext c)                   { return step("push"); }
 static CUresult f_pop(CUcontext *c)                   { return step("pop"); }
@@ -197,6 +204,7 @@ void fake_cuda_free_functions(CudaFunctions **f)
 
 static void scenario(const char *name, const char *fail, const char *want_init, const char *want_all)
 {
+    const int want_ok = !fail;
     static float plane[3][W * H];
     float *planes[3] = { plane[0], plane[1], plane[2] };
     AVFilterContext ctx = { 0 };
@@ -218,9 +226,18 @@ static void scenario(const char *name, const char *fail, const char *want_init, 
     g.react_mode  = GU_REACT_FLOW;
 
     ret = gu_inputs_init(&ctx, &g, W, H);
-    check(ret == 0, "gu_inputs_init succeeds");
+    check(want_ok ? ret == 0 : ret < 0,
+          want_ok ? "gu_inputs_init succeeds" : "gu_inputs_init returns an error");
     snprintf(msg, sizeof(msg), "init CUDA calls are %s (got %s)", want_init, calls);
     check(!strcmp(calls, want_init), msg);
+
+    if (!want_ok) {
+        gu_inputs_uninit(&g);
+        snprintf(msg, sizeof(msg), "all CUDA calls are %s (got %s)", want_all, calls);
+        check(!strcmp(calls, want_all), msg);
+        check(g.cu == NULL && g.cu_ctx == NULL, "the loader and the context are released");
+        return;
+    }
     check(g.nvof_ready == 0, "no NVOFA, so the flow stays off");
 
     fill(planes, 0);
@@ -254,14 +271,18 @@ int main(void)
         return 0;
     }
 
-    scenario("CUDA fails to load: init succeeds, zero flow, nothing to free", "load",
-             "load", "load");
     scenario("CUDA loads and starts: the call order an NVIDIA server runs", NULL,
              "load,cuInit,cuDeviceGet,retain,push,pop",
              "load,cuInit,cuDeviceGet,retain,push,pop,push,pop,release,free");
-    scenario("cuInit fails: carry on, free the loader, no context calls", "cuInit",
+    scenario("CUDA fails to load: init fails, nothing to free", "load",
+             "load", "load");
+    scenario("cuInit fails: init fails, free the loader, no context calls", "cuInit",
              "load,cuInit", "load,cuInit,free");
-    scenario("the context cannot be made current: carry on, release what was retained", "push",
+    scenario("cuDeviceGet fails: init fails, free the loader, no context calls", "cuDeviceGet",
+             "load,cuInit,cuDeviceGet", "load,cuInit,cuDeviceGet,free");
+    scenario("the retain fails (no context set): init fails, no push, pop or release", "retain",
+             "load,cuInit,cuDeviceGet,retain", "load,cuInit,cuDeviceGet,retain,free");
+    scenario("the context cannot be made current: init fails, release what was retained", "push",
              "load,cuInit,cuDeviceGet,retain,push",
              "load,cuInit,cuDeviceGet,retain,push,push,pop,release,free");
 

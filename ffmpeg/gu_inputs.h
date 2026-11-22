@@ -74,8 +74,8 @@
 /* GU_NO_NVOF (set by build-ffmpeg.sh for the OpenVINO build): compile no CUDA and no NVOFA
  * at all, so the build needs neither nv-codec-headers nor the Optical Flow SDK.  Motion vectors
  * and the reactive mask are then zero, as they already are on an NVIDIA machine without NVOFA.
- * Unset (every other build), the code below is the NVIDIA path, and a CUDA that will not start
- * degrades to the same zero flow instead of failing the filter. */
+ * Unset (every other build), the code below is the NVIDIA path: a CUDA that will not start is an
+ * error, and only a failed NVOFA init degrades to zero flow. */
 #ifndef GU_NO_NVOF
 #include <ffnvcodec/dynlink_loader.h>
 
@@ -171,23 +171,6 @@ typedef struct GUInputs {
         }                                                                        \
     } while (0)
 
-/* Load libcuda and make the primary context current.  On failure g->cu may be left set (or
- * NULL) and g->cu_ctx may be set; gu_inputs_uninit releases whichever is, so the caller only
- * has to carry on without CUDA. */
-static int gu_cuda_open(AVFilterContext *ctx, GUInputs *g)
-{
-    int ret;
-
-    if ((ret = cuda_load_functions(&g->cu, ctx)) < 0) {
-        g->cu = NULL;
-        return ret;
-    }
-    GU_CHECK_CU(ctx, g->cu->cuInit(0));
-    GU_CHECK_CU(ctx, g->cu->cuDeviceGet(&g->cu_device, g->device_index));
-    GU_CHECK_CU(ctx, g->cu->cuDevicePrimaryCtxRetain(&g->cu_ctx, g->cu_device));
-    GU_CHECK_CU(ctx, g->cu->cuCtxPushCurrent(g->cu_ctx));
-    return 0;
-}
 #endif
 
 /* --------------------------------------------------------------- Hanning -- */
@@ -871,9 +854,6 @@ static int gu_inputs_init(AVFilterContext *ctx, GUInputs *g, int w, int h)
 {
     size_t npix;
     int ret;
-#ifndef GU_NO_NVOF
-    int cuda_on;
-#endif
 
     g->w = w; g->h = h;
     npix = (size_t)w * h;
@@ -893,12 +873,16 @@ static int gu_inputs_init(AVFilterContext *ctx, GUInputs *g, int w, int h)
            "built without NVOFA: motion vectors will be ZERO, which tells the upscaler "
            "nothing moved\n");
 #else
-    cuda_on = gu_cuda_open(ctx, g) >= 0;
-    if (!cuda_on) {
-        av_log(ctx, AV_LOG_WARNING,
-               "no usable CUDA: motion vectors will be ZERO, which tells the upscaler "
-               "nothing moved\n");
-    } else if (gu_nvof_init(ctx, g) < 0) {
+    if ((ret = cuda_load_functions(&g->cu, ctx)) < 0) {
+        av_log(ctx, AV_LOG_ERROR, "cannot load libcuda\n");
+        return ret;
+    }
+    GU_CHECK_CU(ctx, g->cu->cuInit(0));
+    GU_CHECK_CU(ctx, g->cu->cuDeviceGet(&g->cu_device, g->device_index));
+    GU_CHECK_CU(ctx, g->cu->cuDevicePrimaryCtxRetain(&g->cu_ctx, g->cu_device));
+    GU_CHECK_CU(ctx, g->cu->cuCtxPushCurrent(g->cu_ctx));
+
+    if (gu_nvof_init(ctx, g) < 0) {
         av_log(ctx, AV_LOG_WARNING,
                "no hardware optical flow: motion vectors will be ZERO, which tells "
                "the upscaler nothing moved\n");
@@ -908,8 +892,7 @@ static int gu_inputs_init(AVFilterContext *ctx, GUInputs *g, int w, int h)
 
     if ((ret = gu_pc_init(ctx, g)) < 0) {
 #ifndef GU_NO_NVOF
-        if (cuda_on)
-            g->cu->cuCtxPopCurrent(&g->cu_ctx);
+        g->cu->cuCtxPopCurrent(&g->cu_ctx);
 #endif
         return ret;
     }
@@ -920,8 +903,7 @@ static int gu_inputs_init(AVFilterContext *ctx, GUInputs *g, int w, int h)
     }
 
 #ifndef GU_NO_NVOF
-    if (cuda_on)
-        GU_CHECK_CU(ctx, g->cu->cuCtxPopCurrent(&g->cu_ctx));
+    GU_CHECK_CU(ctx, g->cu->cuCtxPopCurrent(&g->cu_ctx));
 #endif
 
     g->have_previous = 0;
