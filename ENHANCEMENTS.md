@@ -147,12 +147,17 @@ capability record: `Vendor` (`nvidia`, `intel`, `none`), `Setting`, `Detected`, 
 `CudaOnlyLevelsAvailable`, `OpenVinoAvailable`, `Reason`, `Devices`. Detection reads
 `/sys/class/drm/renderD*/device/vendor` (`0x10de` NVIDIA, `0x8086` Intel) for every render node that
 has a `/dev/dri` entry; `/proc/driver/nvidia`, then `nvidia-smi -L` (only if nothing else answered),
-find an NVIDIA GPU that has no render node. The machine is asked once per process. `GpuVendor`
+find an NVIDIA GPU that has no render node. The machine is asked by a background probe started when
+the patches are applied (`CachedProbe<T>`, `src/patcher/CachedProbe.cs`: the transcode path only reads
+the cached answer and never spawns `nvidia-smi`); an answer that found no supported GPU is retried
+every 60 s, one that found one is kept. `GpuVendor`
 `auto` picks NVIDIA first when it is present, so an existing install is unchanged; `nvidia`, `intel`
 and `none` override detection, and a vendor chosen but not found reports `Detected` false and no
-capability. It is reported in `Levels.Gpu` on the probe, `Gpu` on `GET /JellyfinPlus/Status` (and the
-dashboard's status line), and `Gpu` on each `SessionRecord` (so `Record.Gpu`, and flat `Gpu`, on
-`GET /JellyfinPlus/Session/{id}`).
+capability. The full record is on `Gpu` of `GET /JellyfinPlus/Status` (administrator only; the
+dashboard's status line). Every other route, which any authenticated user reaches, carries only the
+summary (`Vendor`, `Detected`, `EncoderFamily`, `CudaOnlyLevelsAvailable`, `OpenVinoAvailable`):
+`Levels.Gpu` on the probe, and `Gpu` on each `SessionRecord` (so `Record.Gpu`, and flat `Gpu`, on
+`GET /JellyfinPlus/Session/{id}`), with no render-node path, PCI id, setting or reason.
 
 Four things read it to decide, and only when `Vendor` is `intel` **and** `Detected` is true
 (`UpscaleEngine.IsIntelPath`), so every other server, an Intel setting with no Intel GPU included,
@@ -166,9 +171,18 @@ keeps the code path that existed before the setting did:
   lists no `*_qsv` encoder the choice is `libx264` / `libx265` / `libsvtav1`, and the record's
   `EncoderFamily` reads `software`. When Jellyfin already chose a QSV or software encoder (its own
   hardware acceleration is QSV) and the setting is auto or NVENC, Jellyfin's choice is kept; one that
-  cannot take the chain (`*_vaapi`, `*_nvenc`) is replaced. `GuardAv1` test-encodes one frame with
-  `av1_qsv` (once, remembered) and swaps to `hevc_qsv`, or `h264_qsv` when the client cannot take
-  HEVC, if it fails.
+  cannot take the chain (`*_vaapi`, `*_nvenc`) is replaced. With neither a `*_qsv` nor a software
+  encoder listed the engine picks nothing and Jellyfin's own encoder stands (the reason says so).
+  `GuardAv1` reads the result of a one-frame `av1_qsv` test encode that runs in the background
+  (started at plugin start-up, on the detected render node, never on the transcode path); a failure
+  swaps to `hevc_qsv`, or `h264_qsv` when the client cannot take HEVC. The answer is cached for 1 h
+  when usable, 5 min when it failed and 1 min when inconclusive. Until the first answer exists the
+  guard swaps as if the test had failed (the reason says it has not finished), so an Arc-less GPU never
+  gets an `av1_qsv` it cannot open; an inconclusive answer leaves `av1_qsv` alone. The encoder list is
+  read at start-up too, so the capability record and `Gpu/Load` never
+  spawn ffmpeg, and report the unresolved `qsv` family until it is read. An optional
+  `TranscodeManager.StartFfMpeg` prefix removes VA-API-only options (`-init_hw_device vaapi`,
+  `-filter_hw_device`, `-hwaccel vaapi`, `-rc_mode`, `-sei`) from a swapped session's command line.
 - **The end of the chain.** The GPU-resident encode (`hwmap=derive_device=cuda`) is a Vulkan-to-CUDA
   map and exists only for NVENC, so on Intel `BuildChain` always ends in `hwdownload,format=yuv420p`
   whatever `GpuResidentEncode` says (the encoder's `nv12` is reached by the conversion ffmpeg
@@ -1647,9 +1661,9 @@ All under the Jellyfin API root. "Administrator" is the `RequiresElevation` poli
 
 | Method and path | Auth | Purpose |
 |---|---|---|
-| `GET /JellyfinPlus/Status` | Administrator | Patch status (`PatchActive`, `PatchStatus`), the GPU capability record (`Gpu`), shim sync result and recent sessions. Used by the dashboard page. |
-| `GET /JellyfinPlus/Gpu/Load` | Any authenticated user, API key included | A cheap load snapshot so background encoders can back off: `activeTranscodes`, `activeVideoTranscodes`, `enhancedSessions` (null), `nvencSessions` (NVENC sessions from `nvidia-smi`; null when there is no NVIDIA GPU or no `nvidia-smi`), and, additive: `vendor` (`nvidia`, `intel`, `none`), `encoderSessions` (NVIDIA: the NVENC count; Intel: clients whose video-engine time moved in the window, which is encode on this plugin's chain and would also count a client decoding in hardware), `gpuBusyPercent` (Intel: the busiest engine class, 0-100, from DRM fdinfo of this server's own processes only; null on NVIDIA and when unreadable), `gpuIdlePercent` (Intel: the least-idle GT's share of the window asleep, from sysfs RC6/GT-idle residency, which covers every process; "idle" is not the inverse of busy), `loadSource`. Cached 5 s and single-flight; never needs `intel_gpu_top` or perf. GPU_VENDORS.md 5.2 |
-| `GET /JellyfinPlus/Session/{playSessionId}` | Any authenticated user | What the server actually did for one play session. The id `probe` returns the capability lists with no session (used by the client probe; the lists include `Levels.Gpu`, the GPU capability record, and on a detected Intel GPU `Levels.Withheld`, the NVIDIA-only levels left out of the lists); `dashboard` is used by the config page. A session recorded for a different user is reported as unknown. If either side has no user id (for example an API key), it answers as before the check existed. |
+| `GET /JellyfinPlus/Status` | Administrator | Patch status (`PatchActive`, `PatchStatus`), the full GPU capability record (`Gpu`, with devices and reason; the Intel encoder family resolved against ffmpeg), shim sync result and recent sessions. Used by the dashboard page. |
+| `GET /JellyfinPlus/Gpu/Load` | Any authenticated user, API key included | A cheap load snapshot so background encoders can back off: `activeTranscodes`, `activeVideoTranscodes`, `enhancedSessions` (null), `nvencSessions` (NVENC sessions from `nvidia-smi`; null when there is no NVIDIA GPU or no `nvidia-smi`), and, additive: `vendor` (`nvidia`, `intel`, `none`), `encoderSessions` (NVIDIA: the NVENC count; Intel: clients whose video-engine time moved in the window, which is encode on this plugin's chain and would also count a client decoding in hardware), `gpuBusyPercent` (Intel: the busiest engine class, 0-100, from DRM fdinfo of this server's own processes only; null on NVIDIA, when unreadable, and when any class could not be measured, since that class may be the busiest), `gpuIdlePercent` (Intel: the least-idle GT's share of the window asleep, from sysfs RC6/GT-idle residency, which covers every process; "idle" is not the inverse of busy), `loadSource`. Cached 5 s and single-flight; never needs `intel_gpu_top` or perf. GPU_VENDORS.md 5.2 |
+| `GET /JellyfinPlus/Session/{playSessionId}` | Any authenticated user | What the server actually did for one play session. The id `probe` returns the capability lists with no session (used by the client probe; the lists include `Levels.Gpu`, the non-sensitive GPU summary, and on a detected Intel GPU `Levels.Withheld`, the NVIDIA-only levels left out of the lists); `dashboard` is used by the config page. A session recorded for a different user is reported as unknown. If either side has no user id (for example an API key), it answers as before the check existed. |
 | `GET /JellyfinPlus/FilterCache/Status` | Administrator | Per-library, per-kind cache state: built time, key counts, dirty flag, run state, last error, and outcome counters. |
 | `POST /JellyfinPlus/FilterCache/Rebuild?force=true` | Administrator | Starts a background rebuild and returns 202 with the status JSON. `force` (default true) rebuilds every library, not only stale ones. 409 when a rebuild is running or the cache is not ready. |
 | `GET /JellyfinPlus/Tags/Categories[?parentId=..&userId=..]` | Any authenticated user (another user's `userId`: administrators only) | Smart tag categories over the user's visible items (section 3): `[{id, label, kind, prefix?, primary, coverage, tags: [{name, label, count}]}]`. 404 for a parent the user cannot see. Cached per user, access digest and parent; kept warm in the background (section 3). |

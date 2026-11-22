@@ -128,12 +128,34 @@ operator has actually installed the provider.
 
 ### 3.5 Where it is reported
 
-- **Probe** (`PatcherHost.Levels()`, served as `Levels.Gpu` by `GET /JellyfinPlus/Session/probe`).
+Only the **Status** route is administrator-only. `GET /JellyfinPlus/Session/{id}` is open to any
+authenticated user (it answers for the caller's own session), so everything it serves carries the
+summary alone: `Vendor`, `Detected`, `EncoderFamily`, `CudaOnlyLevelsAvailable`, `OpenVinoAvailable`
+(`GpuSummary`). `Devices`, `RenderNode`, `Reason`, `Setting` and `DecodeType` are never served there
+(AGENTS.md invariant 13).
+
+- **Probe** (`PatcherHost.Levels()`, served as `Levels.Gpu` by `GET /JellyfinPlus/Session/probe`): summary.
   The probe is what the client builds its menu from, so this is where later PRs will filter levels.
-- **Status** (`GET /JellyfinPlus/Status`, `Gpu`), and the dashboard's status line.
+- **Status** (`GET /JellyfinPlus/Status`, `Gpu`), and the dashboard's status line: the full record.
 - **SessionRecord** (`Gpu`), written when the session's command is built, so Recent sessions and
   `GET /JellyfinPlus/Session/{id}` (`Record.Gpu`, and flat `Gpu`) say what the server looked like for
-  that session.
+  that session: summary, one immutable instance shared by every record built under the same detection.
+
+### 3.5.1 The shared probe helper
+
+`CachedProbe<T>` (`src/patcher/CachedProbe.cs`) is how the patcher asks the machine something slow
+from a path that must not wait for it. PRs 2, 3 and 7 reuse it rather than probing under a lock:
+
+- `Start()` runs the probe on the thread pool at plug-in start-up (`PatcherHost.Apply`); `Peek()` is
+  all the transcode path calls, takes a lock for a few field reads and never runs the probe.
+- A conclusive answer (the `conclusive` predicate) is kept for the life of the process. A null,
+  throwing or inconclusive one stands only for `retryAfter` (60 s for GPU detection); the next `Peek()`
+  after that schedules a new probe and returns the last answer meanwhile. This is the fix for
+  `nvidia-smi` failing while the driver loads at boot and pinning the box to `none` until restart.
+- Before the first answer lands the record says so ("GPU detection has not finished; reported as
+  none") rather than guessing.
+- `Reset()` discards the answer and any probe in flight. Tests pass a fake clock and a queue as the
+  scheduler (`scripts/gpu-vendor-harness`).
 
 ### 3.6 Tests
 
@@ -152,7 +174,13 @@ running Jellyfin. It checks:
   `HwaccelArgs` (both forms), `BuildChain` (plain, deband with download, CUDA-native, CUDA-native
   bridged through libplacebo) and `EncoderFor` return the exact strings they returned before the
   setting existed. The expected strings are written out by hand from the code, not computed;
-- that the probe, the status route and `SessionRecord` carry the record.
+- **access:** the probe and a recorded session (what any authenticated user can fetch) carry the five
+  summary fields and none of `Devices`, `RenderNode`, `Reason`, `Setting`, nor a device path or PCI
+  id anywhere in the body; the status route keeps the full record;
+- `CachedProbe<T>` with a fake clock: the probe never runs on the caller, a negative answer is retried
+  after the window and replaced, a conclusive one is never re-asked, a throw is no answer, and a
+  probe in flight across `Reset()` is discarded;
+- `GpuVendor=none` with an NVIDIA card present says the setting overrode detection.
 
 PR 2 extends the same harness (it now compiles the DRM fdinfo reader and the load controller as
 well). The NVIDIA strings above are asserted on a machine with no GPU, an NVIDIA one and a mixed one,
@@ -261,9 +289,36 @@ of Jellyfin's is kept; one that cannot take this chain (`*_vaapi`, `*_nvenc`) is
 reason.
 
 **`GuardAv1`.** `av1_qsv` is listed by any build that compiles it, but only Arc and newer can open
-it, so on Intel one frame is test-encoded with `av1_qsv` (once, remembered) and a failure swaps to
-`hevc_qsv`, or `h264_qsv` when the client cannot take HEVC. An inconclusive probe (no ffmpeg, a
-timeout) leaves the choice alone, as the NVIDIA guard does.
+it, so on Intel one frame is test-encoded with `av1_qsv` and a failure swaps to `hevc_qsv`, or
+`h264_qsv` when the client cannot take HEVC. The test encode runs in the background, started at
+plugin start-up (and again when its answer lapses), opens the QSV device on the detected render node
+(`-init_hw_device vaapi=va:<node> -init_hw_device qsv=qs@va`, the form Jellyfin's own QSV lines use;
+not run against hardware) and is single-flight; the transcode path only reads its cached answer. A
+usable answer is kept 1 h, a failure 5 min and an inconclusive try (no ffmpeg, a timeout) 1 min, so a
+busy GPU or a timeout does not pin the choice. Until the first answer exists the guard swaps to
+`hevc_qsv` (or `h264_qsv`) as if the test had failed, and the reason says it has not finished: the
+old guard ran the test inline, so a first AV1 session on a GPU without an AV1 encoder never reached
+`av1_qsv`, and the swap-while-pending keeps that. The cost is that a first AV1 session on an Arc card in
+the seconds after start-up gets HEVC; the next one gets AV1. An inconclusive answer (no ffmpeg, a
+timeout) leaves `av1_qsv` alone, as the NVIDIA guard does.
+
+**No encoder.** With neither a `*_qsv` nor a software encoder in ffmpeg's list, `ChooseEncoder`
+returns nothing and Jellyfin's own choice stands; it no longer names a `*_qsv` encoder that would fail
+to open. For a stream copy that is the copy.
+
+**VA-API arguments.** Jellyfin's VA-API-specific options are keyed on the encoder name or emitted
+inside the methods this plugin already hooks (a read of `EncodingHelper` on release-10.11.z; about
+50 KB of it, including an HLS caller, was not read). As a second line, an optional prefix on
+`TranscodeManager.StartFfMpeg` removes `-init_hw_device vaapi=...`, the `-filter_hw_device` and
+`-hwaccel_device` that name it, `-hwaccel vaapi`, `-hwaccel_output_format vaapi`, `-rc_mode` and `-sei`
+from the command line of a session on the Intel path whose encoder is QSV or software. A line that
+still names a VA-API encoder, or opens a QSV device itself, is left whole. If a parameter name of
+`StartFfMpeg` differs Harmony throws at patch time and the patch is reported as failed, which leaves
+command lines as they were. The harness checks the prefix against the real `StartFfMpeg` in the
+server's assembly (`state` and `commandLineArguments` exist, with the right types), runs
+`PatcherHost.Apply` and asserts the prefix is installed. The command-line fixture is reconstructed
+from Jellyfin's source, not captured from a session, and a served segment on a real Arc is not
+verified.
 
 **Not done here, done in PR 3 (section 5.3).** The Vulkan device was still `vk:0`, and the CUDA-only
 levels were not withheld from the probe on Intel; PR 3 starts the Vulkan device from the render node and
@@ -291,7 +346,13 @@ mapped to render, copy, video, video-enhance and compute so the maths is one cod
 
 Busy percentage is the change between two samples: i915 divides the summed busy nanoseconds of a
 class by `elapsed x capacity`; xe divides the summed busy cycles by the change in
-`drm-total-cycles`. `gpuBusyPercent` is the busiest class (clamped to 0-100). `encoderSessions` is
+`drm-total-cycles`. `gpuBusyPercent` is the busiest class (clamped to 0-100). An i915 class that
+prints no capacity line is taken as one engine; when its figure is then over 110% it is a multi-engine
+class that cannot be normalised and is left out of the per-class figures instead of being reported
+as 100. A class left out (that, or an xe class with no elapsed cycles) may be the busiest one, so
+`gpuBusyPercent` is then null, not the busiest of the others: a real i915 file lists every engine
+class, and reading the idle ones as the answer would show a busy encode as 0%. A two-engine class at or under 100% of one engine with no capacity line is
+indistinguishable from a one-engine class and is reported as measured. `encoderSessions` is
 the number of distinct clients whose video-engine time moved in the window, which on this plugin's
 chain (software decode) is encode; a hardware-decoding client would count too, and the doc says so.
 Only clients present in both samples are counted, so an encode that starts and ends inside one window
@@ -303,9 +364,11 @@ the GPU is invisible; so a second figure that is not about processes is added wh
 without any privilege: `gpuIdlePercent`, the least-idle GT's share of the window spent in RC6
 (`gt/gt*/rc6_residency_ms` for i915, `tile*/gt*/gtidle/idle_residency_ms` for xe). RC6 idle is
 "the GT slept", not "the engines were busy", so it is reported beside the busy figure, not folded
-into it. `intel_gpu_top` and perf are never required. Sampling is two reads (the first call waits
-300 ms between them, later calls reuse the previous sample when it is 0.5 to 30 s old), the result is
-cached for 5 s and single-flighted, as the NVENC count is, and a failure is null, never an error.
+into it. `intel_gpu_top` and perf are never required. Sampling is two reads (the first waits 300 ms
+between them, later ones reuse the previous sample when it is 0.5 to 30 s old). The request thread
+never does it: the route returns the cached figure (null when there is none or it is over 60 s old)
+and, once the 5 s cache has lapsed, starts one background refresh, so the first poll after a quiet
+spell reports null and the next one has a figure. A failure is null, never an error.
 
 ### 5.3 PR 3: the Vulkan device from the render node, and the NVIDIA-only levels on Intel
 
