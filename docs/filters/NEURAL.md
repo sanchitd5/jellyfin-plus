@@ -139,8 +139,9 @@ this repository, and no new model is introduced.
 
 `device=openvino` asks ONNX Runtime for its OpenVINO provider on the GPU. The engine asks for it on a
 detected Intel server when `libonnxruntime_providers_openvino.so` sits in `ort/lib` (the capability
-record's `OpenVinoAvailable`), and asks for `device=cpu`, with the reason in the session record, when
-it does not. Every other server's node has no `device` option and so runs CUDA, as before. The record's
+record's `OpenVinoAvailable`) and the patched ffmpeg's `-h filter=ort` lists `openvino` (checked once in
+the background, so a binary built before the device existed is not sent an option it rejects), and asks
+for `device=cpu`, with the reason in the session record, when either is missing. Every other server's node has no `device` option and so runs CUDA, as before. The record's
 `NeuralDevice` is what was asked for; whether ONNX Runtime loaded the provider is only in ffmpeg's log
 (`OpenVINO execution provider unavailable ...` or `OpenVINO session could not be created ...`, then
 `using CPU`). Checked against the real ONNX Runtime 1.24.1 OpenVINO provider on a machine with no GPU:

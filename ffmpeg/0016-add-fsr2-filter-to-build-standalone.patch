@@ -17,7 +17,7 @@ is NVIDIA's. Use this or 0004, never both.
      libplacebo
      libpulse
      libqrencode
-@@ -4155,6 +4155,7 @@
+@@ -4155,6 +4156,7 @@
  libplacebo_filter_deps="libplacebo vulkan"
  oidn_filter_deps="libopenimagedenoise"
  ort_filter_deps="libonnxruntime"
@@ -25,7 +25,7 @@ is NVIDIA's. Use this or 0004, never both.
  lv2_filter_deps="lv2"
  mcdeint_filter_deps="avcodec gpl"
  metadata_filter_deps="avformat"
-@@ -7361,6 +7361,11 @@
+@@ -7361,6 +7363,11 @@
  }
  enabled libopenimagedenoise && require libopenimagedenoise OpenImageDenoise/oidn.h oidnNewDevice -lOpenImageDenoise
  enabled libonnxruntime    && require libonnxruntime onnxruntime_c_api.h OrtGetApiBase -lonnxruntime
