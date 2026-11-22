@@ -319,7 +319,7 @@
                         <div class="inputContainer">
                             <input is="emby-input" type="number" id="NeuralMaxSourceHeight" data-config="NeuralMaxSourceHeight" data-kind="int" data-default="0" label="Neural only for sources up to (px, 0 = off)" min="0" max="4320" required />
                             <div class="fieldDescription">
-                            Use the Real-ESRGAN levels only for small sources. 0, the default, changes nothing. Above 0, a source at or below this height gets the neural level: the session's, or the default above, or, when neither names one, the cheapest installed weight (on an Intel server only when the OpenVINO provider is installed, never on the CPU by choice). A source taller than this does not run a neural level and takes the shader path instead, and Recent sessions says so. Applies to the Real-ESRGAN levels, not to the RTX ones. 480 is the recommended value on an Intel GPU, and it is not measured: at 480p only the x2 weight can be near real time even on the NVIDIA card these were timed on, and nothing has been timed on an Intel GPU (docs/architecture/GPU_VENDORS.md, 5.4). Start with realesr-anime-x2 as the default above, and watch the GPU before raising it.
+                            Use the Real-ESRGAN levels only for small sources. 0, the default, changes nothing. Above 0, a source at or below this height gets the neural level: the session's, or the default above, or, when neither names one, the cheapest installed weight (on an Intel server only when the OpenVINO provider is installed and the patched ffmpeg's ort filter lists the openvino device, never on the CPU by choice). A source taller than this does not run a neural level and takes the shader path instead, and Recent sessions says so. Applies to the Real-ESRGAN levels, not to the RTX ones, and on every GPU vendor, NVIDIA included. When the server picks the level itself, Recent sessions still shows the requested level as off although a network ran; the routing note on that session says why. 480 is the recommended value on an Intel GPU, and it is not measured: at 480p only the x2 weight can be near real time even on the NVIDIA card these were timed on, and nothing has been timed on an Intel GPU (docs/architecture/GPU_VENDORS.md, 5.4). Start with realesr-anime-x2 as the default above, and watch the GPU before raising it.
                         </div>
                         </div>
 
@@ -826,15 +826,19 @@
                 return ' GPU: ' + found + node + ' (' + g.Reason + ').';
             }
 
-            // The levels this server's GPU cannot run, as the server reports them: only an Intel
-            // server sends any, and then every one needs NVIDIA. Nothing is said otherwise.
+            // The levels this server's GPU does not offer, as the server reports them (axis -> level
+            // -> the server's own reason: needs NVIDIA, or for fsr2 on a build made for Intel, a
+            // start-up check that has not passed): only an Intel server sends any. Nothing is said
+            // otherwise, and no reason is written here.
             function withheldText(w) {
                 if (!w) { return ''; }
-                var names = [];
+                var items = [];
                 Object.keys(w).forEach(function (axis) {
-                    Object.keys(w[axis] || {}).forEach(function (level) { names.push(level); });
+                    Object.keys(w[axis] || {}).forEach(function (level) {
+                        items.push(axis + ' ' + level + ' (' + w[axis][level] + ')');
+                    });
                 });
-                return names.length ? ' Not offered on this GPU (needs NVIDIA): ' + names.join(', ') + '.' : '';
+                return items.length ? ' Not offered on this GPU: ' + items.join(', ') + '.' : '';
             }
 
             function loadStatus(page) {

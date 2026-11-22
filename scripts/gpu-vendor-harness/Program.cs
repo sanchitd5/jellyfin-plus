@@ -79,6 +79,8 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
 
         private static int Main()
         {
+            // The render-node test runs on the calling thread, so every Devices() call below sees its answer.
+            UpscaleEngine.DrmVulkanInline = true;
             PciIds();
             Settings();
             Decision();
@@ -87,16 +89,27 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
             IntelEncoder();
             IntelChain();
             IntelDevices();
+            DrmProbeCache();
             TwoGpuMachines();
             NvidiaOnlyLevels();
             NoCudaGame();
             NeuralDevice();
             NeuralRouting();
+            AutoNeuralCache();
             IntelHardwareDecode();
             Fdinfo();
             IdleResidency();
             LoadRoute();
             CapabilityJson();
+            VaapiStrip();
+            StripPrefix();
+            NullEncoderBranches();
+            IntelProbes();
+            Access();
+            CachedProbes();
+
+            // Last: it runs the real PatcherHost.Apply, which installs the Harmony patches for the rest of the process.
+            PatchWiring();
 
             if (_rig != null)
             {
@@ -515,7 +528,7 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
         {
             GpuDetector.UseEnvironment(Machine("renderD128", "0x8086"));
             UpscaleEngine.EncoderListSource = () => Encoders(list);
-            UpscaleEngine.Av1QsvProbeSource = () => true;
+            UpscaleEngine.Av1QsvProbeSource = _ => true;
             UpscaleEngine.DrmVulkanProbeSource = n => true;
             UpscaleEngine.Settings = new UpscaleSettings { Encoder = encoder, GpuVendor = setting };
         }
@@ -547,16 +560,27 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
 
             // AV1 without an AV1 encoder in the GPU: the test encode fails and the choice swaps.
             OnIntel("auto", "auto", FullList);
-            UpscaleEngine.Av1QsvProbeSource = () => false;
+            UpscaleEngine.Av1QsvProbeSource = _ => false;
             Equal("av1_qsv fails its test encode, client takes hevc: hevc_qsv", "hevc_qsv", UpscaleEngine.EncoderFor(Job("av1", "av1", "hevc"), out reason));
             Equal("av1_qsv swap: the reason", "a test encode with av1_qsv failed on this GPU, used hevc_qsv instead of av1_qsv; Encoder set to auto; following the client-negotiated av1 (av1_qsv)", reason);
             Equal("av1_qsv fails its test encode, client takes only h264: h264_qsv", "h264_qsv", UpscaleEngine.EncoderFor(Job("av1", "av1", "h264"), out reason));
-            UpscaleEngine.Av1QsvProbeSource = () => null;
+            UpscaleEngine.Av1QsvProbeSource = _ => null;
             Equal("an inconclusive AV1 test leaves av1_qsv alone", "av1_qsv", UpscaleEngine.EncoderFor(Job("av1", "av1", "hevc"), out reason));
             Equal("GuardAv1 on Intel leaves other encoders alone", "hevc_qsv", UpscaleEngine.GuardAv1(null, "hevc_qsv", out reason));
             Check("GuardAv1 on Intel: nothing swapped, no reason", reason == null);
-            UpscaleEngine.Av1QsvProbeSource = () => false;
+            UpscaleEngine.Av1QsvProbeSource = _ => false;
             Equal("GuardAv1 on Intel swaps a test-encode failure", "hevc_qsv", UpscaleEngine.GuardAv1(null, "av1_qsv", out reason));
+
+            // The plan's DeviceInit is the one the test encode runs on; GuardAv1Intel must not resolve its own.
+            var planDevices = new UpscaleEngine.DeviceInit { QsvArgs = " -init_hw_device qsv=qs:hw_any,child_device=/dev/dri/renderD999" };
+            UpscaleEngine.DeviceInit probed = null;
+            UpscaleEngine.Av1QsvProbeSource = d => { probed = d; return false; };
+            UpscaleEngine.GuardAv1(null, "av1_qsv", out reason, planDevices);
+            Check("GuardAv1 on Intel probes on the plan's DeviceInit, not a fresh Devices()", ReferenceEquals(probed, planDevices));
+            probed = null;
+            UpscaleEngine.EncoderFor(Job("av1", "av1", "hevc"), out reason, planDevices);
+            Check("EncoderFor hands the plan's DeviceInit to GuardAv1", ReferenceEquals(probed, planDevices));
+            UpscaleEngine.Av1QsvProbeSource = _ => false;
 
             // The encoder list decides between QSV and software, and never produces VA-API or NVENC.
             OnIntel("auto", "auto", "libx264", "libx265", "hevc_vaapi", "h264_vaapi");
@@ -566,8 +590,19 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
             Equal("no QSV: the record's family is software", "software", UpscaleEngine.Capability().EncoderFamily);
             Check("no QSV: the record's reason says VA-API cannot be fed", UpscaleEngine.Capability().Reason.Contains("VA-API encoder cannot take this chain"));
             OnIntel("auto", "auto", "hevc_vaapi");
-            Equal("no QSV and no software encoder: hevc_qsv, with the failure said", "hevc_qsv", UpscaleEngine.EncoderFor(Job("hevc", "hevc"), out reason));
-            Check("...and the reason says it will fail to open", reason.Contains("ffmpeg lists neither hevc_qsv nor libx265"), reason);
+            Check("no QSV and no software encoder: no encoder, Jellyfin's choice stands", UpscaleEngine.EncoderFor(Job("hevc", "hevc"), out reason) == null);
+            Check("...and the reason says what was kept", reason.Contains("ffmpeg lists neither hevc_qsv nor libx265") && reason.Contains("kept Jellyfin's encoder"), reason);
+            Check("no encoder, client named no codec: still null", UpscaleEngine.EncoderFor(null, out reason) == null);
+            OnIntel("auto", "hevc_qsv", "hevc_vaapi");
+            Check("a named QSV encoder ffmpeg lacks, nothing usable: null, not the unlisted name", UpscaleEngine.EncoderFor(Job("hevc", "hevc"), out reason) == null);
+            OnIntel("auto", "hevc_vaapi", "hevc_vaapi");
+            Check("a named VA-API encoder with nothing usable: null, not the VA-API name", UpscaleEngine.EncoderFor(Job("hevc", "hevc"), out reason) == null);
+
+            // The encoder postfix keeps Jellyfin's own choice when the engine has none.
+            OnIntel("auto", "auto", "hevc_vaapi");
+            string kept = "hevc_vaapi";
+            bool keptHandled = UpscalePatches.ApplyIntelEncoder(Job("hevc", "hevc"), UpscaleEngine.Settings, ref kept);
+            Check("ApplyIntelEncoder with no usable encoder keeps Jellyfin's", keptHandled && kept == "hevc_vaapi", kept);
             UpscaleEngine.EncoderListSource = () => null;
             Equal("unreadable ffmpeg list: the usual QSV choice", "hevc_qsv", UpscaleEngine.EncoderFor(Job("hevc", "hevc"), out reason));
             Equal("unreadable ffmpeg list: record family stays qsv", "qsv", UpscaleEngine.Capability().EncoderFamily);
@@ -585,7 +620,8 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
             Equal("hevc_qsv named: the reason", "configured encoder 'hevc_qsv' applied", reason);
             Equal("hevc_qsv named, the client only takes h264: h264_qsv", "h264_qsv", UpscaleEngine.EncoderFor(Job("h264", "h264"), out reason));
             OnIntel("auto", "hevc_qsv", "h264_qsv");
-            Equal("hevc_qsv named but not in ffmpeg: the client's encoder", "hevc_qsv", UpscaleEngine.EncoderFor(Job("hevc", "hevc"), out reason));
+            Check("hevc_qsv named but not in ffmpeg, no software hevc either: null", UpscaleEngine.EncoderFor(Job("hevc", "hevc"), out reason) == null);
+            Equal("hevc_qsv named but not in ffmpeg: the client's h264 encoder", "h264_qsv", UpscaleEngine.EncoderFor(Job("h264", "h264"), out reason));
 
             // Never NVENC, never CUDA, whatever the setting and whatever the client says.
             bool leaked = false;
@@ -671,8 +707,8 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
                 Equal("Intel BuildChain ends in a download, never the CUDA hand-off" + tag,
                     "format=yuv420p,hwupload,libplacebo=w=1920:h=1080:upscaler=ewa_lanczos,hwdownload,format=yuv420p",
                     UpscaleEngine.BuildChain(new UpscaleEngine.Plan { Width = 1920, Height = 1080, UpscaleApplied = true }));
-                Equal("Intel HwaccelArgs starts the Vulkan device from the render node, never vk:0" + tag,
-                    " -init_hw_device drm=dr:/dev/dri/renderD128 -init_hw_device vulkan=vk@dr -filter_hw_device vk",
+                Equal("Intel HwaccelArgs starts the Vulkan device from the render node, never vk:0, and pins QSV to it" + tag,
+                    " -init_hw_device drm=dr:/dev/dri/renderD128 -init_hw_device vulkan=vk@dr -init_hw_device qsv=qs:hw_any,child_device=/dev/dri/renderD128 -filter_hw_device vk",
                     UpscaleEngine.HwaccelArgs(null));
 
                 var plan = new UpscaleEngine.Plan { Act = true, Width = 1920, Height = 1080, SourceWidth = 1280, SourceHeight = 720 };
@@ -699,6 +735,7 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
         private static void IntelDevices()
         {
             const string Drm128 = " -init_hw_device drm=dr:/dev/dri/renderD128 -init_hw_device vulkan=vk@dr";
+            const string Qsv128 = " -init_hw_device qsv=qs:hw_any,child_device=/dev/dri/renderD128";
             var asked = new List<string>();
 
             GpuDetector.UseEnvironment(Machine("renderD128", "0x8086"));
@@ -710,10 +747,10 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
             };
             UpscaleEngine.Settings = new UpscaleSettings { Encoder = "auto", GpuVendor = "auto" };
 
-            Equal("one Intel GPU: HwaccelArgs", Drm128 + " -filter_hw_device vk", UpscaleEngine.HwaccelArgs(null));
+            Equal("one Intel GPU: HwaccelArgs", Drm128 + Qsv128 + " -filter_hw_device vk", UpscaleEngine.HwaccelArgs(null));
             Check("one Intel GPU: never vk:0", !UpscaleEngine.HwaccelArgs(null).Contains("vk:0"));
-            Check("one Intel GPU: the QSV device is not added (the encoder finds the node itself)", UpscaleEngine.Devices().QsvArgs == string.Empty);
-            Equal("one Intel GPU: the encoder's device in the record", "implicit (the first Intel render node, /dev/dri/renderD128)", UpscaleEngine.Devices().QsvText);
+            Equal("one Intel GPU: the QSV device is pinned to the detected node", Qsv128, UpscaleEngine.Devices().QsvArgs);
+            Equal("one Intel GPU: the encoder's device in the record", "/dev/dri/renderD128", UpscaleEngine.Devices().QsvText);
             Equal("one Intel GPU: the Vulkan device in the record", "render node /dev/dri/renderD128", UpscaleEngine.Devices().VulkanText);
             Check("the render-node test was asked about the node, and only that node", asked.Count > 0 && asked.All(n => n == "/dev/dri/renderD128"));
             Equal("the render-node test command",
@@ -722,44 +759,38 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
             Equal("Vulkan-denoise probe tests the session's device",
                 "-hide_banner -loglevel error" + Drm128 + " -filter_hw_device vk -f lavfi -i testsrc=size=64x64:rate=1 -frames:v 1 -vf \"format=yuv420p,hwupload,nlmeans_vulkan,hwdownload,format=yuv420p\" -f null -",
                 UpscaleEngine.VulkanDenoiseProbeArgs());
-            Equal("AV1 QSV test encode is unchanged when the device is implicit",
-                "-hide_banner -loglevel error -f lavfi -i color=c=black:s=640x360:r=1 -frames:v 1 -vf format=nv12 -c:v av1_qsv -f null -",
+            Equal("AV1 QSV test encode uses the pinned QSV device",
+                "-hide_banner -loglevel error" + Qsv128 + " -f lavfi -i color=c=black:s=640x360:r=1 -frames:v 1 -vf format=nv12 -c:v av1_qsv -f null -",
                 UpscaleEngine.Av1QsvProbeArgs());
 
             // A CUDA-native plan cannot reach an Intel server (Decide drops those levels), and if one
             // ever did, the command still carries no CUDA.
             string cuda = UpscaleEngine.HwaccelArgs(new UpscaleEngine.Plan { UsesCudaNeural = true });
-            Equal("Intel: a CUDA-native plan still gets the Vulkan device only", Drm128 + " -filter_hw_device vk", cuda);
+            Equal("Intel: a CUDA-native plan still gets the Vulkan and QSV devices only", Drm128 + Qsv128 + " -filter_hw_device vk", cuda);
 
             // The record says which device the command used.
             var plan = new UpscaleEngine.Plan { Act = true, Width = 1920, Height = 1080, SourceWidth = 1280, SourceHeight = 720 };
             SessionRecord record = UpscaleEngine.Describe(null, plan, "applied", "x");
             Equal("record: VulkanDevice names the node", "render node /dev/dri/renderD128", record.VulkanDevice);
-            Equal("record: QsvDevice says implicit", "implicit (the first Intel render node, /dev/dri/renderD128)", record.QsvDevice);
+            Equal("record: QsvDevice names the pinned node", "/dev/dri/renderD128", record.QsvDevice);
             Check("record: a session that was not enhanced names no device",
                 UpscaleEngine.Describe(null, new UpscaleEngine.Plan(), "not-requested", "x").VulkanDevice == null
                 && UpscaleEngine.Describe(null, new UpscaleEngine.Plan(), "not-requested", "x").QsvDevice == null);
 
             // The test fails: the first Vulkan device, and the record says why. Never a dead stream from this change.
             UpscaleEngine.DrmVulkanProbeSource = n => false;
-            Equal("the render-node test fails: vk:0", " -init_hw_device vulkan=vk:0 -filter_hw_device vk", UpscaleEngine.HwaccelArgs(null));
+            Equal("the render-node test fails: vk:0, QSV still pinned", " -init_hw_device vulkan=vk:0" + Qsv128 + " -filter_hw_device vk", UpscaleEngine.HwaccelArgs(null));
             Equal("the render-node test fails: the record says so", "vk:0 (a test start from /dev/dri/renderD128 failed, so the first Vulkan device)", UpscaleEngine.Devices().VulkanText);
             Equal("the render-node test fails: the Vulkan-denoise probe follows", "-hide_banner -loglevel error -init_hw_device vulkan=vk:0 -filter_hw_device vk -f lavfi -i testsrc=size=64x64:rate=1 -frames:v 1 -vf \"format=yuv420p,hwupload,nlmeans_vulkan,hwdownload,format=yuv420p\" -f null -", UpscaleEngine.VulkanDenoiseProbeArgs());
 
             // The test cannot tell (no ffmpeg, a timeout): the node is trusted, and the record says it was not tested.
             UpscaleEngine.DrmVulkanProbeSource = n => null;
-            Equal("the render-node test is inconclusive: the node is used", Drm128 + " -filter_hw_device vk", UpscaleEngine.HwaccelArgs(null));
+            Equal("the render-node test is inconclusive: the node is used", Drm128 + Qsv128 + " -filter_hw_device vk", UpscaleEngine.HwaccelArgs(null));
             Equal("the render-node test is inconclusive: the record says it was not tested", "render node /dev/dri/renderD128 (not tested: ffmpeg could not be run)", UpscaleEngine.Devices().VulkanText);
             UpscaleEngine.DrmVulkanProbeSource = n => true;
 
-            // Where the QSV device is pinned: only when the encoder's own search (renderD128 to renderD135) cannot find the node.
-            foreach (int number in new[] { 128, 129, 135 })
-            {
-                GpuDetector.UseEnvironment(Machine("renderD" + number, "0x8086"));
-                Equal("renderD" + number + ": QSV left implicit", string.Empty, UpscaleEngine.Devices().QsvArgs);
-            }
-
-            foreach (int number in new[] { 136, 140, 191 })
+            // The QSV device is pinned to the detected node whatever its number: the encoder's own search is not trusted to pick it.
+            foreach (int number in new[] { 128, 129, 135, 136, 140, 191 })
             {
                 string node = "/dev/dri/renderD" + number;
                 GpuDetector.UseEnvironment(Machine("renderD" + number, "0x8086"));
@@ -801,11 +832,159 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
             UpscaleEngine.DrmVulkanProbeSource = null;
         }
 
+        private static bool WaitFor(Func<bool> done)
+        {
+            var clock = System.Diagnostics.Stopwatch.StartNew();
+            while (!done())
+            {
+                if (clock.ElapsedMilliseconds > 5000)
+                {
+                    return false;
+                }
+
+                System.Threading.Thread.Sleep(10);
+            }
+
+            return true;
+        }
+
+        // Review of PR 3: the render-node test runs in the background, true is kept for good, false
+        // and inconclusive results are tested again after a window, and the stale one is served meanwhile.
+        private static void DrmProbeCache()
+        {
+            const string Node = "/dev/dri/renderD128";
+            const string Found = "render node " + Node;
+            const string Failed = "vk:0 (a test start from " + Node + " failed, so the first Vulkan device)";
+            const string Untested = Found + " (not tested: ffmpeg could not be run)";
+            DateTime now = new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+            GpuDetector.UseEnvironment(Machine("renderD128", "0x8086"));
+            UpscaleEngine.EncoderListSource = () => Encoders(FullList);
+            UpscaleEngine.Settings = new UpscaleSettings { Encoder = "auto", GpuVendor = "auto" };
+            UpscaleEngine.DrmVulkanClock = () => now;
+
+            // A session-path call never waits for the test, and concurrent callers share one test.
+            UpscaleEngine.DrmVulkanInline = false;
+            var release = new System.Threading.ManualResetEventSlim(false);
+            var started = new System.Threading.ManualResetEventSlim(false);
+            int asks = 0;
+            UpscaleEngine.DrmVulkanProbeSource = n =>
+            {
+                System.Threading.Interlocked.Increment(ref asks);
+                started.Set();
+                release.Wait(10000);
+                return true;
+            };
+            var timer = System.Diagnostics.Stopwatch.StartNew();
+            UpscaleEngine.DeviceInit first = UpscaleEngine.Devices();
+            timer.Stop();
+            Check("a first call returns at once while the test is blocked", timer.ElapsedMilliseconds < 2000, timer.ElapsedMilliseconds + " ms");
+            Equal("the untested node is used and the record says the test is pending", Found + " (test pending)", first.VulkanText);
+            Equal("...the command uses the node", " -init_hw_device drm=dr:" + Node + " -init_hw_device vulkan=vk@dr", first.VulkanArgs);
+            Check("the test was started in the background", started.Wait(5000));
+            System.Threading.Tasks.Parallel.For(0, 8, _ => UpscaleEngine.Devices());
+            Equal("concurrent callers share one test", "1", asks.ToString());
+            release.Set();
+            Check("the answer arrives and is used", WaitFor(() => UpscaleEngine.Devices().VulkanText == Found));
+            Equal("a true result is one test only", "1", asks.ToString());
+            now = now.AddHours(24);
+            UpscaleEngine.DrmVulkanInline = true;
+            UpscaleEngine.Devices();
+            Equal("a true result is never asked again", "1", asks.ToString());
+
+            // False: kept inside the window, tested again after it, and the stale value is served during the re-test.
+            System.Threading.ManualResetEventSlim gate = null;
+            var retestStarted = new System.Threading.ManualResetEventSlim(false);
+            bool? answer = false;
+            asks = 0;
+            Func<string, bool?> probe = n =>
+            {
+                System.Threading.Interlocked.Increment(ref asks);
+                var g = gate;
+                if (g != null)
+                {
+                    retestStarted.Set();
+                    g.Wait(10000);
+                }
+
+                return answer;
+            };
+            now = new DateTime(2026, 1, 2, 0, 0, 0, DateTimeKind.Utc);
+            UpscaleEngine.DrmVulkanProbeSource = probe;
+            Equal("false: vk:0 and the record says why", Failed, UpscaleEngine.Devices().VulkanText);
+            Equal("false: tested once", "1", asks.ToString());
+            now = now.AddMinutes(4);
+            UpscaleEngine.Devices();
+            Equal("false: not asked again inside the window", "1", asks.ToString());
+            now = now.AddMinutes(2);
+            UpscaleEngine.DrmVulkanInline = false;
+            gate = new System.Threading.ManualResetEventSlim(false);
+            answer = true;
+            timer.Restart();
+            string stale = UpscaleEngine.Devices().VulkanText;
+            timer.Stop();
+            Equal("false: after the window the stale value is served while it is tested again", Failed, stale);
+            Check("false: and the call did not wait for the re-test", timer.ElapsedMilliseconds < 2000, timer.ElapsedMilliseconds + " ms");
+            Check("false: the re-test started in the background", retestStarted.Wait(5000));
+            System.Threading.Tasks.Parallel.For(0, 8, _ => UpscaleEngine.Devices());
+            Equal("false: one re-test however many callers", "2", asks.ToString());
+            gate.Set();
+            Check("false: a later true replaces it", WaitFor(() => UpscaleEngine.Devices().VulkanText == Found));
+            gate = null;
+            now = now.AddHours(24);
+            UpscaleEngine.DrmVulkanInline = true;
+            UpscaleEngine.Devices();
+            Equal("false then true: kept for good", "2", asks.ToString());
+
+            // Inconclusive (null): same window, same replacement.
+            asks = 0;
+            answer = null;
+            UpscaleEngine.DrmVulkanProbeSource = probe;
+            Equal("null: the node is used and the record says it was not tested", Untested, UpscaleEngine.Devices().VulkanText);
+            now = now.AddMinutes(1);
+            UpscaleEngine.Devices();
+            Equal("null: not asked again inside the window", "1", asks.ToString());
+            now = now.AddMinutes(5);
+            answer = true;
+            Equal("null: asked again after the window, and a true replaces it", Found, UpscaleEngine.Devices().VulkanText);
+            Equal("null: two tests in all", "2", asks.ToString());
+
+            // Start-up warming runs the test on Intel and not on NVIDIA.
+            asks = 0;
+            UpscaleEngine.DrmVulkanProbeSource = probe;
+            UpscaleEngine.WarmDevices();
+            Equal("WarmDevices asks the render-node test on an Intel server", "1", asks.ToString());
+            GpuDetector.UseEnvironment(Machine("renderD128", "0x10de"));
+            UpscaleEngine.DrmVulkanProbeSource = probe;
+            asks = 0;
+            UpscaleEngine.WarmDevices();
+            Equal("WarmDevices asks nothing on an NVIDIA server", "0", asks.ToString());
+
+            // One DeviceInit per plan: the command and the record keep the answer the plan was decided with.
+            GpuDetector.UseEnvironment(Machine("renderD128", "0x8086"));
+            answer = true;
+            UpscaleEngine.DrmVulkanProbeSource = probe;
+            var plan = new UpscaleEngine.Plan { Act = true, Width = 1920, Height = 1080, SourceWidth = 1280, SourceHeight = 720, Devices = UpscaleEngine.Devices() };
+            string decided = UpscaleEngine.HwaccelArgs(plan);
+            answer = false;
+            UpscaleEngine.DrmVulkanProbeSource = probe;
+            Equal("a plan keeps its device when the test answer changes", decided, UpscaleEngine.HwaccelArgs(plan));
+            Equal("...and the record names the same device", Found, UpscaleEngine.Describe(null, plan, "applied", "x").VulkanDevice);
+            Check("...while a plan decided now gets vk:0", UpscaleEngine.HwaccelArgs(new UpscaleEngine.Plan()).Contains("vulkan=vk:0"));
+
+            GpuDetector.UseEnvironment(null);
+            UpscaleEngine.EncoderListSource = null;
+            UpscaleEngine.DrmVulkanProbeSource = null;
+            UpscaleEngine.DrmVulkanClock = null;
+            UpscaleEngine.DrmVulkanInline = true;
+        }
+
         // PR 3: a machine with two GPUs gets the node of the vendor that was chosen. Auto is NVIDIA
         // first, and NVIDIA keeps vk:0 byte for byte (the NVIDIA rule); intel moves to the Intel node.
         private static void TwoGpuMachines()
         {
             const string Vk0 = " -init_hw_device vulkan=vk:0 -filter_hw_device vk";
+            const string Qsv128 = " -init_hw_device qsv=qs:hw_any,child_device=/dev/dri/renderD128";
+            const string Qsv129 = " -init_hw_device qsv=qs:hw_any,child_device=/dev/dri/renderD129";
             var asked = new List<string>();
             UpscaleEngine.EncoderListSource = () => Encoders(FullList);
             UpscaleEngine.DrmVulkanProbeSource = n =>
@@ -819,7 +998,7 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
 
             GpuDetector.UseEnvironment(intelFirst);
             UpscaleEngine.Settings = new UpscaleSettings { GpuVendor = "intel" };
-            Equal("Intel at 128, NVIDIA at 129, intel chosen: the Intel node", " -init_hw_device drm=dr:/dev/dri/renderD128 -init_hw_device vulkan=vk@dr -filter_hw_device vk", UpscaleEngine.HwaccelArgs(null));
+            Equal("Intel at 128, NVIDIA at 129, intel chosen: the Intel node", " -init_hw_device drm=dr:/dev/dri/renderD128 -init_hw_device vulkan=vk@dr" + Qsv128 + " -filter_hw_device vk", UpscaleEngine.HwaccelArgs(null));
             UpscaleEngine.Settings = new UpscaleSettings { GpuVendor = "auto" };
             asked.Clear();
             Equal("Intel at 128, NVIDIA at 129, auto: NVIDIA, vk:0 as before", Vk0, UpscaleEngine.HwaccelArgs(null));
@@ -829,9 +1008,9 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
 
             GpuDetector.UseEnvironment(nvidiaFirst);
             UpscaleEngine.Settings = new UpscaleSettings { GpuVendor = "intel" };
-            Equal("NVIDIA at 128, Intel at 129, intel chosen: the Intel node, not the first", " -init_hw_device drm=dr:/dev/dri/renderD129 -init_hw_device vulkan=vk@dr -filter_hw_device vk", UpscaleEngine.HwaccelArgs(null));
+            Equal("NVIDIA at 128, Intel at 129, intel chosen: the Intel node, not the first", " -init_hw_device drm=dr:/dev/dri/renderD129 -init_hw_device vulkan=vk@dr" + Qsv129 + " -filter_hw_device vk", UpscaleEngine.HwaccelArgs(null));
             Check("...the test was asked about renderD129", asked.Count > 0 && asked.All(n => n == "/dev/dri/renderD129"));
-            Equal("...its encoder is found by the encoder's own search", "implicit (the first Intel render node, /dev/dri/renderD129)", UpscaleEngine.Devices().QsvText);
+            Equal("...its encoder is pinned to the same node", "/dev/dri/renderD129", UpscaleEngine.Devices().QsvText);
             Equal("...and the record says so", "render node /dev/dri/renderD129", UpscaleEngine.Describe(null, new UpscaleEngine.Plan { Act = true }, "applied", "x").VulkanDevice);
             UpscaleEngine.Settings = new UpscaleSettings { GpuVendor = "auto" };
             Equal("NVIDIA at 128, Intel at 129, auto: vk:0 as before", Vk0, UpscaleEngine.HwaccelArgs(null));
@@ -839,13 +1018,13 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
             // Two Intel GPUs: the first Intel node, which is the encoder's own pick too.
             GpuDetector.UseEnvironment(Machine("renderD128", "0x8086", "renderD129", "0x8086"));
             UpscaleEngine.Settings = new UpscaleSettings { GpuVendor = "auto" };
-            Equal("two Intel GPUs: the first Intel node", " -init_hw_device drm=dr:/dev/dri/renderD128 -init_hw_device vulkan=vk@dr -filter_hw_device vk", UpscaleEngine.HwaccelArgs(null));
-            Check("two Intel GPUs: the encoder's implicit search agrees", UpscaleEngine.Devices().QsvArgs == string.Empty);
+            Equal("two Intel GPUs: the first Intel node, for Vulkan and QSV", " -init_hw_device drm=dr:/dev/dri/renderD128 -init_hw_device vulkan=vk@dr" + Qsv128 + " -filter_hw_device vk", UpscaleEngine.HwaccelArgs(null));
 
-            // An AMD node beside the Intel one is skipped, and the Intel node's own number is used.
+            // An AMD node beside the Intel one is skipped, and the QSV device is pinned to the Intel node, not to renderD128.
             GpuDetector.UseEnvironment(Machine("renderD128", "0x1002", "renderD129", "0x8086"));
             UpscaleEngine.Settings = new UpscaleSettings { GpuVendor = "intel" };
-            Equal("AMD at 128, Intel at 129: the Intel node", " -init_hw_device drm=dr:/dev/dri/renderD129 -init_hw_device vulkan=vk@dr -filter_hw_device vk", UpscaleEngine.HwaccelArgs(null));
+            Equal("AMD at 128, Intel at 129: the Intel node for Vulkan and QSV", " -init_hw_device drm=dr:/dev/dri/renderD129 -init_hw_device vulkan=vk@dr" + Qsv129 + " -filter_hw_device vk", UpscaleEngine.HwaccelArgs(null));
+            Check("AMD at 128, Intel at 129: no QSV device on the AMD node", !UpscaleEngine.HwaccelArgs(null).Contains("child_device=/dev/dri/renderD128"));
 
             // Intel chosen with no Intel GPU on the machine: the NVIDIA path, vk:0.
             GpuDetector.UseEnvironment(Machine("renderD128", "0x10de"));
@@ -886,7 +1065,7 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
         {
             UpscaleEngine.EncoderListSource = () => Encoders(FullList);
             UpscaleEngine.DrmVulkanProbeSource = n => true;
-            UpscaleEngine.Av1QsvProbeSource = () => true;
+            UpscaleEngine.Av1QsvProbeSource = _ => true;
             SetFilters("optix", "oidn", "ort", "fsr2", "dlss", "dlpp_rtcuda", "vsr_rtcuda", "libplacebo", "nlmeans_vulkan");
 
             // What the probe held before, for an NVIDIA box with every file in place.
@@ -899,7 +1078,7 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
             JsonElement intel = Probe();
 
             Equal("Intel probe: Denoise", "off,light,strong,max,oidn", string.Join(",", Strings(intel, "Denoise")));
-            Equal("Intel probe: Neural keeps the ONNX level and loses DLPP and VSR", "off,realesr-anime-x2", string.Join(",", Strings(intel, "Neural")));
+            Equal("Intel probe: Neural keeps the ONNX level (PR 5 runs it on OpenVINO or the CPU) and loses DLPP and VSR", "off,realesr-anime-x2", string.Join(",", Strings(intel, "Neural")));
             Equal("Intel probe: Game is off alone", "off", string.Join(",", Strings(intel, "Game")));
             Equal("Intel probe: GameOptionLevels is empty", string.Empty, string.Join(",", Strings(intel, "GameOptionLevels")));
             Equal("Intel probe: the neural labels follow", "off,realesr-anime-x2", string.Join(",", Keys(intel.GetProperty("NeuralLabels")).OrderBy(n => n, StringComparer.Ordinal)));
@@ -911,7 +1090,8 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
             Equal("Intel probe: Withheld, game", "fsr2,dlss,dlaa", string.Join(",", Keys(withheld.GetProperty("Game"))));
             Check("Intel probe: every withheld level says needs NVIDIA",
                 Keys(withheld).All(axis => withheld.GetProperty(axis).EnumerateObject().All(l => l.Value.GetString() == "needs NVIDIA")));
-            Check("Intel probe: a level that is offered is not in Withheld", !withheld.GetProperty("Denoise").TryGetProperty("oidn", out _) && !withheld.GetProperty("Neural").TryGetProperty("realesr-anime-x2", out _));
+            Check("Intel probe: the ONNX level is offered, so it is not in Withheld under any reason", !withheld.GetProperty("Neural").TryGetProperty("realesr-anime-x2", out _));
+            Check("Intel probe: a level that is offered is not in Withheld", !withheld.GetProperty("Denoise").TryGetProperty("oidn", out _));
 
             // Nothing else in the probe moved: every other key is byte-identical to the NVIDIA one.
             string[] moved = { "Denoise", "Neural", "NeuralLabels", "Game", "GameLabels", "GameOptionLevels", "Gpu", "Withheld" };
@@ -1018,17 +1198,49 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
             plan = UpscaleEngine.Decide(SessionJob("upscale", "1080", "denoise", "optix"));
             Check("mixed box, auto (NVIDIA): optix is not withheld", plan.GpuWithheld == null, plan.GpuWithheld);
 
-            // The neural report is honest about what an ONNX level runs on without CUDA.
+            // The ONNX levels are withheld on Intel with their own reason, and run unchanged on NVIDIA.
             GpuDetector.UseEnvironment(Machine("renderD128", "0x8086"));
             UpscaleEngine.Settings = rig;
             plan = UpscaleEngine.Decide(SessionJob("upscale", "1080", "neural", "realesr-anime-x2"));
             record = UpscaleEngine.Describe(null, plan, plan.Status, plan.Reason);
-            Check("Intel: an ONNX neural level is not withheld", plan.GpuWithheld == null && plan.NeuralApplied, plan.Status + ": " + plan.Reason);
+            Check("Intel: an ONNX neural level is not withheld", plan.GpuWithheld == null && plan.GpuWithheldUnmeasured == null && plan.NeuralApplied, plan.Status + ": " + plan.Reason);
             Check("Intel: and its description does not claim CUDA", record.Summary.Contains("this server's GPU is Intel, so no CUDA and the CPU provider") && !record.Summary.Contains("ONNX Runtime CUDA"), record.Summary);
+            Equal("Intel: the neural level asked for is still recorded", "realesr-anime-x2", plan.NeuralRequested);
+            Check("Intel record: nothing is withheld for it, as NVIDIA-only or as unmeasured", record.GpuWithheld == null && record.GpuWithheldUnmeasured == null);
+            Check("Intel record: the summary says no level was left out", !record.Summary.Contains("NOT run"), record.Summary);
+
+            // PR 5 runs the ONNX levels on OpenVINO or the CPU, so an optix level beside one is the only one withheld.
+            plan = UpscaleEngine.Decide(SessionJob("upscale", "1080", "denoise", "optix", "neural", "realesr-anime-x2"));
+            record = UpscaleEngine.Describe(null, plan, plan.Status, plan.Reason);
+            Check("Intel: a session asking for optix and an ONNX level withholds only optix", plan.GpuWithheld == "denoise optix" && plan.GpuWithheldUnmeasured == null && plan.NeuralApplied, plan.GpuWithheld + " | " + plan.GpuWithheldUnmeasured);
+            Check("Intel record: the summary names optix and says nothing about the ONNX level being unmeasured",
+                record.Summary.Contains("denoise optix NOT run: needs an NVIDIA GPU and this server's is Intel") && !record.Summary.Contains("not measured on Intel"), record.Summary);
+
+            // Asked for nothing but an ONNX level: left with nothing, and the reason says why.
+            UpscaleEngine.Settings = optIn;
+            plan = UpscaleEngine.Decide(SessionJob("neural", "realesr-anime-x2"));
+            Check("Intel, only an ONNX level asked for: it is not left with nothing (PR 5 runs it)", plan.Act && plan.NeuralApplied, plan.Status + ": " + plan.Reason);
+            Check("Intel, only an ONNX level asked for: the reason does not say it is unmeasured", !(plan.Reason ?? string.Empty).Contains("not measured on Intel"), plan.Reason);
+
             GpuDetector.UseEnvironment(Machine("renderD128", "0x10de"));
+            UpscaleEngine.Settings = rig;
             plan = UpscaleEngine.Decide(SessionJob("upscale", "1080", "neural", "realesr-anime-x2"));
             record = UpscaleEngine.Describe(null, plan, plan.Status, plan.Reason);
-            Check("NVIDIA: the same level is still described as ONNX Runtime CUDA", record.Summary.Contains("ONNX Runtime CUDA"), record.Summary);
+            Check("NVIDIA: the same level runs, nothing withheld", plan.NeuralApplied && plan.GpuWithheld == null && plan.GpuWithheldUnmeasured == null, plan.Status + ": " + plan.Reason);
+            Check("NVIDIA: it is still described as ONNX Runtime CUDA", record.Summary.Contains("ONNX Runtime CUDA"), record.Summary);
+            Check("NVIDIA record: no unmeasured text", record.GpuWithheldUnmeasured == null);
+
+            // ShaderLibrary names the ONNX levels, and leaves the NVIDIA-only and unknown ones out.
+            foreach (string level in new[] { "realesr-anime-x2", "realesr-anime-x4", "realesr-general-x4", "REALESR-ANIME-X2" })
+            {
+                Check("neural " + level + " is an ONNX level", ShaderLibrary.IsOnnxNeural(level));
+            }
+
+            Check("off, dlpp-2, vsr-rtcuda, banana and null are not ONNX levels",
+                !ShaderLibrary.IsOnnxNeural("off") && !ShaderLibrary.IsOnnxNeural("dlpp-2") && !ShaderLibrary.IsOnnxNeural("vsr-rtcuda") && !ShaderLibrary.IsOnnxNeural("banana") && !ShaderLibrary.IsOnnxNeural(null));
+            Check("reason: an ONNX level has none (PR 5 runs it on OpenVINO or the CPU)", UpscaleEngine.IntelWithholdReason("Neural", "realesr-general-x4") == null);
+            Equal("reason: a CUDA-native level", "needs NVIDIA", UpscaleEngine.IntelWithholdReason("Neural", "dlpp-1"));
+            Check("reason: off and banana have none", UpscaleEngine.IntelWithholdReason("Neural", "off") == null && UpscaleEngine.IntelWithholdReason("Neural", "banana") == null);
 
             GpuDetector.UseEnvironment(null);
             UpscaleEngine.EncoderListSource = null;
@@ -1063,12 +1275,27 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
             };
         }
 
-        // PR 6: fsr2 is offered and run on a detected Intel GPU only when the build left the fsr2-nocuda marker; dlss and dlaa never.
+        private static int _fsr2ProbeCalls;
+
+        // Replaces the fsr2 start-up probe with one that counts its calls and answers with `answer`. Its scheduler
+        // runs the work at once, so a Start() lands the answer before the next read; `schedule` overrides that.
+        private static void UseFsr2Probe(Func<UpscaleEngine.Fsr2ProbeResult> answer, Func<DateTime> now = null, Action<Action> schedule = null)
+        {
+            _fsr2ProbeCalls = 0;
+            UpscaleEngine.Fsr2Probe = UpscaleEngine.NewFsr2Probe(() => { _fsr2ProbeCalls++; return answer(); }, now, schedule ?? (work => work()));
+        }
+
+        private static UpscaleEngine.Fsr2ProbeResult Fsr2Passed() => new UpscaleEngine.Fsr2ProbeResult { Ok = true };
+
+        private static UpscaleEngine.Fsr2ProbeResult Fsr2Failed() => new UpscaleEngine.Fsr2ProbeResult { Ok = false };
+
+        // PR 6: fsr2 is offered and run on a detected Intel GPU only when the build left the fsr2-nocuda marker AND a
+        // one-frame fsr2 run on this GPU passed; dlss and dlaa never.
         private static void NoCudaGame()
         {
             UpscaleEngine.EncoderListSource = () => Encoders(FullList);
             UpscaleEngine.DrmVulkanProbeSource = n => true;
-            UpscaleEngine.Av1QsvProbeSource = () => true;
+            UpscaleEngine.Av1QsvProbeSource = _ => true;
             SetFilters("optix", "oidn", "ort", "fsr2", "dlss", "dlpp_rtcuda", "vsr_rtcuda", "libplacebo", "nlmeans_vulkan");
             string marker = Path.Combine(Rig(), "fsr2-nocuda");
 
@@ -1085,19 +1312,27 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
             Check("Intel node + marker: NoCudaGameAvailable", GpuDetector.Resolve("auto", Path.Combine(Rig(), "models"), WithFile(Machine("renderD128", "0x8086"), marker)).NoCudaGameAvailable);
             Check("Intel chosen, no Intel node, marker: no NoCudaGameAvailable", !GpuDetector.Resolve("intel", Path.Combine(Rig(), "models"), WithFile(Machine("renderD128", "0x10de"), marker)).NoCudaGameAvailable);
 
-            // Without the marker the Intel probe is what PR 3 made it: no game level.
+            // Without the marker the Intel probe is what PR 3 made it: no game level, and the fsr2 probe never runs
+            // even though one that would pass is installed.
+            UseFsr2Probe(Fsr2Passed);
             GpuDetector.UseEnvironment(Machine("renderD128", "0x8086"));
             UpscaleEngine.Settings = RigSettings("auto");
+            UpscaleEngine.StartFsr2Probe();
             JsonElement bare = Probe();
             Equal("Intel, no marker: Game is off alone", "off", string.Join(",", Strings(bare, "Game")));
             Equal("Intel, no marker: Withheld game", "fsr2,dlss,dlaa", string.Join(",", Keys(bare.GetProperty("Withheld").GetProperty("Game"))));
             UpscaleEngine.Plan refused = UpscaleEngine.Decide(SessionJob("upscale", "1080", "game", "fsr2"));
             Equal("Intel, no marker: fsr2 is withheld", "game fsr2", refused.GpuWithheld);
             Check("Intel, no marker: no fsr2 node and no motion note", !refused.GameApplied && refused.GameFilter == null && refused.GameMotionNote == null);
+            Equal("Intel, no marker: fsr2 says needs NVIDIA", UpscaleEngine.NeedsNvidia, bare.GetProperty("Withheld").GetProperty("Game").GetProperty("fsr2").GetString());
+            Check("Intel, no marker: the fsr2 probe was never run", _fsr2ProbeCalls == 0, _fsr2ProbeCalls + " calls");
 
-            // With it, fsr2 is offered and runs, and dlss and dlaa stay withheld.
+            // With the marker and a passing probe, fsr2 is offered and runs, and dlss and dlaa stay withheld.
+            UseFsr2Probe(Fsr2Passed);
             GpuDetector.UseEnvironment(WithFile(Machine("renderD128", "0x8086"), marker));
             UpscaleEngine.Settings = RigSettings("auto");
+            UpscaleEngine.StartFsr2Probe();
+            Check("Intel + marker: start-up runs the probe once", _fsr2ProbeCalls == 1, _fsr2ProbeCalls + " calls");
             JsonElement marked = Probe();
             Check("Intel + marker: Game offers fsr2 and not dlss or dlaa", Strings(marked, "Game").Contains("fsr2") && !Strings(marked, "Game").Contains("dlss") && !Strings(marked, "Game").Contains("dlaa"), string.Join(",", Strings(marked, "Game")));
             Check("Intel + marker: the game labels follow", Keys(marked.GetProperty("GameLabels")).Contains("fsr2") && !Keys(marked.GetProperty("GameLabels")).Contains("dlss"));
@@ -1117,16 +1352,80 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
             UpscaleEngine.Plan dlaa = UpscaleEngine.Decide(SessionJob("upscale", "1080", "game", "dlaa"));
             Equal("Intel + marker: dlaa is still withheld", "game dlaa", dlaa.GpuWithheld);
             Check("Intel + marker: neither dlss nor dlaa has a node", !dlss.GameApplied && !dlaa.GameApplied && dlss.GameFilter == null && dlaa.GameFilter == null);
+            Check("Intel + marker: a pass is kept, the probe ran once in all", _fsr2ProbeCalls == 1, _fsr2ProbeCalls + " calls");
 
-            // The marker never reaches an NVIDIA box, and the classification of the levels themselves does not move.
+            // A probe that ran and failed: fsr2 is withheld with its own reason, no node and no motion note.
+            UseFsr2Probe(Fsr2Failed);
+            UpscaleEngine.StartFsr2Probe();
+            JsonElement failed = Probe();
+            Check("Intel + marker, probe failed: Game is off alone", string.Join(",", Strings(failed, "Game")) == "off", string.Join(",", Strings(failed, "Game")));
+            Equal("Intel + marker, probe failed: fsr2 says why", UpscaleEngine.Fsr2ProbeFailed, failed.GetProperty("Withheld").GetProperty("Game").GetProperty("fsr2").GetString());
+            Equal("Intel + marker, probe failed: dlss still says needs NVIDIA", UpscaleEngine.NeedsNvidia, failed.GetProperty("Withheld").GetProperty("Game").GetProperty("dlss").GetString());
+            UpscaleEngine.Plan failedPlan = UpscaleEngine.Decide(SessionJob("upscale", "1080", "game", "fsr2"));
+            Equal("Intel + marker, probe failed: fsr2 is withheld", "game fsr2", failedPlan.GpuWithheld);
+            Check("Intel + marker, probe failed: no fsr2 node and no motion note", !failedPlan.GameApplied && failedPlan.GameFilter == null && failedPlan.GameMotionNote == null);
+            string failedSummary = UpscaleEngine.Describe(null, failedPlan, failedPlan.Status, failedPlan.Reason).Summary ?? string.Empty;
+            Check("Intel + marker, probe failed: the summary does not say needs NVIDIA", !failedSummary.Contains("NVIDIA"), failedSummary);
+            Check("Intel + marker, probe failed: the chain has no fsr2", !UpscaleEngine.BuildChain(failedPlan).Contains("fsr2"));
+
+            // A probe with no answer (ffmpeg missing, killed on the time limit, threw), and one that has not landed yet.
+            UseFsr2Probe(() => null);
+            UpscaleEngine.StartFsr2Probe();
+            JsonElement unanswered = Probe();
+            Equal("Intel + marker, probe null: fsr2 is waiting", UpscaleEngine.Fsr2ProbePending, unanswered.GetProperty("Withheld").GetProperty("Game").GetProperty("fsr2").GetString());
+            Equal("Intel + marker, probe null: fsr2 is withheld", "game fsr2", UpscaleEngine.Decide(SessionJob("upscale", "1080", "game", "fsr2")).GpuWithheld);
+            UseFsr2Probe(() => throw new InvalidOperationException("no ffmpeg"));
+            UpscaleEngine.StartFsr2Probe();
+            Check("Intel + marker, probe threw: fsr2 is withheld", UpscaleEngine.WithheldLevels(UpscaleEngine.Settings)["Game"].ContainsKey("fsr2"));
+            var queued = new List<Action>();
+            UseFsr2Probe(Fsr2Passed, null, queued.Add);
+            Check("Intel + marker, probe pending: fsr2 is withheld and the read did not run it", UpscaleEngine.WithheldLevels(UpscaleEngine.Settings)["Game"].ContainsKey("fsr2") && _fsr2ProbeCalls == 0 && queued.Count == 1, _fsr2ProbeCalls + " calls, " + queued.Count + " queued");
+            Equal("Intel + marker, probe pending: the reason", UpscaleEngine.Fsr2ProbePending, UpscaleEngine.WithheldLevels(UpscaleEngine.Settings)["Game"]["fsr2"]);
+            Equal("Intel + marker, probe pending: the session is withheld", "game fsr2", UpscaleEngine.Decide(SessionJob("upscale", "1080", "game", "fsr2")).GpuWithheld);
+            queued[0]();
+            Check("Intel + marker, probe lands: fsr2 is offered", !UpscaleEngine.WithheldLevels(UpscaleEngine.Settings)["Game"].ContainsKey("fsr2") && UpscaleEngine.NoCudaGameNow());
+
+            // CachedProbe's rules on a fake clock: a pass is kept, a failure is asked again only after the TTL.
+            DateTime clock = new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+            bool pass = false;
+            UseFsr2Probe(() => pass ? Fsr2Passed() : Fsr2Failed(), () => clock);
+            UpscaleEngine.StartFsr2Probe();
+            UpscaleEngine.NoCudaGameNow();
+            Check("probe: a failure is not asked again before the TTL", _fsr2ProbeCalls == 1, _fsr2ProbeCalls + " calls");
+            clock = clock + UpscaleEngine.Fsr2ProbeRetryAfter + TimeSpan.FromSeconds(1);
+            pass = true;
+            Check("probe: the read after the TTL still answers from the failure", !UpscaleEngine.NoCudaGameNow());
+            Check("probe: and it asked again, off the read", _fsr2ProbeCalls == 2, _fsr2ProbeCalls + " calls");
+            Check("probe: the pass is offered", UpscaleEngine.NoCudaGameNow());
+            clock = clock + TimeSpan.FromDays(1);
+            UpscaleEngine.NoCudaGameNow();
+            Check("probe: a pass is kept and never asked again", _fsr2ProbeCalls == 2 && UpscaleEngine.NoCudaGameNow(), _fsr2ProbeCalls + " calls");
+            Check("probe: a throw is an answer of null", UpscaleEngine.NewFsr2Probe(() => throw new InvalidOperationException(), null, work => work()).Peek() == null);
+
+            string probeArgs = UpscaleEngine.Fsr2ProbeArgs();
+            Check("probe: the command runs fsr2 and starts no device of its own", probeArgs.Contains("fsr2=") && !probeArgs.Contains("-init_hw_device") && !probeArgs.Contains("-filter_hw_device"), probeArgs);
+
+            // The marker never reaches an NVIDIA box or a no-GPU box, and the classification of the levels themselves does not move.
+            UseFsr2Probe(Fsr2Passed);
             GpuDetector.UseEnvironment(WithFile(Machine("renderD128", "0x10de"), marker));
             UpscaleEngine.Settings = RigSettings("auto");
+            UpscaleEngine.StartFsr2Probe();
             Equal("NVIDIA with the marker file: Game keeps all three", "off,fsr2,dlss,dlaa", string.Join(",", Strings(Probe(), "Game")));
             UpscaleEngine.Plan nvFsr = UpscaleEngine.Decide(SessionJob("upscale", "1080", "game", "fsr2"));
             Check("NVIDIA with the marker file: fsr2 runs with no motion note", nvFsr.GameApplied && nvFsr.GpuWithheld == null && nvFsr.GameMotionNote == null, nvFsr.Status + ": " + nvFsr.Reason);
+            Check("NVIDIA with the marker file: the fsr2 probe was never run", _fsr2ProbeCalls == 0, _fsr2ProbeCalls + " calls");
+            GpuDetector.UseEnvironment(WithFile(Machine(), marker));
+            UpscaleEngine.Settings = RigSettings("auto");
+            UpscaleEngine.StartFsr2Probe();
+            UpscaleEngine.NoCudaGameNow();
+            Probe();
+            Check("no GPU with the marker file: the fsr2 probe was never run", _fsr2ProbeCalls == 0, _fsr2ProbeCalls + " calls");
+            GpuDetector.UseEnvironment(WithFile(Machine("renderD128", "0x10de"), marker));
+            UpscaleEngine.Settings = RigSettings("auto");
             Check("the level classification is unchanged", ShaderLibrary.IsNvidiaOnlyGame("fsr2") && ShaderLibrary.IsCudaFreeGame("fsr2") && !ShaderLibrary.IsCudaFreeGame("dlss") && !ShaderLibrary.IsCudaFreeGame("dlaa") && !ShaderLibrary.IsCudaFreeGame("off") && !ShaderLibrary.IsCudaFreeGame(null));
 
             GpuDetector.UseEnvironment(null);
+            UpscaleEngine.Fsr2Probe = UpscaleEngine.NewFsr2Probe();
             UpscaleEngine.EncoderListSource = null;
             UpscaleEngine.DrmVulkanProbeSource = null;
             UpscaleEngine.Av1QsvProbeSource = null;
@@ -1134,14 +1433,30 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
 
         // ---- PR 7: IntelHardwareDecode ------------------------------------------------------------
 
-        private const string SoftwareIntelArgs = " -init_hw_device drm=dr:/dev/dri/renderD128 -init_hw_device vulkan=vk@dr -filter_hw_device vk";
+        // The QSV device is pinned to the detected render node in every Intel command (PR 3's review: the
+        // encoder's own search is not trusted to pick the detector's node), software or hardware decode.
+        private const string QsvPin = " -init_hw_device qsv=qs:hw_any,child_device=/dev/dri/renderD128";
 
-        private const string HardwareIntelArgs = " -init_hw_device vaapi=va:/dev/dri/renderD128 -init_hw_device vulkan=vk@va -hwaccel vaapi -hwaccel_output_format vaapi -filter_hw_device vk";
+        private const string SoftwareIntelArgs = " -init_hw_device drm=dr:/dev/dri/renderD128 -init_hw_device vulkan=vk@dr" + QsvPin + " -filter_hw_device vk";
+
+        // The decode and map devices alone: what HardwareDecodeDeviceArgs and the start-up test command carry.
+        private const string HardwareIntelDeviceArgs = " -init_hw_device vaapi=va:/dev/dri/renderD128 -init_hw_device vulkan=vk@va -hwaccel vaapi -hwaccel_device va -hwaccel_output_format vaapi -filter_hw_device vk";
+
+        // What a session's command carries: the same, with the pinned QSV device after the Vulkan one.
+        private const string HardwareIntelArgs = " -init_hw_device vaapi=va:/dev/dri/renderD128 -init_hw_device vulkan=vk@va" + QsvPin + " -hwaccel vaapi -hwaccel_device va -hwaccel_output_format vaapi -filter_hw_device vk";
 
         private const string Vk0Args = " -init_hw_device vulkan=vk:0 -filter_hw_device vk";
 
+        private const string HardwareSourceReason = "software decode: the source is not upright 8-bit SDR progressive 4:2:0 h264 (Main or High) or hevc (Main)";
+
+        private const string PatchedBinary = "/usr/lib/jellyfin-ffmpeg-oidn/ffmpeg";
+
         // A 1280x720 session asking for 1080, whose video stream says what codec, depth and scan it is.
-        private static EncodingJobInfo HwJob(string codec, int? bitDepth, bool interlaced, string transfer, int? rotation, params string[] options)
+        // The profile and pixel format are the ones the gate admits for that codec.
+        private static EncodingJobInfo HwJob(string codec, int? bitDepth, bool interlaced, string transfer, int? rotation, params string[] options) =>
+            HwJobFull(codec, bitDepth, interlaced, transfer, rotation, string.Equals(codec, "hevc", StringComparison.OrdinalIgnoreCase) ? "Main" : "High", "yuv420p", options);
+
+        private static EncodingJobInfo HwJobFull(string codec, int? bitDepth, bool interlaced, string transfer, int? rotation, string profile, string pixelFormat, params string[] options)
         {
             var streamOptions = new Dictionary<string, string>();
             for (int i = 0; i < options.Length; i += 2)
@@ -1159,6 +1474,8 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
                     Height = 720,
                     Rotation = rotation,
                     Codec = codec,
+                    Profile = profile,
+                    PixelFormat = pixelFormat,
                     BitDepth = bitDepth,
                     IsInterlaced = interlaced,
                     ColorTransfer = transfer,
@@ -1188,9 +1505,10 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
         {
             UpscaleEngine.EncoderListSource = () => Encoders(FullList);
             UpscaleEngine.DrmVulkanProbeSource = n => true;
-            UpscaleEngine.Av1QsvProbeSource = () => true;
+            UpscaleEngine.Av1QsvProbeSource = _ => true;
             SetFilters("optix", "oidn", "ort", "fsr2", "dlss", "dlpp_rtcuda", "vsr_rtcuda", "libplacebo", "nlmeans_vulkan", "atadenoise", "deblock");
             string marker = Path.Combine(Rig(), "fsr2-nocuda");
+            UpscaleEngine.PatchedFfmpegSource = () => PatchedBinary;
             int calls = 0;
             bool? answer = true;
             UpscaleEngine.IntelHwDecodeProbeSource = node =>
@@ -1220,18 +1538,44 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
             Check("hardware decode: no hwupload and no format=yuv420p", !chain.Contains("hwupload") && !chain.Contains("yuv420p"), chain);
             Equal("hardware decode, literal plan: the chain",
                 "hwmap=derive_device=vulkan,libplacebo=w=1920:h=1080:upscaler=ewa_lanczos,hwdownload,format=nv12",
-                UpscaleEngine.BuildChain(new UpscaleEngine.Plan { Width = 1920, Height = 1080, UpscaleApplied = true, HardwareDecode = true }));
+                UpscaleEngine.BuildChain(new UpscaleEngine.Plan { Width = 1920, Height = 1080, UpscaleApplied = true, HardwareDecode = true, HardwareDecodeFormat = "nv12" }));
             Equal("hardware decode, literal plan with deband: the chain",
                 "hwmap=derive_device=vulkan,libplacebo=w=1920:h=1080:upscaler=ewa_lanczos:deband=1:deband_threshold=3:deband_grain=0,hwdownload,format=nv12",
-                UpscaleEngine.BuildChain(new UpscaleEngine.Plan { Width = 1920, Height = 1080, UpscaleApplied = true, DebandApplied = true, HardwareDecode = true }));
+                UpscaleEngine.BuildChain(new UpscaleEngine.Plan { Width = 1920, Height = 1080, UpscaleApplied = true, DebandApplied = true, HardwareDecode = true, HardwareDecodeFormat = "nv12" }));
             Equal("hardware decode, untagged range: tagged before the map",
                 "setparams=range=tv,hwmap=derive_device=vulkan,libplacebo=w=1920:h=1080:upscaler=ewa_lanczos,hwdownload,format=nv12",
-                UpscaleEngine.BuildChain(new UpscaleEngine.Plan { Width = 1920, Height = 1080, UpscaleApplied = true, RangeUntagged = true, HardwareDecode = true }));
+                UpscaleEngine.BuildChain(new UpscaleEngine.Plan { Width = 1920, Height = 1080, UpscaleApplied = true, RangeUntagged = true, HardwareDecode = true, HardwareDecodeFormat = "nv12" }));
+            Equal("the surface format of 8-bit 4:2:0 is nv12", "nv12", UpscaleEngine.HardwareSurfaceFormat("yuv420p"));
+            foreach (string other in new[] { "yuv420p10le", "yuv422p", "yuv444p", "p010le", "nv12", string.Empty, null })
+            {
+                Check("no surface format, so no hardware decode, for " + (other ?? "null"), UpscaleEngine.HardwareSurfaceFormat(other) == null);
+            }
+
+            Equal("the decided plan carries the derived format", "nv12", hw.HardwareDecodeFormat);
+            Check("a software plan carries no format", HwDecide(Machine("renderD128", "0x8086"), HwSettings(false), PlainHwJob("upscale", "1080")).HardwareDecodeFormat == null);
             Equal("the software chain with the same literal plan is the one it always was",
                 "format=yuv420p,hwupload,libplacebo=w=1920:h=1080:upscaler=ewa_lanczos,hwdownload,format=yuv420p",
                 UpscaleEngine.BuildChain(new UpscaleEngine.Plan { Width = 1920, Height = 1080, UpscaleApplied = true }));
-            Equal("the test command", "-hide_banner -loglevel error -init_hw_device vaapi=va:/dev/dri/renderD128 -init_hw_device vulkan=vk@va -filter_hw_device va -f lavfi -i testsrc=size=64x64:rate=1 -frames:v 1 -vf format=nv12,hwupload,hwmap=derive_device=vulkan,hwdownload,format=nv12 -f null -",
-                UpscaleEngine.HardwareDecodeProbeArgs("/dev/dri/renderD128"));
+
+            // The start-up test is the production command: same device arguments (decoder bound by name),
+            // a decode of a real clip, and the production chain with libplacebo on the mapped surfaces.
+            Equal("the device arguments, shared by the command and the test", HardwareIntelDeviceArgs, UpscaleEngine.HardwareDecodeDeviceArgs("/dev/dri/renderD128", string.Empty));
+            Equal("the device arguments carry the QSV device after the Vulkan one",
+                " -init_hw_device vaapi=va:/dev/dri/renderD128 -init_hw_device vulkan=vk@va -init_hw_device qsv=qs:hw_any,child_device=/dev/dri/renderD128 -hwaccel vaapi -hwaccel_device va -hwaccel_output_format vaapi -filter_hw_device vk",
+                UpscaleEngine.HardwareDecodeDeviceArgs("/dev/dri/renderD128", " -init_hw_device qsv=qs:hw_any,child_device=/dev/dri/renderD128"));
+            string testChain = UpscaleEngine.HardwareDecodeTestChain();
+            Equal("the test chain is the production hardware-decode chain",
+                "hwmap=derive_device=vulkan,libplacebo=w=512:h=288:upscaler=ewa_lanczos,hwdownload,format=nv12", testChain);
+            Equal("the test command", "-hide_banner -loglevel error" + HardwareIntelDeviceArgs + " -i \"/tmp/h264.mp4\" -vf \"" + testChain + "\" -frames:v 3 -f null -",
+                UpscaleEngine.HardwareDecodeTestArgs("/dev/dri/renderD128", "/tmp/h264.mp4", testChain));
+            Check("the test command decodes before it filters: no testsrc, no hwupload, no -filter_hw_device va",
+                !UpscaleEngine.HardwareDecodeTestArgs("/dev/dri/renderD128", "/tmp/h264.mp4", testChain).Contains("testsrc")
+                && !UpscaleEngine.HardwareDecodeTestArgs("/dev/dri/renderD128", "/tmp/h264.mp4", testChain).Contains("hwupload")
+                && !UpscaleEngine.HardwareDecodeTestArgs("/dev/dri/renderD128", "/tmp/h264.mp4", testChain).Contains("-filter_hw_device va"));
+            string h264Clip = UpscaleEngine.HardwareDecodeClipArgs("h264", "/tmp/h264.mp4");
+            string hevcClip = UpscaleEngine.HardwareDecodeClipArgs("hevc", "/tmp/hevc.mp4");
+            Check("the h264 clip is 8-bit 4:2:0 Main", h264Clip.Contains("-pix_fmt yuv420p") && h264Clip.Contains("-c:v libx264 -profile:v main") && h264Clip.EndsWith("-y \"/tmp/h264.mp4\""), h264Clip);
+            Check("the hevc clip is 8-bit 4:2:0 Main", hevcClip.Contains("-pix_fmt yuv420p") && hevcClip.Contains("-c:v libx265 -profile:v main") && hevcClip.EndsWith("-y \"/tmp/hevc.mp4\""), hevcClip);
 
             SessionRecord on = UpscaleEngine.Describe(null, hw, hw.Status, hw.Reason);
             Check("the record says hardware decode ran", on.HardwareDecode == true && on.HardwareDecodeReason == hw.HardwareDecodeReason);
@@ -1249,7 +1593,7 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
                 UpscaleEngine.Plan soft = HwDecide(Machine("renderD128", "0x8086"), HwSettings(true), PlainHwJob("upscale", "1080"));
                 string tag = " [test " + (result == null ? "inconclusive" : "failed") + "]";
                 Check("software decode" + tag, soft.Act && !soft.HardwareDecode, soft.HardwareDecodeReason);
-                Check("the reason names the test" + tag, soft.HardwareDecodeReason.StartsWith("software decode: the startup test-decode on /dev/dri/renderD128 ") && soft.HardwareDecodeReason.EndsWith(result == null ? "could not be run" : "failed"), soft.HardwareDecodeReason);
+                Check("the reason names the test" + tag, soft.HardwareDecodeReason.StartsWith("software decode: the startup test-decode of h264 on /dev/dri/renderD128 ") && soft.HardwareDecodeReason.EndsWith(result == null ? "could not be run" : "failed"), soft.HardwareDecodeReason);
                 Equal("the device arguments are the software ones" + tag, SoftwareIntelArgs, UpscaleEngine.HwaccelArgs(soft));
                 Check("the chain is the software chain" + tag, UpscaleEngine.BuildChain(soft).StartsWith("format=yuv420p") && UpscaleEngine.BuildChain(soft).Contains("hwupload"));
                 SessionRecord softRecord = UpscaleEngine.Describe(null, soft, soft.Status, soft.Reason);
@@ -1278,6 +1622,15 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
             foreach (var pair in blocked)
             {
                 calls = 0;
+                if (pair.Key == "game")
+                {
+                    // PR 6's review: fsr2 runs on Intel only once its start-up probe has passed, so it has to have.
+                    GpuDetector.UseEnvironment(marked);
+                    UpscaleEngine.Settings = HwSettings(true);
+                    UseFsr2Probe(Fsr2Passed);
+                    UpscaleEngine.StartFsr2Probe();
+                }
+
                 UpscaleEngine.Plan cpu = HwDecide(marked, HwSettings(true), PlainHwJob(pair.Value));
                 string tag = " [" + pair.Key + "]";
                 Check("a CPU-side step keeps software decode" + tag, cpu.Act && !cpu.HardwareDecode, cpu.Status + ": " + cpu.Reason + " / " + cpu.HardwareDecodeReason);
@@ -1286,6 +1639,8 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
                 Equal("the device arguments are the software ones" + tag, SoftwareIntelArgs, UpscaleEngine.HwaccelArgs(cpu));
                 Check("the chain is the software chain" + tag, UpscaleEngine.BuildChain(cpu).StartsWith("format=yuv420p"), UpscaleEngine.BuildChain(cpu));
             }
+
+            UpscaleEngine.Fsr2Probe = UpscaleEngine.NewFsr2Probe();
 
             // A GPU-side Vulkan denoise rides along only when the patched binary can compile it.
             UpscaleEngine.Plan vulkanDenoise = HwDecide(Machine("renderD128", "0x8086"), HwSettings(true), PlainHwJob("upscale", "1080", "denoise", "strong"));
@@ -1310,7 +1665,7 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
                 UpscaleEngine.Plan source = HwDecide(Machine("renderD128", "0x8086"), HwSettings(true), pair.Value);
                 string tag = " [" + pair.Key + "]";
                 Check("source keeps software decode" + tag, source.Act && !source.HardwareDecode, source.Status + ": " + source.Reason + " / " + source.HardwareDecodeReason);
-                Equal("the reason names the source" + tag, "software decode: the source is not upright 8-bit SDR progressive h264 or hevc", source.HardwareDecodeReason);
+                Equal("the reason names the source" + tag, HardwareSourceReason, source.HardwareDecodeReason);
                 Check("the test did not run" + tag, calls == 0, "calls " + calls);
                 Equal("the device arguments are the software ones" + tag, SoftwareIntelArgs, UpscaleEngine.HwaccelArgs(source));
             }
@@ -1333,7 +1688,8 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
             Check("off, Intel: the record has neither key", !offJson.Contains("HardwareDecode") && offRecord.HardwareDecode == null && offRecord.HardwareDecodeReason == null, offJson);
             Check("off, Intel: the summary does not mention it", !offRecord.Summary.Contains("VA-API") && !offRecord.Summary.Contains("software decode"), offRecord.Summary);
 
-            // Setting on but no Intel GPU that was seen: software, the command is the one the setting-off session gets.
+            // Setting on but no Intel GPU that was seen: nothing changes anywhere (null reason, no record keys,
+            // no probe key), so the command, the record and the probe are the setting-off ones.
             var others = new Dictionary<string, FakeGpuEnvironment[]>
             {
                 ["NVIDIA"] = new[] { Machine("renderD128", "0x10de") },
@@ -1347,18 +1703,217 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
                 UpscaleEngine.Plan noIntel = HwDecide(pair.Value[0], HwSettings(true), PlainHwJob("upscale", "1080"));
                 UpscaleEngine.Plan baseline = HwDecide(pair.Value[0], HwSettings(false), PlainHwJob("upscale", "1080"));
                 Check("on, no Intel path: still enhanced as with the setting off" + tag, noIntel.Act == baseline.Act, noIntel.Status + ": " + noIntel.Reason);
-                Check("on, no Intel path: software decode" + tag, !noIntel.HardwareDecode && (!noIntel.Act || noIntel.HardwareDecodeReason == "software decode: needs a detected Intel GPU"), noIntel.HardwareDecodeReason);
+                Check("on, no Intel path: software decode, and no reason" + tag, !noIntel.HardwareDecode && noIntel.HardwareDecodeReason == null, noIntel.HardwareDecodeReason);
                 Check("on, no Intel path: the test never ran" + tag, calls == 0);
+                SessionRecord baselineRecord = UpscaleEngine.Describe(null, baseline, baseline.Status, baseline.Reason);
+                SessionRecord noIntelRecord = UpscaleEngine.Describe(null, noIntel, noIntel.Status, noIntel.Reason);
+                baselineRecord.Timestamp = noIntelRecord.Timestamp = string.Empty;
+                Equal("on, no Intel path: the session record is the setting-off one" + tag, JsonSerializer.Serialize(baselineRecord), JsonSerializer.Serialize(noIntelRecord));
+                Check("on, no Intel path: the record has no HardwareDecode key" + tag, !JsonSerializer.Serialize(noIntelRecord).Contains("HardwareDecode"));
+                GpuDetector.UseEnvironment(pair.Value[0]);
+                UpscaleEngine.Settings = HwSettings(false);
+                string probeBaseline = Probe().GetRawText();
+                UpscaleEngine.Settings = HwSettings(true);
+                Equal("on, no Intel path: the probe is the setting-off one" + tag, probeBaseline, Probe().GetRawText());
+                Check("on, no Intel path: the probe has no IntelHardwareDecode key" + tag, !Keys(Probe()).Contains("IntelHardwareDecode"));
                 Equal("on, no Intel path: the device arguments are the setting-off ones" + tag, UpscaleEngine.HwaccelArgs(baseline), UpscaleEngine.HwaccelArgs(noIntel));
                 Equal("on, no Intel path: the chain is the setting-off one" + tag, UpscaleEngine.BuildChain(baseline), UpscaleEngine.BuildChain(noIntel));
                 Check("off, no Intel path: no reason" + tag, baseline.HardwareDecodeReason == null);
                 Check("off, no Intel path: the record has no new key" + tag, !JsonSerializer.Serialize(UpscaleEngine.Describe(null, baseline, baseline.Status, baseline.Reason)).Contains("HardwareDecode"));
             }
 
+            // The source gate by profile and chroma format: only 8-bit 4:2:0 h264 Main/High and hevc Main reach the
+            // GPU decoder; the rest would come back as software frames and kill the stream at the hwmap.
+            answer = true;
+            var gate = new (string Codec, string Profile, string Pixel, bool Hardware)[]
+            {
+                ("h264", "Main", "yuv420p", true),
+                ("h264", "High", "yuv420p", true),
+                ("hevc", "Main", "yuv420p", true),
+                ("H264", " high ", "YUV420P", true),
+                ("hevc", "MAIN", "yuv420p", true),
+                ("h264", "Baseline", "yuv420p", false),
+                ("h264", "Constrained Baseline", "yuv420p", false),
+                ("h264", "Extended", "yuv420p", false),
+                ("h264", "High 10", "yuv420p", false),
+                ("h264", "High 10", "yuv420p10le", false),
+                ("h264", "High 4:2:2", "yuv422p", false),
+                ("h264", "High 4:2:2", "yuv420p", false),
+                ("h264", "High 4:4:4 Predictive", "yuv444p", false),
+                ("h264", "High 4:4:4 Predictive", "yuv420p", false),
+                ("h264", "High", "yuv422p", false),
+                ("h264", "High", "yuv444p", false),
+                ("h264", "High", "yuvj420p", false),
+                ("h264", "Main", "yuvj420p", false),
+                ("hevc", "Main 10", "yuv420p10le", false),
+                ("hevc", "Main 10", "yuv420p", false),
+                ("hevc", "Rext", "yuv420p", false),
+                ("hevc", "Rext", "yuv422p", false),
+                ("hevc", "Rext", "yuv444p", false),
+                ("hevc", "Main Still Picture", "yuv420p", false),
+                ("hevc", "Main", "yuv422p", false),
+                ("hevc", "Main", "yuv444p", false),
+                ("hevc", "Main", "yuvj420p", false),
+                ("hevc", "High", "yuv420p", false),
+                ("h264", null, "yuv420p", false),
+                ("h264", string.Empty, "yuv420p", false),
+                ("hevc", null, "yuv420p", false),
+                ("h264", "High", null, false),
+                ("h264", "High", string.Empty, false),
+                ("hevc", "Main", null, false),
+            };
+            foreach (var row in gate)
+            {
+                calls = 0;
+                string tag = " [" + row.Codec + " / " + (row.Profile ?? "no profile") + " / " + (row.Pixel ?? "no pixel format") + "]";
+                UpscaleEngine.Plan p = HwDecide(Machine("renderD128", "0x8086"), HwSettings(true), HwJobFull(row.Codec, 8, false, "bt709", null, row.Profile, row.Pixel, "upscale", "1080"));
+                Check("the session is enhanced" + tag, p.Act, p.Status + ": " + p.Reason);
+                if (row.Hardware)
+                {
+                    Check("hardware decode" + tag, p.HardwareDecode, p.HardwareDecodeReason);
+                    Equal("the device arguments are the hardware ones" + tag, HardwareIntelArgs, UpscaleEngine.HwaccelArgs(p));
+                }
+                else
+                {
+                    Check("software decode" + tag, !p.HardwareDecode, p.HardwareDecodeReason);
+                    Equal("the reason is the source one" + tag, HardwareSourceReason, p.HardwareDecodeReason);
+                    Check("the test did not run" + tag, calls == 0, "calls " + calls);
+                    Equal("the device arguments are the software ones" + tag, SoftwareIntelArgs, UpscaleEngine.HwaccelArgs(p));
+                }
+            }
+
+            // The start-up test is read, never waited on, and a bad answer is not kept for the life of the process.
+            UpscaleEngine.IntelHwDecodeProbeSource = null;
+            var queued = new List<Action>();
+            DateTime clock = new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+            int runs = 0;
+            Func<UpscaleEngine.HwDecodeAnswer> next = () => new UpscaleEngine.HwDecodeAnswer(true, true);
+            UpscaleEngine.HardwareDecodeProbeFactory = n => new CachedProbe<UpscaleEngine.HwDecodeAnswer>(
+                () =>
+                {
+                    runs++;
+                    return next();
+                },
+                a => a.Conclusive,
+                UpscaleEngine.HardwareDecodeRetryAfter,
+                () => clock,
+                queued.Add);
+            Func<string, UpscaleEngine.Plan> decide = codec => HwDecide(Machine("renderD128", "0x8086"), HwSettings(true), HwJob(codec, 8, false, "bt709", null, "upscale", "1080"));
+            Action drain = () =>
+            {
+                Action[] work = queued.ToArray();
+                queued.Clear();
+                foreach (Action w in work)
+                {
+                    w();
+                }
+            };
+            const string Test264 = "software decode: the startup test-decode of h264 on /dev/dri/renderD128";
+
+            UpscaleEngine.ResetHardwareDecodeProbes();
+            UpscaleEngine.Plan cold = decide("h264");
+            Check("no answer yet: the session is enhanced in software", cold.Act && !cold.HardwareDecode, cold.HardwareDecodeReason);
+            Equal("no answer yet: the reason says so", Test264 + " has not finished", cold.HardwareDecodeReason);
+            Check("no answer yet: the probe was queued, not run, so the plan did not wait", queued.Count == 1 && runs == 0, "queued " + queued.Count + ", runs " + runs);
+            Equal("no answer yet: the command is the software one", SoftwareIntelArgs, UpscaleEngine.HwaccelArgs(cold));
+            decide("h264");
+            Check("a second session does not queue a second probe", queued.Count == 1 && runs == 0);
+            drain();
+            Check("the probe ran once", runs == 1, "runs " + runs);
+            Check("a passed test: both codecs decode on the GPU", decide("h264").HardwareDecode && decide("hevc").HardwareDecode);
+            clock = clock.AddDays(30);
+            Check("true is kept for life: no probe however late", decide("h264").HardwareDecode && queued.Count == 0 && runs == 1, "queued " + queued.Count + ", runs " + runs);
+
+            UpscaleEngine.ResetHardwareDecodeProbes();
+            runs = 0;
+            next = () => new UpscaleEngine.HwDecodeAnswer(false, false);
+            decide("h264");
+            drain();
+            Equal("a failed test: the reason says failed", Test264 + " failed", decide("h264").HardwareDecodeReason);
+            clock = clock.AddSeconds(59);
+            decide("h264");
+            Check("a failed test is not asked again inside the delay", queued.Count == 0 && runs == 1, "queued " + queued.Count + ", runs " + runs);
+            clock = clock.AddSeconds(2);
+            UpscaleEngine.Plan standing = decide("h264");
+            Check("after the delay it is asked again in the background while the last answer stands", queued.Count == 1 && !standing.HardwareDecode && standing.HardwareDecodeReason == Test264 + " failed", standing.HardwareDecodeReason);
+            next = () => new UpscaleEngine.HwDecodeAnswer(true, true);
+            drain();
+            Check("a later pass turns hardware decode on without a restart", decide("h264").HardwareDecode && runs == 2, "runs " + runs);
+
+            UpscaleEngine.ResetHardwareDecodeProbes();
+            next = () => throw new InvalidOperationException("probe broke");
+            decide("h264");
+            drain();
+            UpscaleEngine.Plan broke = decide("h264");
+            Check("a probe that throws is no answer: software decode, the session still enhanced", broke.Act && !broke.HardwareDecode && broke.HardwareDecodeReason == Test264 + " has not finished", broke.HardwareDecodeReason);
+            clock = clock.AddSeconds(61);
+            decide("h264");
+            next = () => new UpscaleEngine.HwDecodeAnswer(true, true);
+            drain();
+            Check("a throwing probe is retried and then passes", decide("h264").HardwareDecode);
+
+            UpscaleEngine.ResetHardwareDecodeProbes();
+            next = () => new UpscaleEngine.HwDecodeAnswer(null, null);
+            decide("h264");
+            drain();
+            Equal("a test that could not be run: the reason says so", Test264 + " could not be run", decide("h264").HardwareDecodeReason);
+
+            UpscaleEngine.ResetHardwareDecodeProbes();
+            next = () => new UpscaleEngine.HwDecodeAnswer(true, false);
+            decide("h264");
+            drain();
+            Check("the answer is per codec: h264 passed, so h264 decodes on the GPU", decide("h264").HardwareDecode);
+            UpscaleEngine.Plan hevcOnly = decide("hevc");
+            Check("the answer is per codec: hevc failed, so hevc stays in software", !hevcOnly.HardwareDecode && hevcOnly.HardwareDecodeReason == "software decode: the startup test-decode of hevc on /dev/dri/renderD128 failed", hevcOnly.HardwareDecodeReason);
+            Equal("...and its command is the software one", SoftwareIntelArgs, UpscaleEngine.HwaccelArgs(hevcOnly));
+
+            // The patched ffmpeg is looked up for every plan: a binary removed after start-up gives software decode.
+            UpscaleEngine.ResetHardwareDecodeProbes();
+            queued.Clear();
+            UpscaleEngine.PatchedFfmpegSource = () => null;
+            UpscaleEngine.Plan nobin = decide("h264");
+            Check("no patched ffmpeg: software decode with the reason", nobin.Act && !nobin.HardwareDecode && nobin.HardwareDecodeReason.StartsWith("software decode: the patched ffmpeg is not installed"), nobin.HardwareDecodeReason);
+            Check("no patched ffmpeg: no test was started", queued.Count == 0);
+            Equal("no patched ffmpeg: the command is the software one", SoftwareIntelArgs, UpscaleEngine.HwaccelArgs(nobin));
+            UpscaleEngine.PatchedFfmpegSource = () => PatchedBinary;
+
+            // Start-up: the probe is started in the background for an Intel node with the setting on, and nowhere else.
+            UpscaleEngine.ResetHardwareDecodeProbes();
+            queued.Clear();
+            runs = 0;
+            GpuDetector.UseEnvironment(Machine("renderD128", "0x8086"));
+            UpscaleEngine.Settings = HwSettings(true);
+            UpscaleEngine.PrimeHardwareDecode();
+            Check("start-up: an Intel node with the setting on queues the probe without running it", queued.Count == 1 && runs == 0, "queued " + queued.Count + ", runs " + runs);
+            UpscaleEngine.ResetHardwareDecodeProbes();
+            queued.Clear();
+            UpscaleEngine.Settings = HwSettings(false);
+            UpscaleEngine.PrimeHardwareDecode();
+            Check("start-up: the setting off starts nothing", queued.Count == 0);
+            GpuDetector.UseEnvironment(Machine("renderD128", "0x10de"));
+            UpscaleEngine.Settings = HwSettings(true);
+            UpscaleEngine.PrimeHardwareDecode();
+            Check("start-up: an NVIDIA server starts nothing", queued.Count == 0);
+            UpscaleEngine.HardwareDecodeProbeFactory = null;
+            UpscaleEngine.ResetHardwareDecodeProbes();
+            answer = true;
+            UpscaleEngine.IntelHwDecodeProbeSource = node =>
+            {
+                calls++;
+                return answer;
+            };
+
+            // Jellyfin's own kept nodes: before the chain in software decode, after its download under hardware decode.
+            var keptNodes = new List<string> { "setparams=color_primaries=bt709", "setparams=color_trc=bt709" };
+            Equal("software decode: kept nodes lead", "setparams=color_primaries=bt709,setparams=color_trc=bt709,CHAIN", UpscaleEngine.JoinChain(new UpscaleEngine.Plan(), "CHAIN", keptNodes));
+            Equal("hardware decode: kept nodes follow the download", "CHAIN,setparams=color_primaries=bt709,setparams=color_trc=bt709", UpscaleEngine.JoinChain(new UpscaleEngine.Plan { HardwareDecode = true }, "CHAIN", keptNodes));
+            Equal("software decode, nothing kept: the chain alone", "CHAIN", UpscaleEngine.JoinChain(new UpscaleEngine.Plan(), "CHAIN", new List<string>()));
+            Equal("hardware decode, nothing kept: the chain alone", "CHAIN", UpscaleEngine.JoinChain(new UpscaleEngine.Plan { HardwareDecode = true }, "CHAIN", new List<string>()));
+
             // Two GPUs with Intel chosen: the Intel node, not the first or the NVIDIA one.
             UpscaleEngine.Plan chosen = HwDecide(Machine("renderD128", "0x10de", "renderD129", "0x8086"), HwSettings(true, "intel"), PlainHwJob("upscale", "1080"));
             Check("two GPUs, intel chosen: hardware decode", chosen.HardwareDecode, chosen.HardwareDecodeReason);
-            Equal("two GPUs, intel chosen: the Intel node", " -init_hw_device vaapi=va:/dev/dri/renderD129 -init_hw_device vulkan=vk@va -hwaccel vaapi -hwaccel_output_format vaapi -filter_hw_device vk", UpscaleEngine.HwaccelArgs(chosen));
+            Equal("two GPUs, intel chosen: the Intel node", " -init_hw_device vaapi=va:/dev/dri/renderD129 -init_hw_device vulkan=vk@va -init_hw_device qsv=qs:hw_any,child_device=/dev/dri/renderD129 -hwaccel vaapi -hwaccel_device va -hwaccel_output_format vaapi -filter_hw_device vk", UpscaleEngine.HwaccelArgs(chosen));
 
             // The probe: no new key until the setting is on.
             GpuDetector.UseEnvironment(Machine("renderD128", "0x8086"));
@@ -1376,6 +1931,9 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
             GpuDetector.UseEnvironment(null);
             UpscaleEngine.Settings = new UpscaleSettings();
             UpscaleEngine.IntelHwDecodeProbeSource = null;
+            UpscaleEngine.PatchedFfmpegSource = null;
+            UpscaleEngine.HardwareDecodeProbeFactory = null;
+            UpscaleEngine.ResetHardwareDecodeProbes();
             UpscaleEngine.EncoderListSource = null;
             UpscaleEngine.DrmVulkanProbeSource = null;
             UpscaleEngine.Av1QsvProbeSource = null;
@@ -1447,7 +2005,8 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
         {
             UpscaleEngine.EncoderListSource = () => Encoders(FullList);
             UpscaleEngine.DrmVulkanProbeSource = n => true;
-            UpscaleEngine.Av1QsvProbeSource = () => true;
+            UpscaleEngine.Av1QsvProbeSource = _ => true;
+            UpscaleEngine.OrtOpenVinoProbeSource = () => true;
             SetFilters("optix", "oidn", "ort", "fsr2", "dlss", "libplacebo", "nlmeans_vulkan");
 
             string golden = "format=gbrpf32le,ort=model=" + X2() + ",format=yuv420p";
@@ -1507,8 +2066,16 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
             Check("mixed box, intel chosen, provider present: openvino", mixedIntel.NeuralDevice == "openvino" && mixedIntel.NeuralFilter.Contains(":device=openvino,"));
 
             // Nothing neural ran: no device, no note, nothing in the record.
+            int probeCalls = 0;
+            UpscaleEngine.OrtOpenVinoProbeSource = () => { probeCalls++; return true; };
             UpscaleEngine.Plan plain = DecideOn(NeuralMachine(true, "renderD128", "0x8086"), NeuralSettings("auto", 0), 1280, 720, "upscale", "1080");
             Check("Intel, no neural level: no device and no note", !plain.NeuralApplied && plain.NeuralDevice == null && plain.NeuralDeviceNote == null);
+            Equal("Intel, no neural level, no routing: the OpenVINO probe is not asked", "0", probeCalls.ToString());
+            DecideOn(NeuralMachine(true, "renderD128", "0x8086"), NeuralSettings("auto", 0), 1280, 720, ask);
+            Equal("Intel, a neural level named: the probe is asked", "1", probeCalls.ToString());
+            DecideOn(NeuralMachine(true, "renderD128", "0x8086"), NeuralSettings("auto", 480), 640, 360, "upscale", "1080");
+            Equal("Intel, NeuralMaxSourceHeight set: the probe is asked", "2", probeCalls.ToString());
+            UpscaleEngine.OrtOpenVinoProbeSource = () => true;
             SessionRecord plainRecord = UpscaleEngine.Describe(null, plain, plain.Status, plain.Reason);
             Check("Intel, no neural level: the record has no device", plainRecord.NeuralDevice == null && plainRecord.NeuralDeviceNote == null && plainRecord.NeuralRouting == null);
 
@@ -1528,7 +2095,80 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
             UpscaleEngine.Plan dlpp = DecideOn(NeuralMachine(false, "renderD128", "0x10de"), rig, 1280, 720, "upscale", "1080", "neural", "dlpp-2");
             Check("NVIDIA, dlpp-2: CUDA-native, no ort device", dlpp.UsesCudaNeural && dlpp.NeuralDevice == null);
 
+            // The provider file is there, but the patched ffmpeg has to list the device too. The real probe runs
+            // here against a stub binary beside the model directory, with no seam: one that lists openvino, one that does not.
+            UpscaleEngine.OrtOpenVinoProbeSource = null;
+            UpscaleEngine.ResetOrtProbe();
+            string openvinoNode = "format=gbrpf32le,ort=model=" + X2() + ":device=openvino,format=yuv420p";
+            string cpuNode = "format=gbrpf32le,ort=model=" + X2() + ":device=cpu,format=yuv420p";
+
+            StubFfmpeg(listsOpenVino: false);
+            UpscaleEngine.Plan cold = DecideOn(NeuralMachine(true, "renderD128", "0x8086"), NeuralSettings("auto", 0), 1280, 720, ask);
+            Equal("Intel, provider present, probe not answered yet: the node asks for cpu, not openvino", cpuNode, cold.NeuralFilter);
+            Check("Intel, provider present, probe not answered yet: the note says it is not confirmed",
+                cold.NeuralDevice == "cpu" && cold.NeuralDeviceNote != null && cold.NeuralDeviceNote.Contains("has not been confirmed"), cold.NeuralDeviceNote);
+            UpscaleEngine.WarmOrtProbe().Wait();
+
+            UpscaleEngine.Plan stale = DecideOn(NeuralMachine(true, "renderD128", "0x8086"), NeuralSettings("auto", 0), 1280, 720, ask);
+            Equal("Intel, provider present, binary without openvino: the node asks for cpu", cpuNode, stale.NeuralFilter);
+            Check("Intel, provider present, binary without openvino: the note says rebuild with ORT_EP=openvino",
+                stale.NeuralDevice == "cpu" && stale.NeuralDeviceNote != null && stale.NeuralDeviceNote.Contains("no openvino device") && stale.NeuralDeviceNote.Contains("ORT_EP=openvino"), stale.NeuralDeviceNote);
+            SessionRecord staleRecord = UpscaleEngine.Describe(null, stale, stale.Status, stale.Reason);
+            Check("Intel, binary without openvino: the summary says CPU provider and why", staleRecord.Summary.Contains("the CPU provider (the patched ffmpeg's ort filter has no openvino device"), staleRecord.Summary);
+            UpscaleEngine.Plan staleRouted = DecideOn(NeuralMachine(true, "renderD128", "0x8086"), NeuralSettings("auto", 480), 640, 360, "upscale", "1080");
+            Check("Intel, binary without openvino, 480, 360p: no network is chosen, and it says why",
+                staleRouted.Act && !staleRouted.NeuralApplied && staleRouted.NeuralRouting != null
+                && staleRouted.NeuralRouting.Contains("no neural level was chosen") && staleRouted.NeuralRouting.Contains("no openvino device") && staleRouted.NeuralRouting.Contains("far from real time"), staleRouted.NeuralRouting);
+            UpscaleEngine.Plan nvidiaStale = DecideOn(NeuralMachine(true, "renderD128", "0x10de"), NeuralSettings("auto", 0), 1280, 720, ask);
+            Equal("NVIDIA, binary without openvino: the node is the one it always was", golden, nvidiaStale.NeuralFilter);
+
+            StubFfmpeg(listsOpenVino: true);
+            UpscaleEngine.ResetOrtProbe();
+            UpscaleEngine.WarmOrtProbe().Wait();
+            UpscaleEngine.Plan fresh = DecideOn(NeuralMachine(true, "renderD128", "0x8086"), NeuralSettings("auto", 0), 1280, 720, ask);
+            Equal("Intel, provider present, binary lists openvino: the node asks for openvino", openvinoNode, fresh.NeuralFilter);
+            Check("Intel, provider present, binary lists openvino: no note", fresh.NeuralDevice == "openvino" && fresh.NeuralDeviceNote == null);
+
+            // Without the provider file the binary is not asked at all: the CPU, for the provider reason.
+            UpscaleEngine.Plan noProvider = DecideOn(NeuralMachine(false, "renderD128", "0x8086"), NeuralSettings("auto", 0), 1280, 720, ask);
+            Check("Intel, no provider file, binary lists openvino: still cpu, for the provider reason", noProvider.NeuralDevice == "cpu" && noProvider.NeuralDeviceNote.Contains("OpenVINO provider (ort/lib/libonnxruntime_providers_openvino.so) is not installed"));
+
+            // A binary that takes seconds to answer: the session is planned at once on the CPU, with
+            // the probe left running in the background, and the answer is used once it lands.
+            StubFfmpeg(listsOpenVino: true, delaySeconds: 5);
+            UpscaleEngine.ResetOrtProbe();
+            var clock = System.Diagnostics.Stopwatch.StartNew();
+            UpscaleEngine.Plan slow = DecideOn(NeuralMachine(true, "renderD128", "0x8086"), NeuralSettings("auto", 0), 1280, 720, ask);
+            clock.Stop();
+            Check("Intel, slow probe, cold cache: the plan does not wait for the binary (" + clock.ElapsedMilliseconds + " ms)", clock.ElapsedMilliseconds < 2000);
+            Equal("Intel, slow probe, cold cache: the node asks for cpu", cpuNode, slow.NeuralFilter);
+            Check("Intel, slow probe, cold cache: the note says it is not confirmed", slow.NeuralDevice == "cpu" && slow.NeuralDeviceNote != null && slow.NeuralDeviceNote.Contains("has not been confirmed"), slow.NeuralDeviceNote);
+            UpscaleEngine.WarmOrtProbe().Wait();
+            UpscaleEngine.Plan slowDone = DecideOn(NeuralMachine(true, "renderD128", "0x8086"), NeuralSettings("auto", 0), 1280, 720, ask);
+            Equal("Intel, slow probe answered: the node asks for openvino", openvinoNode, slowDone.NeuralFilter);
+
             ResetNeuralHarness();
+        }
+
+        // A stand-in patched ffmpeg beside the model directory (where PatchedFfmpegPath looks) whose
+        // `-h filter=ort` prints the device list with or without openvino, after an optional delay.
+        // Moved into place, not written in place, so a process is never started from a file that is
+        // still open for writing.
+        private static void StubFfmpeg(bool listsOpenVino, int delaySeconds = 0)
+        {
+            string path = Path.Combine(NeuralRig(), "ffmpeg");
+            string temp = path + ".tmp";
+            string script = "#!/bin/sh\n"
+                + (delaySeconds > 0 ? "sleep " + delaySeconds + "\n" : string.Empty)
+                + "echo 'Filter ort'\n"
+                + "echo '  device <int> ..FV...... which device to run on (from 0 to 2) (default cuda)'\n"
+                + "echo '     cuda            0'\n"
+                + "echo '     cpu             1'\n"
+                + (listsOpenVino ? "echo '     openvino        2'\n" : string.Empty)
+                + "exit 0\n";
+            File.WriteAllText(temp, script);
+            File.SetUnixFileMode(temp, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+            File.Move(temp, path, overwrite: true);
         }
 
         private static void ResetNeuralHarness()
@@ -1537,7 +2177,82 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
             UpscaleEngine.EncoderListSource = null;
             UpscaleEngine.DrmVulkanProbeSource = null;
             UpscaleEngine.Av1QsvProbeSource = null;
+            UpscaleEngine.OrtOpenVinoProbeSource = null;
+            UpscaleEngine.ResetOrtProbe();
+            File.Delete(Path.Combine(NeuralRig(), "ffmpeg"));
             UpscaleEngine.Settings = new UpscaleSettings();
+        }
+
+        // The auto-picked level is looked up once per directory per TTL, not stat'ed on every plan.
+        private static void AutoNeuralCache()
+        {
+            int stats = 0;
+            var present = new HashSet<string>(StringComparer.Ordinal);
+            long now = 1000;
+            ShaderLibrary.WeightFileExistsSource = p => { stats++; return present.Contains(p); };
+            ShaderLibrary.AutoNeuralClockSource = () => now;
+            ShaderLibrary.ResetAutoNeuralCache();
+            try
+            {
+                var cfg = new UpscaleSettings { NeuralModelDirectory = "/nonexistent/auto-neural-cache-rig" };
+                present.Add(ShaderLibrary.NeuralModelPath("realesr-general-x4", cfg));
+
+                string first = ShaderLibrary.AutoNeuralLevel(cfg);
+                int afterFirst = stats;
+                Check("auto neural cache: the first lookup stats the weights and picks the cheapest installed", first == "realesr-general-x4" && afterFirst > 0, first + " stats=" + afterFirst);
+
+                for (int i = 0; i < 50; i++)
+                {
+                    ShaderLibrary.AutoNeuralLevel(cfg);
+                }
+
+                Check("auto neural cache: 50 further lookups inside the TTL stat nothing", stats == afterFirst, "stats=" + stats + " first=" + afterFirst);
+
+                present.Add(ShaderLibrary.NeuralModelPath("realesr-anime-x2", cfg));
+                Equal("auto neural cache: a weight installed inside the TTL is not seen yet", "realesr-general-x4", ShaderLibrary.AutoNeuralLevel(cfg));
+
+                now += 31000;
+                Equal("auto neural cache: past the TTL it looks again and sees it", "realesr-anime-x2", ShaderLibrary.AutoNeuralLevel(cfg));
+                Check("auto neural cache: past the TTL it did stat again", stats > afterFirst);
+
+                int before = stats;
+                var other = new UpscaleSettings { NeuralModelDirectory = "/nonexistent/auto-neural-cache-other" };
+                Check("auto neural cache: another directory is its own entry (none installed there)", ShaderLibrary.AutoNeuralLevel(other) == null && stats > before);
+
+                // Through the engine: planning a small source repeatedly stats the weights once.
+                before = stats;
+                UpscaleEngine.EncoderListSource = () => Encoders(FullList);
+                UpscaleEngine.DrmVulkanProbeSource = n => true;
+                UpscaleEngine.Av1QsvProbeSource = _ => true;
+                UpscaleEngine.OrtOpenVinoProbeSource = () => true;
+                SetFilters("optix", "oidn", "ort", "fsr2", "dlss", "dlpp_rtcuda", "vsr_rtcuda", "libplacebo", "nlmeans_vulkan");
+                var routed = new UpscaleSettings { Encoder = "auto", GpuVendor = "auto", NeuralMaxSourceHeight = 480, NeuralModelDirectory = "/nonexistent/auto-neural-cache-rig" };
+                // A session that names the level never goes through the auto pick, so its stat count is
+                // the cost of planning alone; an auto-picked session must cost exactly the same.
+                DecideOn(NeuralMachine(false, "renderD128", "0x10de"), routed, 640, 360, "upscale", "1080", "neural", "realesr-anime-x2");
+                int named = stats - before;
+                bool flat = true;
+                UpscaleEngine.Plan p = null;
+                for (int i = 0; i < 20; i++)
+                {
+                    before = stats;
+                    p = DecideOn(NeuralMachine(false, "renderD128", "0x10de"), routed, 640, 360, "upscale", "1080");
+                    flat &= stats - before == named;
+                }
+
+                Check("auto neural cache: an auto-picked Decide stats no more files than one that names the level", flat && p.NeuralLevel == "realesr-anime-x2" && p.NeuralRouting != null && p.NeuralRouting.Contains("was chosen"), "named=" + named + " last=" + (stats - before) + " " + p.NeuralRouting);
+            }
+            finally
+            {
+                ShaderLibrary.WeightFileExistsSource = null;
+                ShaderLibrary.AutoNeuralClockSource = null;
+                ShaderLibrary.ResetAutoNeuralCache();
+                UpscaleEngine.EncoderListSource = null;
+                UpscaleEngine.DrmVulkanProbeSource = null;
+                UpscaleEngine.Av1QsvProbeSource = null;
+                UpscaleEngine.OrtOpenVinoProbeSource = null;
+                UpscaleEngine.Settings = new UpscaleSettings();
+            }
         }
 
         // NeuralMaxSourceHeight: what it does for each source height, and that 0 does nothing.
@@ -1545,7 +2260,8 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
         {
             UpscaleEngine.EncoderListSource = () => Encoders(FullList);
             UpscaleEngine.DrmVulkanProbeSource = n => true;
-            UpscaleEngine.Av1QsvProbeSource = () => true;
+            UpscaleEngine.Av1QsvProbeSource = _ => true;
+            UpscaleEngine.OrtOpenVinoProbeSource = () => true;
             SetFilters("optix", "oidn", "ort", "fsr2", "dlss", "dlpp_rtcuda", "vsr_rtcuda", "libplacebo", "nlmeans_vulkan");
 
             Equal("the setting defaults to 0 in the patcher mirror", "0", new UpscaleSettings().NeuralMaxSourceHeight.ToString());
@@ -1674,6 +2390,327 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
             ResetNeuralHarness();
         }
 
+        private static bool WaitUntil(Func<bool> condition)
+        {
+            for (int i = 0; i < 100 && !condition(); i++)
+            {
+                System.Threading.Thread.Sleep(20);
+            }
+
+            return condition();
+        }
+
+        // Review items 1 and 2: the AV1 test encode and the encoder list are read off the request
+        // path, with a time-to-live on every answer but a usable one's, pinned to the render node.
+        private static void IntelProbes()
+        {
+            string reason;
+            DateTime now = new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+            UpscaleEngine.Clock = () => now;
+            int runs = 0;
+            string seenNode = null;
+            bool? answer = false;
+            var gate = new System.Threading.ManualResetEventSlim(false);
+            UpscaleEngine.Av1QsvRunner = node =>
+            {
+                System.Threading.Interlocked.Increment(ref runs);
+                seenNode = node;
+                gate.Wait(5000);
+                return answer;
+            };
+
+            OnIntel("auto", "auto", FullList);
+            UpscaleEngine.Av1QsvProbeSource = null;
+            UpscaleEngine.ResetAv1QsvProbe();
+
+            var timer = System.Diagnostics.Stopwatch.StartNew();
+            string first = UpscaleEngine.GuardAv1(Job("av1", "av1", "hevc"), "av1_qsv", out reason);
+            timer.Stop();
+            Check("AV1 guard returns while the probe is still running", timer.ElapsedMilliseconds < 1000 && !UpscaleEngine.Av1QsvProbeTask.IsCompleted, timer.ElapsedMilliseconds + " ms");
+            Equal("no answer yet: av1_qsv is guarded as before (hevc_qsv), not left to fail at open", "hevc_qsv", first);
+            Check("no answer yet: the reason says the test encode has not finished", reason != null && reason.Contains("has not finished yet"), reason);
+            Equal("no answer yet, the session cannot take HEVC: h264_qsv", "h264_qsv", UpscaleEngine.GuardAv1(Job("av1", "av1", "h264"), "av1_qsv", out reason));
+            Equal("no answer yet: another encoder is untouched", "hevc_qsv", UpscaleEngine.GuardAv1(Job("av1", "av1", "hevc"), "hevc_qsv", out reason));
+            Check("no answer yet: ...and has no reason", reason == null);
+            Check("the probe started in the background", WaitUntil(() => runs == 1));
+            UpscaleEngine.GuardAv1(Job("av1", "av1", "hevc"), "av1_qsv", out reason);
+            UpscaleEngine.GuardAv1(Job("av1", "av1", "hevc"), "av1_qsv", out reason);
+            System.Threading.Thread.Sleep(50);
+            Equal("a probe in flight is not started twice", "1", runs.ToString());
+            Equal("the probe is pinned to the detected render node", "/dev/dri/renderD128", seenNode);
+
+            gate.Set();
+            Check("the probe finishes", UpscaleEngine.Av1QsvProbeTask.Wait(5000));
+            Equal("a failed probe swaps to hevc_qsv", "hevc_qsv", UpscaleEngine.GuardAv1(Job("av1", "av1", "hevc"), "av1_qsv", out reason));
+            Check("a failed probe: the reason is the test-encode failure, not 'not finished'", reason != null && reason.StartsWith("a test encode with av1_qsv failed"), reason);
+            Equal("a failed probe is not re-run inside its time-to-live", "1", runs.ToString());
+
+            now += UpscaleEngine.Av1QsvFailedTtl - TimeSpan.FromSeconds(1);
+            UpscaleEngine.GuardAv1(Job("av1", "av1", "hevc"), "av1_qsv", out reason);
+            UpscaleEngine.Av1QsvProbeTask.Wait(5000);
+            Equal("...still not one second before it lapses", "1", runs.ToString());
+
+            now += TimeSpan.FromSeconds(2);
+            answer = true;
+            Equal("past the failure time-to-live the stale answer is served while it re-asks", "hevc_qsv", UpscaleEngine.GuardAv1(Job("av1", "av1", "hevc"), "av1_qsv", out reason));
+            Check("a failure is asked again", WaitUntil(() => runs == 2));
+            UpscaleEngine.Av1QsvProbeTask.Wait(5000);
+            Equal("the GPU recovered: av1_qsv is kept", "av1_qsv", UpscaleEngine.GuardAv1(Job("av1", "av1", "hevc"), "av1_qsv", out reason));
+
+            now += UpscaleEngine.Av1QsvFailedTtl + TimeSpan.FromMinutes(1);
+            UpscaleEngine.GuardAv1(Job("av1", "av1", "hevc"), "av1_qsv", out reason);
+            UpscaleEngine.Av1QsvProbeTask.Wait(5000);
+            Equal("a usable answer outlives the failure time-to-live", "2", runs.ToString());
+            now += UpscaleEngine.Av1QsvUsableTtl;
+            UpscaleEngine.GuardAv1(Job("av1", "av1", "hevc"), "av1_qsv", out reason);
+            Check("a usable answer is re-checked eventually", WaitUntil(() => runs == 3));
+            UpscaleEngine.Av1QsvProbeTask.Wait(5000);
+
+            // An inconclusive probe (null, e.g. a timeout) is cached briefly, not forever and not never.
+            UpscaleEngine.ResetAv1QsvProbe();
+            runs = 0;
+            answer = null;
+            UpscaleEngine.GuardAv1(Job("av1", "av1", "hevc"), "av1_qsv", out reason);
+            UpscaleEngine.Av1QsvProbeTask.Wait(5000);
+            Equal("an inconclusive probe leaves av1_qsv alone", "av1_qsv", UpscaleEngine.GuardAv1(Job("av1", "av1", "hevc"), "av1_qsv", out reason));
+            Equal("an inconclusive probe is not re-run at once", "1", runs.ToString());
+            now += UpscaleEngine.Av1QsvUnknownTtl + TimeSpan.FromSeconds(1);
+            answer = false;
+            UpscaleEngine.GuardAv1(Job("av1", "av1", "hevc"), "av1_qsv", out reason);
+            Check("an inconclusive probe is asked again after its short time-to-live", WaitUntil(() => runs == 2));
+            UpscaleEngine.Av1QsvProbeTask.Wait(5000);
+            Equal("...and the later answer is used", "hevc_qsv", UpscaleEngine.GuardAv1(Job("av1", "av1", "hevc"), "av1_qsv", out reason));
+
+            // The test encode's arguments: the same QSV device a session opens (DeviceInit.QsvArgs),
+            // so the probe tries the GPU the chain will use and not whichever one ffmpeg finds first.
+            Equal("probe arguments without a QSV device (as before)",
+                "-hide_banner -loglevel error -f lavfi -i color=c=black:s=640x360:r=1 -frames:v 1 -vf format=nv12 -c:v av1_qsv -f null -",
+                UpscaleEngine.Av1QsvProbeArgs(new UpscaleEngine.DeviceInit()));
+            Equal("probe arguments with the render node",
+                "-hide_banner -loglevel error -init_hw_device qsv=qs:hw_any,child_device=/dev/dri/renderD129 -f lavfi -i color=c=black:s=640x360:r=1 -frames:v 1 -vf format=nv12 -c:v av1_qsv -f null -",
+                UpscaleEngine.Av1QsvProbeArgs(new UpscaleEngine.DeviceInit { Intel = true, QsvArgs = " -init_hw_device qsv=qs:hw_any,child_device=/dev/dri/renderD129" }));
+
+            // The record and the load route read the encoder list without asking ffmpeg for it.
+            // On a COLD cache (nothing probed, nothing remembered), so the test does not lean on an
+            // earlier test having left the list behind: any path that asked ffmpeg would count.
+            UpscaleEngine.EncoderListSource = null;
+            UpscaleEngine.ResetEncoderProbe();
+            string family = UpscaleEngine.Capability().EncoderFamily;
+            UpscaleEngine.Capability();
+            Equal("Capability() on a cold cache does not read the encoder list from ffmpeg", "0", UpscaleEngine.EncoderProbeRuns.ToString());
+            Equal("...and reports the unresolved family until it is warmed", "qsv", family);
+            PatcherHost.GpuJson();
+            Equal("PatcherHost.GpuJson (the load route's source) on a cold cache does not read it either", "0", UpscaleEngine.EncoderProbeRuns.ToString());
+
+            // The warm-up is what reads it: on the same cold cache, WarmProbes is the one call that asks ffmpeg.
+            Check("warm-up on a cold cache completes", UpscaleEngine.WarmProbes().Wait(20000));
+            Equal("...and it read the encoder list from ffmpeg once", "1", UpscaleEngine.EncoderProbeRuns.ToString());
+            UpscaleEngine.Av1QsvProbeTask?.Wait(5000);
+
+            // The warm-up reads the list (off the caller) and starts the probe only when av1_qsv is listed.
+            UpscaleEngine.ResetAv1QsvProbe();
+            runs = 0;
+            answer = true;
+            UpscaleEngine.EncoderListSource = () => Encoders("hevc_qsv", "libx265");
+            Check("warm-up completes", UpscaleEngine.WarmProbes().Wait(20000));
+            UpscaleEngine.Av1QsvProbeTask.Wait(5000);
+            Equal("warm-up: no av1_qsv listed, no AV1 test encode", "0", runs.ToString());
+            UpscaleEngine.EncoderListSource = () => Encoders(FullList);
+            Check("warm-up completes (av1_qsv listed)", UpscaleEngine.WarmProbes().Wait(20000));
+            Check("warm-up: av1_qsv listed, the AV1 test encode runs", WaitUntil(() => runs == 1));
+            UpscaleEngine.Av1QsvProbeTask.Wait(5000);
+            GpuDetector.UseEnvironment(Machine("renderD128", "0x10de"));
+            UpscaleEngine.ResetAv1QsvProbe();
+            runs = 0;
+            Check("warm-up completes (NVIDIA)", UpscaleEngine.WarmProbes().Wait(20000));
+            System.Threading.Thread.Sleep(50);
+            Equal("warm-up on NVIDIA starts no Intel probe", "0", runs.ToString());
+
+            GpuDetector.UseEnvironment(null);
+            UpscaleEngine.EncoderListSource = null;
+            UpscaleEngine.Av1QsvProbeSource = null;
+            UpscaleEngine.Av1QsvRunner = null;
+            UpscaleEngine.Clock = null;
+            UpscaleEngine.ResetAv1QsvProbe();
+        }
+
+        // Review item 3: a Jellyfin VA-API command line whose encoder was swapped to QSV or software
+        // keeps none of the VA-API-only options. The line is reconstructed from Jellyfin's
+        // EncodingHelper source (see the fixture), not captured from a running server.
+        private static void VaapiStrip()
+        {
+            string line = Fixture("jellyfin-vaapi-commandline.txt").Trim();
+            string swapped = line.Replace("-codec:v:0 hevc_vaapi", "-codec:v:0 hevc_qsv");
+            string stripped = UpscaleEngine.StripVaapiOnlyArguments(swapped);
+
+            Check("strip: the VA-API device is gone", !stripped.Contains("-init_hw_device") && !stripped.Contains("-filter_hw_device") && !stripped.Contains("-hwaccel_device"), stripped);
+            Check("strip: the VA-API decode arguments are gone", !stripped.Contains("-hwaccel vaapi") && !stripped.Contains("-hwaccel_output_format"), stripped);
+            Check("strip: the VA-API encoder options are gone", !stripped.Contains("-rc_mode") && !stripped.Contains("-sei") && !stripped.Contains("-a53_cc"), stripped);
+            Check("strip: the encoder, bitrate, profile and GOP are kept", stripped.Contains("-codec:v:0 hevc_qsv -b:v 8000000 -maxrate 8000000 -bufsize 16000000 -profile:v:0 main -level 153 -g:v:0 72 -keyint_min:v:0 72"), stripped);
+            Check("strip: the input with its spaces and quotes is kept whole", stripped.Contains("-i file:\"/media/Movie (2020)/Movie.mkv\" "), stripped);
+            Check("strip: the filter chain is left to the filter hook", stripped.Contains("scale_vaapi=w=1920:h=1080"), stripped);
+            Check("strip: the audio and the HLS output are kept", stripped.Contains("-codec:a:0 aac -ac 2 -b:a 384000 -f hls") && stripped.EndsWith("abc.m3u8\""), stripped);
+            Check("strip: no double spaces are left behind", !stripped.Contains("  "), stripped);
+            Equal("strip: the same result for a software encoder", stripped.Replace("hevc_qsv", "libx265"),
+                UpscaleEngine.StripVaapiOnlyArguments(line.Replace("-codec:v:0 hevc_vaapi", "-codec:v:0 libx265")));
+
+            Equal("strip: a line still naming a VA-API encoder is returned as it was", line, UpscaleEngine.StripVaapiOnlyArguments(line));
+
+            string qsvNative = "-init_hw_device vaapi=va:/dev/dri/renderD128 -init_hw_device qsv=qs@va -filter_hw_device qs -hwaccel qsv -hwaccel_output_format qsv -i file:\"/m.mkv\" -codec:v:0 h264_qsv -b:v 4000000 out.m3u8";
+            Equal("strip: a line that opens a QSV device is returned as it was", qsvNative, UpscaleEngine.StripVaapiOnlyArguments(qsvNative));
+
+            string software = "-i file:\"/m.mkv\" -codec:v:0 libx264 -preset veryfast -crf 23 out.m3u8";
+            Check("strip: a line with nothing to strip is the same string", ReferenceEquals(software, UpscaleEngine.StripVaapiOnlyArguments(software)));
+            Equal("strip: null stays null", null, UpscaleEngine.StripVaapiOnlyArguments(null));
+            Equal("strip: empty stays empty", string.Empty, UpscaleEngine.StripVaapiOnlyArguments(string.Empty));
+            Equal("strip: an option left without a value is not dropped past the end", "-codec:v:0 hevc_qsv -rc_mode", UpscaleEngine.StripVaapiOnlyArguments("-codec:v:0 hevc_qsv -rc_mode"));
+
+            // Nits: the software test is the names the chain can pick, not any "lib" encoder.
+            Check("a libvpx encoder does not fit the chain", !UpscaleEngine.EncoderFitsIntelChain("libvpx-vp9") && !UpscaleEngine.EncoderFitsIntelChain("libaom-av1"));
+            Check("libx264, libx265 and libsvtav1 fit the chain, in any case", UpscaleEngine.EncoderFitsIntelChain("libx264") && UpscaleEngine.EncoderFitsIntelChain("LIBX265") && UpscaleEngine.EncoderFitsIntelChain("libsvtav1"));
+        }
+
+        // A job that carries a play session id, so the encoder the patch notes can be read back.
+        private static EncodingJobInfo CodecJob(string session, string negotiated, params string[] supported)
+        {
+            return new FakeJob
+            {
+                BaseRequest = new StreamingRequestDto { PlaySessionId = session, VideoCodec = negotiated },
+                SupportedVideoCodecs = supported,
+            };
+        }
+
+        // Review item 3: what the StartFfMpeg prefix does with a command line, with the decision
+        // handed in as a ready plan. The fixture line is reconstructed from source, not captured.
+        private static void StripPrefix()
+        {
+            string line = Fixture("jellyfin-vaapi-commandline.txt").Trim();
+            string swapped = line.Replace("-codec:v:0 hevc_vaapi", "-codec:v:0 hevc_qsv");
+            string expected = UpscaleEngine.StripVaapiOnlyArguments(swapped);
+            UpscalePatches.PlanSource = _ => new UpscaleEngine.Plan { Act = true };
+
+            OnIntel("auto", "auto", FullList);
+            string args = swapped;
+            UpscalePatches.StartFfMpegStripPrefix(Job("hevc", "hevc"), ref args);
+            Check("StartFfMpeg prefix, Intel and acting: the VA-API-only options are stripped", args != swapped && args == expected && !args.Contains("-init_hw_device") && !args.Contains("-rc_mode"), args);
+
+            UpscalePatches.PlanSource = _ => new UpscaleEngine.Plan { Act = false };
+            args = swapped;
+            UpscalePatches.StartFfMpegStripPrefix(Job("hevc", "hevc"), ref args);
+            Equal("StartFfMpeg prefix, a session the plugin does not act on: the line is untouched", swapped, args);
+
+            UpscalePatches.PlanSource = _ => new UpscaleEngine.Plan { Act = true };
+            GpuDetector.UseEnvironment(Machine("renderD128", "0x10de"));
+            args = swapped;
+            UpscalePatches.StartFfMpegStripPrefix(Job("hevc", "hevc"), ref args);
+            Equal("StartFfMpeg prefix on NVIDIA: the line is untouched", swapped, args);
+
+            UpscalePatches.PlanSource = null;
+            GpuDetector.UseEnvironment(null);
+            UpscaleEngine.EncoderListSource = null;
+            UpscaleEngine.Av1QsvProbeSource = null;
+        }
+
+        // Review item 4: the two places the patch leaves Jellyfin's own encoder alone because the
+        // engine has none to offer. Before this, nothing reached either branch.
+        private static void NullEncoderBranches()
+        {
+            // A stream copy that the plugin would replace, with no QSV or software encoder in ffmpeg.
+            OnIntel("auto", "auto", "hevc_vaapi");
+            UpscalePatches.PlanSource = _ => new UpscaleEngine.Plan { Act = true, ClientOptIn = true };
+            string result = "copy";
+            UpscalePatches.VideoEncoderPostfix(CodecJob("harness-copy-null", "hevc", "hevc"), ref result);
+            Equal("stream copy with no usable encoder: the copy stands", "copy", result);
+            Tuple<string, string> noted = UpscaleEngine.NotedEncoder("harness-copy-null");
+            Check("stream copy with no usable encoder: the session notes why", noted != null && noted.Item1 == "copy" && noted.Item2.Contains("kept the stream copy"), noted == null ? "nothing noted" : noted.Item2);
+
+            // The same copy with a QSV encoder listed IS replaced, so the null case is not a no-op for every input.
+            OnIntel("auto", "auto", FullList);
+            result = "copy";
+            UpscalePatches.VideoEncoderPostfix(CodecJob("harness-copy-qsv", "hevc", "hevc"), ref result);
+            Equal("stream copy with hevc_qsv listed: replaced by it", "hevc_qsv", result);
+
+            // Jellyfin picked a VA-API encoder, which cannot take the chain, and the engine has nothing to put there.
+            OnIntel("auto", "auto", "hevc_vaapi");
+            UpscalePatches.PlanSource = _ => new UpscaleEngine.Plan { Act = true };
+            result = "hevc_vaapi";
+            bool handled = UpscalePatches.ApplyIntelEncoder(CodecJob("harness-vaapi-null", "hevc", "hevc"), UpscaleEngine.Settings, ref result);
+            Check("Jellyfin's VA-API encoder and none to replace it: handled, and kept", handled && result == "hevc_vaapi", result);
+            noted = UpscaleEngine.NotedEncoder("harness-vaapi-null");
+            Check("...and the session notes that it kept Jellyfin's encoder", noted != null && noted.Item2.Contains("kept Jellyfin's hevc_vaapi"), noted == null ? "nothing noted" : noted.Item2);
+
+            // Controls: a session the plugin does not act on is left alone without a note, and one it does act on is replaced.
+            UpscalePatches.PlanSource = _ => new UpscaleEngine.Plan { Act = false };
+            result = "hevc_vaapi";
+            handled = UpscalePatches.ApplyIntelEncoder(CodecJob("harness-vaapi-idle", "hevc", "hevc"), UpscaleEngine.Settings, ref result);
+            Check("a session the plugin does not act on: kept, no note", handled && result == "hevc_vaapi" && UpscaleEngine.NotedEncoder("harness-vaapi-idle") == null, result);
+            OnIntel("auto", "auto", FullList);
+            UpscalePatches.PlanSource = _ => new UpscaleEngine.Plan { Act = true };
+            result = "hevc_vaapi";
+            handled = UpscalePatches.ApplyIntelEncoder(CodecJob("harness-vaapi-swap", "hevc", "hevc"), UpscaleEngine.Settings, ref result);
+            Check("Jellyfin's VA-API encoder with hevc_qsv listed: replaced by it", handled && result == "hevc_qsv", result);
+
+            UpscalePatches.PlanSource = null;
+            GpuDetector.UseEnvironment(null);
+            UpscaleEngine.EncoderListSource = null;
+            UpscaleEngine.Av1QsvProbeSource = null;
+        }
+
+        // Review items 2 and 3: the real PatcherHost.Apply, against the real Jellyfin assemblies. It
+        // installs the Harmony patches for good, so it runs last.
+        private static void PatchWiring()
+        {
+            // Item 3: the strip prefix is bound to the real StartFfMpeg signature.
+            Type manager = typeof(MediaBrowser.MediaEncoding.Transcoding.TranscodeManager);
+            System.Reflection.MethodInfo start = HarmonyLib.AccessTools.Method(manager, "StartFfMpeg");
+            Check("TranscodeManager.StartFfMpeg exists in the server's assembly", start != null);
+            if (start == null)
+            {
+                return;
+            }
+
+            System.Reflection.ParameterInfo[] parameters = start.GetParameters();
+            string signature = string.Join(", ", parameters.Select(p => p.ParameterType.Name + " " + p.Name));
+            System.Reflection.ParameterInfo stateParam = parameters.FirstOrDefault(p => p.Name == "state");
+            System.Reflection.ParameterInfo argsParam = parameters.FirstOrDefault(p => p.Name == "commandLineArguments");
+            Check("StartFfMpeg takes a job state and the command-line string the prefix names",
+                stateParam != null && typeof(EncodingJobInfo).IsAssignableFrom(stateParam.ParameterType) && argsParam != null && argsParam.ParameterType == typeof(string), signature);
+            System.Reflection.MethodInfo prefix = typeof(UpscalePatches).GetMethod("StartFfMpegStripPrefix", System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic);
+            Check("the strip prefix's own parameters are all in StartFfMpeg's signature",
+                prefix != null && prefix.GetParameters().All(p => parameters.Any(q => q.Name == p.Name)), signature);
+
+            // Item 2: a cold encoder cache, an Intel server, and the entry point the plugin calls.
+            GpuDetector.UseEnvironment(Machine("renderD128", "0x8086"));
+            UpscaleEngine.EncoderListSource = null;
+            UpscaleEngine.ResetEncoderProbe();
+            UpscaleEngine.ResetAv1QsvProbe();
+            UpscaleEngine.Av1QsvProbeSource = null;
+            UpscaleEngine.Av1QsvRunner = _ => null;
+
+            string status = null;
+            try
+            {
+                status = PatcherHost.Apply(null, "{\"GpuVendor\":\"auto\"}");
+            }
+            catch (Exception ex)
+            {
+                Check("PatcherHost.Apply runs against the server's assemblies", false, ex.GetType().Name + ": " + ex.Message);
+            }
+
+            Check("PatcherHost.Apply starts the warm-up: the encoder list is read off the caller", WaitUntil(() => UpscaleEngine.EncoderProbeRuns > 0), "EncoderProbeRuns " + UpscaleEngine.EncoderProbeRuns);
+
+            Check("Apply reports the patches active", status != null && status.StartsWith("active"), status);
+            Check("Apply reports the strip installed, not unavailable", status != null && status.Contains("Intel VA-API argument strip") && !status.Contains("Intel VA-API argument strip (not needed"), status);
+            HarmonyLib.Patches installed = HarmonyLib.Harmony.GetPatchInfo(start);
+            Check("StartFfMpeg carries the strip prefix",
+                installed != null && installed.Prefixes.Any(p => p.PatchMethod.Name == "StartFfMpegStripPrefix"),
+                installed == null ? "no patches" : string.Join(", ", installed.Prefixes.Select(p => p.PatchMethod.Name)));
+
+            UpscaleEngine.Av1QsvRunner = null;
+            UpscaleEngine.ResetAv1QsvProbe();
+            GpuDetector.UseEnvironment(null);
+        }
+
         private static string Fixture(string name) => File.ReadAllText(Path.Combine(AppContext.BaseDirectory, "fixtures", name));
 
         // PR 2: DRM fdinfo, from fixture files in the two drivers' formats. The fixtures are written
@@ -1759,12 +2796,41 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
             Check("a zero or negative window measures nothing", DrmFdinfo.Compute(Samples("fdinfo-xe-t0.txt"), Samples("fdinfo-xe-t1.txt"), 0).BusyPercent == null);
             Check("an xe class with no elapsed cycles is left out, not read as 0",
                 DrmFdinfo.Compute(Samples("fdinfo-xe-t1.txt"), Samples("fdinfo-xe-t1.txt"), 1.0).BusyPercent == null);
+            // One xe class measured, another busy with no elapsed cycles: the unmeasured one may be the busiest.
+            DrmClient xeMixedBefore = DrmFdinfo.Parse("drm-driver:\txe\ndrm-pdev:0000:03:00.0\ndrm-client-id:\t9\ndrm-total-cycles-vcs:\t0\ndrm-cycles-vcs:\t0\ndrm-total-cycles-rcs:\t100\ndrm-cycles-rcs:\t0\n");
+            DrmClient xeMixedNow = DrmFdinfo.Parse("drm-driver:\txe\ndrm-pdev:0000:03:00.0\ndrm-client-id:\t9\ndrm-total-cycles-vcs:\t1000\ndrm-cycles-vcs:\t500\ndrm-total-cycles-rcs:\t100\ndrm-cycles-rcs:\t50\n");
+            DrmLoadResult xeMixed = DrmFdinfo.Compute(new Dictionary<string, DrmClient> { [xeMixedBefore.Key] = xeMixedBefore }, new Dictionary<string, DrmClient> { [xeMixedNow.Key] = xeMixedNow }, 1.0);
+            Check("an xe class with no elapsed cycles beside a measured one: the measured class is kept, the headline is null",
+                xeMixed.BusyByClass.ContainsKey("video") && xeMixed.BusyByClass["video"] == 50.0 && !xeMixed.BusyByClass.ContainsKey("render") && xeMixed.BusyPercent == null,
+                string.Join(",", xeMixed.BusyByClass) + " headline " + xeMixed.BusyPercent);
             Check("a counter that went backwards is skipped", DrmFdinfo.Compute(Samples("fdinfo-i915-encode-t1.txt"), Samples("fdinfo-i915-encode-t0.txt"), 1.0).VideoClients == 0);
             Check("a null sample measures nothing", DrmFdinfo.Compute(null, Samples("fdinfo-xe-t1.txt"), 1.0).BusyPercent == null);
             DrmClient hot = DrmFdinfo.Parse("drm-driver:\ti915\ndrm-pdev:0000:03:00.0\ndrm-client-id:\t1\ndrm-engine-video:\t9000000000 ns\n");
             DrmClient hotBefore = DrmFdinfo.Parse("drm-driver:\ti915\ndrm-pdev:0000:03:00.0\ndrm-client-id:\t1\ndrm-engine-video:\t0 ns\n");
-            Check("busy is clamped to 100",
-                DrmFdinfo.Compute(new Dictionary<string, DrmClient> { [hotBefore.Key] = hotBefore }, new Dictionary<string, DrmClient> { [hot.Key] = hot }, 1.0).BusyPercent == 100.0);
+            Check("an i915 class with no capacity line and a figure far over 100% is left out, not clamped to a false 100",
+                DrmFdinfo.Compute(new Dictionary<string, DrmClient> { [hotBefore.Key] = hotBefore }, new Dictionary<string, DrmClient> { [hot.Key] = hot }, 1.0).BusyPercent == null);
+
+            // A multi-engine class whose capacity line is missing: 1.8 s of busy time in a 1 s window.
+            DrmLoadResult noCap = DrmFdinfo.Compute(Samples("fdinfo-i915-multi-nocap-t0.txt"), Samples("fdinfo-i915-multi-nocap-t1.txt"), 1.0);
+            Check("i915 load: no capacity line and 180% raw is null, not 100", noCap.BusyPercent == null && !noCap.BusyByClass.ContainsKey("video"), string.Join(",", noCap.BusyByClass));
+            Check("i915 load: the client still counts as an encoder session when its figure is left out", noCap.VideoClients == 1);
+
+            // Jitter on a one-engine class (no capacity line is normal there) is clamped, not dropped.
+            DrmClient jitterBefore = DrmFdinfo.Parse("drm-driver:\ti915\ndrm-pdev:0000:03:00.0\ndrm-client-id:\t1\ndrm-engine-video:\t0 ns\n");
+            DrmClient jitterNow = DrmFdinfo.Parse("drm-driver:\ti915\ndrm-pdev:0000:03:00.0\ndrm-client-id:\t1\ndrm-engine-video:\t1050000000 ns\n");
+            Check("i915 load: 105% on a class with no capacity line is jitter, clamped to 100",
+                DrmFdinfo.Compute(new Dictionary<string, DrmClient> { [jitterBefore.Key] = jitterBefore }, new Dictionary<string, DrmClient> { [jitterNow.Key] = jitterNow }, 1.0).BusyPercent == 100.0);
+            Check("i915 load: 50% on a class with no capacity line is reported as is",
+                DrmFdinfo.Compute(
+                    new Dictionary<string, DrmClient> { [jitterBefore.Key] = jitterBefore },
+                    new Dictionary<string, DrmClient> { [jitterBefore.Key] = DrmFdinfo.Parse("drm-driver:\ti915\ndrm-pdev:0000:03:00.0\ndrm-client-id:\t1\ndrm-engine-video:\t500000000 ns\n") },
+                    1.0).BusyPercent == 50.0);
+
+            // With a capacity line the figure is normalised and the old clamp stands.
+            DrmClient capBefore = DrmFdinfo.Parse("drm-driver:\ti915\ndrm-pdev:0000:03:00.0\ndrm-client-id:\t2\ndrm-engine-video:\t0 ns\ndrm-engine-capacity-video:\t2\n");
+            DrmClient capNow = DrmFdinfo.Parse("drm-driver:\ti915\ndrm-pdev:0000:03:00.0\ndrm-client-id:\t2\ndrm-engine-video:\t9000000000 ns\ndrm-engine-capacity-video:\t2\n");
+            Check("i915 load: with a capacity line the clamp to 100 still applies",
+                DrmFdinfo.Compute(new Dictionary<string, DrmClient> { [capBefore.Key] = capBefore }, new Dictionary<string, DrmClient> { [capNow.Key] = capNow }, 1.0).BusyPercent == 100.0);
         }
 
         private static Dictionary<string, DrmClient> Samples(params string[] fixtures)
@@ -1881,13 +2947,34 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
 
             // An Intel server: no nvidia-smi, nvencSessions null, the load from the kernel.
             GpuDetector.UseEnvironment(Machine("renderD128", "0x8086"));
-            JsonElement intel = LoadJson(controller);
-            Equal("load route, Intel: vendor", "intel", intel.GetProperty("vendor").GetString());
-            Check("load route, Intel: nvencSessions is null", intel.GetProperty("nvencSessions").ValueKind == JsonValueKind.Null);
+            UpscaleEngine.EncoderListSource = null;
+            UpscaleEngine.ResetEncoderProbe();
+            var cold = System.Diagnostics.Stopwatch.StartNew();
+            JsonElement intelCold = LoadJson(controller);
+            cold.Stop();
+            Equal("load route, Intel: vendor", "intel", intelCold.GetProperty("vendor").GetString());
+            Check("load route, Intel: nvencSessions is null", intelCold.GetProperty("nvencSessions").ValueKind == JsonValueKind.Null);
+            Check("load route, Intel: a cold poll answers at once, with no figure yet (the walk and the 300 ms gap are off the request)",
+                cold.ElapsedMilliseconds < 250 && intelCold.GetProperty("encoderSessions").ValueKind == JsonValueKind.Null && intelCold.GetProperty("gpuBusyPercent").ValueKind == JsonValueKind.Null,
+                cold.ElapsedMilliseconds + " ms; " + intelCold);
+            Check("load route, Intel: the cold poll started a background refresh", !Jellyfin.Plugin.Plus.GpuLoadController.IntelRefreshTask.IsCompleted || Jellyfin.Plugin.Plus.GpuLoadController.IntelRefreshTask.IsCompletedSuccessfully);
+            Jellyfin.Plugin.Plus.GpuLoadController.IntelRefreshTask.GetAwaiter().GetResult();
+            Equal("load route, Intel, cold encoder cache: the route never ran ffmpeg for the encoder list", "0", UpscaleEngine.EncoderProbeRuns.ToString());
+
+            // The refresh stored its figure: the next poll inside the window reads it without a new walk.
+            var warm = controller.GetLoad().GetAwaiter().GetResult();
+            JsonElement intel = JsonDocument.Parse(JsonSerializer.Serialize(warm.Value)).RootElement.Clone();
             if (Directory.Exists("/proc/self/fd"))
             {
                 Check("load route, Intel: with no process on the GPU, zero encoder sessions (not null)", intel.GetProperty("encoderSessions").GetInt32() == 0, intel.ToString());
                 Check("load route, Intel: the source is named", intel.GetProperty("loadSource").GetString().StartsWith("drm-fdinfo"), intel.ToString());
+
+                // A figure older than 60 s is reported as unavailable, not as current.
+                typeof(Jellyfin.Plugin.Plus.GpuLoadController).GetField("_intelAtUtc", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static).SetValue(null, DateTime.UtcNow.AddSeconds(-120));
+                var stale = controller.GetLoad().GetAwaiter().GetResult();
+                JsonElement staleJson = JsonDocument.Parse(JsonSerializer.Serialize(stale.Value)).RootElement.Clone();
+                Check("load route, Intel: a figure older than 60 s is null", staleJson.GetProperty("encoderSessions").ValueKind == JsonValueKind.Null, staleJson.ToString());
+                Jellyfin.Plugin.Plus.GpuLoadController.IntelRefreshTask.GetAwaiter().GetResult();
             }
 
             // A mixed box on auto is NVIDIA, as everywhere else.
@@ -1920,16 +3007,17 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
                 using (JsonDocument doc = JsonDocument.Parse(PatcherHost.SessionJson("harness-no-such-session")))
                 {
                     JsonElement gpu = doc.RootElement.GetProperty("Levels").GetProperty("Gpu");
-                    Equal("probe: Levels.Gpu.Setting follows the setting", "none", gpu.GetProperty("Setting").GetString());
                     Equal("probe: Levels.Gpu.Vendor", "none", gpu.GetProperty("Vendor").GetString());
-                    Check("probe: Levels.Gpu has every capability field",
-                        new[] { "Vendor", "Setting", "Detected", "RenderNode", "EncoderFamily", "DecodeType", "CudaOnlyLevelsAvailable", "OpenVinoAvailable", "Reason", "Devices" }
-                            .All(f => gpu.TryGetProperty(f, out _)));
+                    Check("probe: Levels.Gpu has the summary fields",
+                        SummaryFields.All(f => gpu.TryGetProperty(f, out _)));
                 }
 
                 using (JsonDocument doc = JsonDocument.Parse(PatcherHost.StatusJson()))
                 {
-                    Check("status: carries Gpu", doc.RootElement.TryGetProperty("Gpu", out _));
+                    JsonElement gpu = doc.RootElement.GetProperty("Gpu");
+                    Equal("status: Gpu.Setting follows the setting", "none", gpu.GetProperty("Setting").GetString());
+                    Check("status: Gpu keeps the full record (elevated route)",
+                        SummaryFields.Concat(PrivateFields).Concat(new[] { "DecodeType" }).All(f => gpu.TryGetProperty(f, out _)));
                 }
             }
             catch (Exception ex)
@@ -1943,8 +3031,129 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
                     doc.RootElement.TryGetProperty("Vendor", out _) && doc.RootElement.TryGetProperty("Detected", out _) && doc.RootElement.TryGetProperty("RenderNode", out _));
             }
 
-            string json = JsonSerializer.Serialize(new SessionRecord { Gpu = new GpuCapability { Vendor = "nvidia" } });
+            string json = JsonSerializer.Serialize(new SessionRecord { Gpu = new GpuSummary("nvidia", true, "nvenc", true, false) });
             Check("SessionRecord serialises its Gpu field", json.Contains("\"Gpu\":{") && json.Contains("\"Vendor\":\"nvidia\""), json);
+        }
+
+        private static readonly string[] SummaryFields = { "Vendor", "Detected", "EncoderFamily", "CudaOnlyLevelsAvailable", "OpenVinoAvailable" };
+
+        private static readonly string[] PrivateFields = { "Devices", "RenderNode", "Reason", "Setting" };
+
+        // AGENTS.md invariant 13. GET JellyfinPlus/Session/{id} is any authenticated user, so
+        // neither of its two answers (the probe, a recorded session) may carry what the GPU record
+        // knows about the host. The full record stays on the elevated status route only.
+        private static void Access()
+        {
+            var full = GpuDetector.Resolve("auto", Models, Machine("renderD128", "0x10de", "renderD129", "0x8086"));
+            Check("access setup: the full record does hold the private fields",
+                full.Devices.Count == 2 && full.RenderNode != null && full.Reason.Length > 0 && full.Setting == "auto");
+
+            string json = JsonSerializer.Serialize(full.ToSummary());
+            using (JsonDocument doc = JsonDocument.Parse(json))
+            {
+                Check("summary has exactly the five non-sensitive fields",
+                    doc.RootElement.EnumerateObject().Select(p => p.Name).OrderBy(n => n).SequenceEqual(SummaryFields.OrderBy(n => n)), json);
+            }
+
+            string sid = "harness-access-" + Guid.NewGuid().ToString("N");
+            UpscaleEngine.Record(new SessionRecord { PlaySessionId = sid, Gpu = full.ToSummary() });
+            PatcherHost.Configure("{\"GpuVendor\":\"auto\"}");
+            foreach (string route in new[] { sid, "harness-no-such-session" })
+            {
+                string tag = route == sid ? "recorded session" : "probe";
+                string body = PatcherHost.SessionJson(route);
+                using (JsonDocument doc = JsonDocument.Parse(body))
+                {
+                    JsonElement root = doc.RootElement;
+                    JsonElement gpu = route == sid ? root.GetProperty("Gpu") : root.GetProperty("Levels").GetProperty("Gpu");
+                    Check("non-elevated " + tag + ": Gpu has the summary fields", SummaryFields.All(f => gpu.TryGetProperty(f, out _)));
+                    Check("non-elevated " + tag + ": Gpu omits Devices, RenderNode, Reason and Setting",
+                        PrivateFields.All(f => !gpu.TryGetProperty(f, out _)));
+                    if (route == sid)
+                    {
+                        JsonElement rec = root.GetProperty("Record").GetProperty("Gpu");
+                        Check("non-elevated recorded session: Record.Gpu omits the private fields", PrivateFields.All(f => !rec.TryGetProperty(f, out _)));
+                    }
+                }
+
+                Check("non-elevated " + tag + ": no render node path or PCI id anywhere in the body",
+                    !body.Contains("/dev/dri") && !body.Contains("0x10de") && !body.Contains("0x8086"));
+            }
+
+            string history = JsonSerializer.Serialize(UpscaleEngine.ForSession(sid));
+            Check("the history entry (served by Status) carries no device list or render node",
+                !history.Contains("\"Devices\"") && !history.Contains("\"RenderNode\"") && !history.Contains("/dev/dri"), history);
+        }
+
+        // Review items 2 and 3: a negative or failed probe is not kept for the life of the process,
+        // and the hot path never runs the probe. Driven with a fake clock and a queue standing in for
+        // the thread pool, so it is deterministic.
+        private static void CachedProbes()
+        {
+            DateTime now = new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+            var queue = new Queue<Action>();
+            int calls = 0;
+            string next = null;
+            bool throwNext = false;
+            var probe = new CachedProbe<string>(
+                () =>
+                {
+                    calls++;
+                    if (throwNext)
+                    {
+                        throw new InvalidOperationException("driver still loading");
+                    }
+
+                    return next;
+                },
+                v => v == "gpu",
+                TimeSpan.FromSeconds(60),
+                () => now,
+                queue.Enqueue);
+
+            Check("peek before any probe returns null", probe.Peek() == null);
+            Check("peek schedules the probe and does not run it on the caller", calls == 0 && queue.Count == 1);
+            Check("a second peek while one is scheduled does not queue another", probe.Peek() == null && queue.Count == 1);
+
+            next = "none";
+            queue.Dequeue()();
+            Check("the first probe ran once, off the caller", calls == 1);
+            Equal("an inconclusive answer is returned", "none", probe.Peek());
+            Check("an inconclusive answer inside the retry window does not reprobe", queue.Count == 0 && calls == 1);
+
+            now += TimeSpan.FromSeconds(61);
+            Equal("after the window the stale answer is still returned", "none", probe.Peek());
+            Check("after the window a reprobe is scheduled", queue.Count == 1);
+            next = "gpu";
+            queue.Dequeue()();
+            Equal("the reprobe's conclusive answer replaces the negative one", "gpu", probe.Peek());
+
+            now += TimeSpan.FromDays(1);
+            probe.Peek();
+            Check("a conclusive answer is never reprobed", queue.Count == 0 && calls == 2);
+
+            probe.Reset();
+            Check("after Reset the answer is gone and a probe is scheduled", probe.Peek() == null && queue.Count == 1);
+            throwNext = true;
+            queue.Dequeue()();
+            Check("a throwing probe is no answer and does not escape", probe.Peek() == null && queue.Count == 0);
+            now += TimeSpan.FromSeconds(61);
+            probe.Peek();
+            Check("a failed probe is retried after the window", queue.Count == 1);
+
+            // A probe that lands after Reset must not stand.
+            throwNext = false;
+            next = "gpu";
+            Action inFlight = queue.Dequeue();
+            probe.Reset();
+            inFlight();
+            Check("a probe in flight across Reset is discarded", probe.Peek() == null);
+
+            var overridden = GpuDetector.Resolve("none", Models, Machine("renderD128", "0x10de"));
+            Check("GpuVendor=none with an NVIDIA card: the reason says the setting overrode detection",
+                overridden.Vendor == "none" && overridden.Reason.Contains("overrides detection") && overridden.Reason.Contains("NVIDIA"), overridden.Reason);
+            Check("GpuVendor=none with no card: the reason does not claim an override",
+                !GpuDetector.Resolve("none", Models, Machine()).Reason.Contains("overrides"));
         }
     }
 }

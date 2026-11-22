@@ -136,6 +136,38 @@ namespace Jellyfin.Plugin.Plus.Patcher
 
         /// <summary>Every render node seen, in node order, including vendors the plugin does not handle.</summary>
         public List<GpuDevice> Devices { get; set; } = new List<GpuDevice>();
+
+        /// <summary>The non-sensitive subset, for every route a non-administrator can reach.</summary>
+        public GpuSummary ToSummary()
+            => new GpuSummary(Vendor, Detected, EncoderFamily, CudaOnlyLevelsAvailable, OpenVinoAvailable);
+    }
+
+    /// <summary>
+    /// The part of <see cref="GpuCapability"/> that is safe for any authenticated user: which
+    /// vendor and what its chain could use. No render-node path, PCI id, setting text or reason
+    /// (AGENTS.md invariant 13). Immutable, so one instance is shared by every session record that
+    /// was built under the same detection.
+    /// </summary>
+    public sealed class GpuSummary
+    {
+        public GpuSummary(string vendor, bool detected, string encoderFamily, bool cudaOnlyLevelsAvailable, bool openVinoAvailable)
+        {
+            Vendor = vendor;
+            Detected = detected;
+            EncoderFamily = encoderFamily;
+            CudaOnlyLevelsAvailable = cudaOnlyLevelsAvailable;
+            OpenVinoAvailable = openVinoAvailable;
+        }
+
+        public string Vendor { get; }
+
+        public bool Detected { get; }
+
+        public string EncoderFamily { get; }
+
+        public bool CudaOnlyLevelsAvailable { get; }
+
+        public bool OpenVinoAvailable { get; }
     }
 
     /// <summary>
@@ -309,9 +341,12 @@ namespace Jellyfin.Plugin.Plus.Patcher
 
     /// <summary>
     /// Finds the GPU and builds the capability record. The decision is a pure function of the
-    /// environment (<see cref="Resolve"/>); the machine is asked once per process and the answer
-    /// kept, because a GPU does not appear mid-run and the transcode path must not spawn a process
-    /// per session. Never throws: a failure is a record that says none and why.
+    /// environment (<see cref="Resolve"/>). The machine is asked through a <see cref="CachedProbe{T}"/>:
+    /// <see cref="Start"/> probes in the background at plug-in start-up, the transcode path only
+    /// reads the cached answer, and an answer that found no supported GPU is retried after
+    /// <see cref="RetryAfter"/> rather than kept for the life of the process (nvidia-smi can fail
+    /// while the driver is still loading at boot). Never throws: a failure is a record that says
+    /// none and why.
     /// </summary>
     public static class GpuDetector
     {
@@ -327,58 +362,137 @@ namespace Jellyfin.Plugin.Plus.Patcher
         /// </summary>
         public const string NoCudaGameMarkerFile = "fsr2-nocuda";
 
+        /// <summary>How long a "no supported GPU" answer stands before the machine is asked again.</summary>
+        public static readonly TimeSpan RetryAfter = TimeSpan.FromSeconds(60);
+
         private static readonly object _lock = new object();
-        private static Inventory _inventory;
         private static IGpuEnvironment _environment;
+
+        private static volatile CachedProbe<Inventory> _probe = NewProbe(null);
+
+        private static Built _built;
+
+        private static CachedProbe<Inventory> NewProbe(IGpuEnvironment environment)
+            => new CachedProbe<Inventory>(
+                () => Inventory.Gather(environment ?? new SystemGpuEnvironment()),
+                inv => inv.AnySupportedGpu,
+                RetryAfter,
+                schedule: environment == null ? null : (Action<Action>)(work => work()));
+
+        /// <summary>Begins the background probe. Called when the patches are applied, so the first session finds an answer.</summary>
+        public static void Start() => _probe.Start();
 
         /// <summary>
         /// Points detection at another machine (a fake in the tests) and forgets what was probed.
-        /// Null goes back to the real one. Nothing in production calls this.
+        /// A fake is probed on the calling thread so the next read already has its answer; null
+        /// goes back to the real machine and its background probe. Nothing in production calls this.
         /// </summary>
         public static void UseEnvironment(IGpuEnvironment environment)
         {
             lock (_lock)
             {
                 _environment = environment;
-                _inventory = null;
+                _probe = NewProbe(environment);
+                _built = null;
+            }
+
+            if (environment != null)
+            {
+                _probe.Start();
             }
         }
 
         /// <summary>
-        /// The record for this server under the given setting. Safe on the transcode path: the
-        /// machine is probed on the first call only, and any failure comes back as a none record.
+        /// The full record for this server under the given setting: render-node paths, PCI ids, the
+        /// reason. For the administrator-only status route and nothing a non-administrator can
+        /// reach; use <see cref="CurrentSummary"/> there. Safe on the transcode path: it never
+        /// probes or spawns, and any failure comes back as a none record.
         /// </summary>
         public static GpuCapability Current(string setting, string neuralModelDirectory)
-        {
-            try
-            {
-                IGpuEnvironment env;
-                Inventory inv;
-                lock (_lock)
-                {
-                    env = _environment ?? new SystemGpuEnvironment();
-                    inv = _inventory ?? (_inventory = Inventory.Gather(env));
-                }
+            => Entry(setting, neuralModelDirectory)?.Capability
+                ?? Failed(setting, "GPU detection failed; reported as none");
 
-                return Build(setting, neuralModelDirectory, inv, env);
-            }
-            catch (Exception ex)
+        /// <summary>The non-sensitive subset of <see cref="Current"/>, one shared instance per detection, for non-elevated routes and session records.</summary>
+        public static GpuSummary CurrentSummary(string setting, string neuralModelDirectory)
+            => Entry(setting, neuralModelDirectory)?.Summary
+                ?? new GpuCapability().ToSummary();
+
+        /// <summary>Forgets what was probed and built, so the next read probes again. For tests.</summary>
+        public static void Reset()
+        {
+            _probe.Reset();
+            lock (_lock)
             {
-                return new GpuCapability
-                {
-                    Setting = GpuVendors.NormaliseSetting(setting, out _),
-                    Reason = "GPU detection failed (" + ex.GetType().Name + "); reported as none",
-                };
+                _built = null;
             }
         }
 
-        /// <summary>Forgets what was probed, so the next call asks the machine again. For tests and a config change that moves devices.</summary>
-        public static void Reset()
+        private static Built Entry(string setting, string neuralModelDirectory)
         {
-            lock (_lock)
+            try
             {
-                _inventory = null;
+                Inventory inv = _probe.Peek();
+                DateTime now = DateTime.UtcNow;
+                lock (_lock)
+                {
+                    Built b = _built;
+                    if (b != null
+                        && ReferenceEquals(b.Inventory, inv)
+                        && b.Setting == setting
+                        && b.ModelDirectory == neuralModelDirectory
+                        && now < b.Expires)
+                    {
+                        return b;
+                    }
+                }
+
+                // Expires so an OpenVINO provider installed while running is seen without a restart.
+                GpuCapability cap = inv == null
+                    ? Failed(setting, "GPU detection has not finished; reported as none")
+                    : Build(setting, neuralModelDirectory, inv, _environment ?? new SystemGpuEnvironment());
+                var built = new Built
+                {
+                    Inventory = inv,
+                    Setting = setting,
+                    ModelDirectory = neuralModelDirectory,
+                    Expires = now + (inv == null ? TimeSpan.FromSeconds(1) : RetryAfter),
+                    Capability = cap,
+                    Summary = cap.ToSummary(),
+                };
+                lock (_lock)
+                {
+                    _built = built;
+                }
+
+                return built;
             }
+            catch (Exception)
+            {
+                return null;
+            }
+        }
+
+        private static GpuCapability Failed(string setting, string reason)
+            => new GpuCapability
+            {
+                Setting = GpuVendors.NormaliseSetting(setting, out _),
+                Reason = reason,
+            };
+
+        /// <summary>One built record and what it was built from; replaced when any of that changes.</summary>
+        private sealed class Built
+        {
+            public Inventory Inventory { get; set; }
+
+            public string Setting { get; set; }
+
+            public string ModelDirectory { get; set; }
+
+            public DateTime Expires { get; set; }
+
+            public GpuCapability Capability { get; set; }
+
+            public GpuSummary Summary { get; set; }
         }
 
         /// <summary>The decision, from an environment, with nothing cached. The tests drive this.</summary>
@@ -400,7 +514,11 @@ namespace Jellyfin.Plugin.Plus.Patcher
             if (chosen == GpuVendors.None)
             {
                 vendor = GpuVendors.None;
-                reason = "GpuVendor is none: no vendor-specific path is offered";
+                reason = nvidiaSeen || intelSeen
+                    ? "GpuVendor is none: the setting overrides detection (" + (nvidiaSeen ? "an NVIDIA GPU" : "an Intel GPU")
+                        + (nvidiaSeen && intelSeen ? " and an Intel GPU" : string.Empty)
+                        + " was found); no vendor-specific path is offered"
+                    : "GpuVendor is none: no vendor-specific path is offered";
             }
             else if (chosen == GpuVendors.Nvidia)
             {
@@ -505,6 +623,10 @@ namespace Jellyfin.Plugin.Plus.Patcher
             public bool NvidiaDriverLoaded { get; private set; }
 
             public bool NvidiaSmiLists { get; private set; }
+
+            /// <summary>False means nothing usable was seen: possibly a driver still loading, so the answer is retried.</summary>
+            public bool AnySupportedGpu
+                => NvidiaDriverLoaded || NvidiaSmiLists || Devices.Any(d => d.Vendor != null);
 
             public static Inventory Gather(IGpuEnvironment env)
             {

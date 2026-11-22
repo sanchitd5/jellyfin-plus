@@ -184,6 +184,29 @@ namespace Jellyfin.Plugin.Plus.Patcher
                 logger?.LogWarning(ex, "JellyfinPlus: the A/B live-apply swap patches could not be installed. Live-apply still works, via today's tear-down-and-restart.");
             }
 
+            // Intel: drop VA-API-only options from the command line of a swapped encoder. Resolved
+            // by name, and a parameter name Jellyfin renamed makes Harmony throw here, which only
+            // loses this safety net. typeof, not TypeByName: that only finds the type once the swap
+            // block above has loaded its assembly.
+            try
+            {
+                MethodInfo start = AccessTools.Method(typeof(MediaBrowser.MediaEncoding.Transcoding.TranscodeManager), "StartFfMpeg");
+                if (start == null)
+                {
+                    failed.Add("Intel VA-API argument strip (not needed unless a VA-API option survives the encoder swap)");
+                }
+                else
+                {
+                    harmony.Patch(start, prefix: new HarmonyMethod(typeof(UpscalePatches).GetMethod(nameof(StartFfMpegStripPrefix), BindingFlags.Static | BindingFlags.NonPublic)));
+                    applied.Add("Intel VA-API argument strip");
+                }
+            }
+            catch (Exception ex)
+            {
+                failed.Add("Intel VA-API argument strip (not needed unless a VA-API option survives the encoder swap)");
+                logger?.LogWarning(ex, "JellyfinPlus: the Intel VA-API argument strip could not be installed. Command lines are unchanged.");
+            }
+
             // Faster seeks: quick ffmpeg stop + small probe on mid-item starts. Own try/catch, ahead
             // of the MediaInfoHelper block for the same early-return reason as the swap.
             try
@@ -569,6 +592,9 @@ namespace Jellyfin.Plugin.Plus.Patcher
         private static readonly ConcurrentDictionary<string, Verdict> _verdicts =
             new ConcurrentDictionary<string, Verdict>();
 
+        /// <summary>Replaces the decision with a ready plan (Plan.Act is the verdict). For the tests; nothing in production sets it.</summary>
+        internal static Func<EncodingJobInfo, UpscaleEngine.Plan> PlanSource { get; set; }
+
         /// <summary>Nothing removes a verdict on its own, so the table is dropped when it grows.</summary>
         private const int VerdictLimit = 256;
 
@@ -578,6 +604,12 @@ namespace Jellyfin.Plugin.Plus.Patcher
         /// </summary>
         private static Verdict VerdictFor(EncodingJobInfo state)
         {
+            if (PlanSource != null)
+            {
+                UpscaleEngine.Plan given = PlanSource(state);
+                return new Verdict { Plan = given, Act = given.Act, Status = given.Status, Reason = given.Reason };
+            }
+
             string key = UpscaleEngine.SessionKey(state);
             if (!string.IsNullOrEmpty(key) && _verdicts.TryGetValue(key, out var cached))
             {
@@ -711,6 +743,33 @@ namespace Jellyfin.Plugin.Plus.Patcher
             }
         }
 
+        /// <summary>
+        /// Last look at the ffmpeg command line of a session this plugin acts on, on an Intel
+        /// server: removes the VA-API-only options a swapped-in QSV or software encoder would
+        /// reject. Always a no-op off Intel, and on a line with nothing to strip.
+        /// </summary>
+        internal static void StartFfMpegStripPrefix(EncodingJobInfo state, ref string commandLineArguments)
+        {
+            try
+            {
+                if (!UpscaleEngine.IsIntelPath() || !ShouldAct(state, out _))
+                {
+                    return;
+                }
+
+                string stripped = UpscaleEngine.StripVaapiOnlyArguments(commandLineArguments);
+                if (!string.Equals(stripped, commandLineArguments, StringComparison.Ordinal))
+                {
+                    _logger?.LogInformation("JellyfinPlus: removed VA-API-only arguments from the ffmpeg command line for {Path}", state.MediaPath);
+                    commandLineArguments = stripped;
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogError(ex, "JellyfinPlus: stripping VA-API arguments failed; the command line is unchanged");
+            }
+        }
+
         private static bool ShouldAct(EncodingJobInfo state, out UpscaleEngine.Plan plan)
         {
             var verdict = VerdictFor(state);
@@ -770,11 +829,8 @@ namespace Jellyfin.Plugin.Plus.Patcher
 
                 var kept = UpscaleEngine.KeepNonScalingNodes(ExtractVfBody(__result));
                 string chain = UpscaleEngine.BuildChain(plan);
-                // A hardware-decode chain starts from VA-API surfaces no kept node can read, so
-                // Jellyfin's own nodes follow the download instead of leading the chain.
-                __result = " -vf \"" + (kept.Count == 0 ? chain
-                    : plan.HardwareDecode ? chain + "," + string.Join(",", kept)
-                    : string.Join(",", kept) + "," + chain) + "\"";
+                // Kept nodes lead the chain, or follow its download under hardware decode (JoinChain).
+                __result = " -vf \"" + UpscaleEngine.JoinChain(plan, chain, kept) + "\"";
 
                 var record = RecordFor(state, verdict, plan, "applied", "filter chain injected");
                 _logger?.LogInformation("JellyfinPlus: {Summary} for {Path}", record.Summary, state.MediaPath);
@@ -869,7 +925,7 @@ namespace Jellyfin.Plugin.Plus.Patcher
         /// configured encoder ffmpeg does not have or the session did not declare playable, so a
         /// misconfiguration degrades to the negotiated codec instead of to a black screen.
         /// </summary>
-        private static void VideoEncoderPostfix(EncodingJobInfo state, ref string __result)
+        internal static void VideoEncoderPostfix(EncodingJobInfo state, ref string __result)
         {
             try
             {
@@ -919,7 +975,16 @@ namespace Jellyfin.Plugin.Plus.Patcher
                     return;
                 }
 
-                string encoder = UpscaleEngine.EncoderFor(state, out string encoderReason);
+                string encoder = UpscaleEngine.EncoderFor(state, out string encoderReason, plan.Devices);
+                if (encoder == null)
+                {
+                    // Intel with no QSV or software encoder listed: nothing can take the chain's
+                    // frames, so the stream copy stands.
+                    UpscaleEngine.NoteEncoder(UpscaleEngine.SessionKey(state), __result, encoderReason + "; kept the stream copy");
+                    _logger?.LogWarning("JellyfinPlus: no encoder can replace the stream copy for {Path} ({Reason})", state.MediaPath, encoderReason);
+                    return;
+                }
+
                 UpscaleEngine.NoteEncoder(UpscaleEngine.SessionKey(state), encoder, encoderReason);
                 _logger?.LogInformation(
                     "JellyfinPlus: replacing stream copy with {Encoder} for {Path} ({Reason})",
@@ -976,12 +1041,19 @@ namespace Jellyfin.Plugin.Plus.Patcher
                 return true;
             }
 
-            if (!ShouldAct(state, out _))
+            if (!ShouldAct(state, out var actPlan))
             {
                 return true;
             }
 
-            string chosen = UpscaleEngine.EncoderFor(state, out string reason);
+            string chosen = UpscaleEngine.EncoderFor(state, out string reason, actPlan?.Devices);
+            if (chosen == null)
+            {
+                UpscaleEngine.NoteEncoder(sessionKey, __result, reason + "; kept Jellyfin's " + __result);
+                _logger?.LogWarning("JellyfinPlus: kept Jellyfin's encoder {Encoder} for {Path} ({Reason})", __result, state.MediaPath, reason);
+                return true;
+            }
+
             UpscaleEngine.NoteEncoder(sessionKey, chosen, reason + " (replacing Jellyfin's " + __result + ", which cannot take this chain's frames)");
             _logger?.LogInformation(
                 "JellyfinPlus: encoder {Was} -> {Now} for {Path} ({Reason})",
@@ -1001,7 +1073,8 @@ namespace Jellyfin.Plugin.Plus.Patcher
         /// </summary>
         private static void ApplyConfiguredEncoderToTranscode(EncodingJobInfo state, UpscaleSettings cfg, ref string __result)
         {
-            string swapped = UpscaleEngine.GuardAv1(state, __result, out string av1Reason);
+            ShouldAct(state, out var guardPlan);
+            string swapped = UpscaleEngine.GuardAv1(state, __result, out string av1Reason, guardPlan?.Devices);
             if (av1Reason != null)
             {
                 UpscaleEngine.NoteEncoder(UpscaleEngine.SessionKey(state), swapped, av1Reason);
@@ -1032,12 +1105,12 @@ namespace Jellyfin.Plugin.Plus.Patcher
                 return;
             }
 
-            if (!ShouldAct(state, out _))
+            if (!ShouldAct(state, out var actPlan))
             {
                 return;
             }
 
-            string chosen = UpscaleEngine.EncoderFor(state, out string reason);
+            string chosen = UpscaleEngine.EncoderFor(state, out string reason, actPlan?.Devices);
             string sessionKey = UpscaleEngine.SessionKey(state);
 
             if (!string.Equals(chosen, configured, StringComparison.OrdinalIgnoreCase))

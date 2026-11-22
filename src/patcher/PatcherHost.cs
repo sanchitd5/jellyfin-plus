@@ -22,7 +22,18 @@ namespace Jellyfin.Plugin.Plus.Patcher
         public static string Apply(object logger, string settingsJson)
         {
             Configure(settingsJson);
+            GpuDetector.Start();
+            UpscaleEngine.WarmDevices();
             UpscalePatches.Apply(logger as ILogger);
+            UpscaleEngine.StartFsr2Probe();
+
+            // Off this thread: the encoder list and the AV1 test encode are ffmpeg runs, and the
+            // capability record and the transcode path only read what they leave behind.
+            UpscaleEngine.WarmProbes();
+
+            // Off the start-up thread: the render-node lookup can run a test, and the hardware-decode
+            // test spawns ffmpeg. A session that arrives first finds no answer and decodes in software.
+            Task.Run(UpscaleEngine.PrimeHardwareDecode);
             return UpscalePatches.Status;
         }
 
@@ -34,6 +45,7 @@ namespace Jellyfin.Plugin.Plus.Patcher
                 if (settings != null)
                 {
                     UpscaleEngine.Settings = settings;
+                    Task.Run(UpscaleEngine.WarmOrtProbeIfWanted);
                 }
             }
             catch (Exception)
@@ -204,9 +216,12 @@ namespace Jellyfin.Plugin.Plus.Patcher
                 ["Upscalers"] = ShaderLibrary.Upscalers,
 
                 // The GPU capability record: what vendor this server has and what that vendor's
+                // The GPU capability record: what vendor this server has and what that vendor's
                 // chain can use. On a detected Intel GPU it also decides the Denoise, Neural and
-                // Game lists above (the NVIDIA-only levels are left out) and the Vulkan device.
-                ["Gpu"] = Gpu(),
+                // Game lists above (the NVIDIA-only levels are left out) and the Vulkan device. The
+                // summary only: this is served to every authenticated user, and the full record
+                // (device paths, PCI ids) is for Status.
+                ["Gpu"] = GpuPublic(),
             };
 
             // Why a level is missing from the lists above, only where one is: an Intel server. The
@@ -224,8 +239,9 @@ namespace Jellyfin.Plugin.Plus.Patcher
                 levels["NeuralMaxSourceHeight"] = cfg.NeuralMaxSourceHeight;
             }
 
-            // Present only while the operator has hardware decode on, for the same reason.
-            if (cfg != null && cfg.IntelHardwareDecode)
+            // Present only while the operator has hardware decode on and an Intel GPU was found, so an
+            // NVIDIA or CPU-only server serves the probe it always did with the setting on too.
+            if (cfg != null && cfg.IntelHardwareDecode && UpscaleEngine.IsIntelPath())
             {
                 levels["IntelHardwareDecode"] = true;
             }
@@ -233,7 +249,7 @@ namespace Jellyfin.Plugin.Plus.Patcher
             return levels;
         }
 
-        /// <summary>The GPU capability record under the current GpuVendor setting. Never throws.</summary>
+        /// <summary>The full GPU capability record under the current GpuVendor setting, for the administrator-only status route. Never throws.</summary>
         private static GpuCapability Gpu()
         {
             return UpscaleEngine.Capability();
@@ -241,9 +257,13 @@ namespace Jellyfin.Plugin.Plus.Patcher
 
         /// <summary>
         /// The GPU capability record as JSON, for the plugin side (the load route tells NVIDIA from
-        /// Intel by it). Primitives only across the load-context boundary, like everything here.
+        /// Intel by it; only the vendor leaves that route). Primitives only across the load-context
+        /// boundary, like everything here.
         /// </summary>
         public static string GpuJson() => JsonSerializer.Serialize(Gpu());
+
+        /// <summary>The non-sensitive subset of the GPU record, for routes any authenticated user can reach. Never throws.</summary>
+        private static GpuSummary GpuPublic() => UpscaleEngine.CapabilitySummary();
 
         /// <summary>Status plus recent sessions, as JSON.</summary>
         public static string StatusJson()
@@ -386,8 +406,8 @@ namespace Jellyfin.Plugin.Plus.Patcher
                 ["Summary"] = record.Summary,
             };
 
-            // Present only while IntelHardwareDecode is on, so every other server's session JSON is
-            // exactly what it was.
+            // Present only while IntelHardwareDecode is on and the server's GPU is a detected Intel
+            // one, so every other server's session JSON is exactly what it was.
             if (record.HardwareDecodeReason != null)
             {
                 session["HardwareDecode"] = record.HardwareDecode;
