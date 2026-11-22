@@ -984,8 +984,10 @@ never `PASS`.
 | 13 | Client, human | always `MANUAL`: browser, hard reload, `window.__jellyfinPlus.installed===true`, 5 min at two levels plus one 2160p output, two seeks, no stall over 2 s |
 
 **Gates.** A real run refuses to start unless `BENCH_ASSERT_QUIET=1` (the pod cannot see vzdump or
-other transcodes: the caller must), outside 01:00 to 07:00 and 16:30 to 18:30 Australia/Melbourne
-(drain, trivy, backups), and with memory PSI `some avg60` under 1%. `--no-gates` skips them only
+other transcodes: the caller must), outside the blocked windows (default 01:00 to 07:00 and 16:30 to
+18:30 Australia/Melbourne: drain, trivy, backups; set `BENCH_BLOCK_WINDOWS` to a comma list of
+`HHMM-HHMM`, start included and end not, and `BENCH_TZ` to the zone; a malformed value exits 2),
+and with memory PSI `some avg60` under 1%. `--no-gates` skips them only
 with `BENCH_CONFIRM_NO_GATES=1` as well. Rows 1 and 12 read only the shim-log lines appended during
 the run. The admin token reaches curl on stdin, never on a command line. A failed API call, or a
 stream that returns no segment, is a `FAIL` of that row, not a figure. Exit codes: 0, 1 if any row

@@ -38,6 +38,8 @@
 #   BENCH_PSI_FILE        memory pressure file for the gate    /proc/pressure/memory
 #   BENCH_SHIM_LOG        the shim's log; rows 1 and 12 read only what is appended during the run   /var/log/jellyfin-upscale.log
 #   BENCH_NEURAL_LEVEL    the neural level row 6 asks for      realesr-anime-x2 (realesr-anime-x2|realesr-anime-x4|realesr-general-x4)
+#   BENCH_BLOCK_WINDOWS   the gate's blocked clock windows, HHMM-HHMM comma list, start included, end not   0100-0700,1630-1830
+#   BENCH_TZ              the zone those windows are read in    Australia/Melbourne
 #
 # Clips: <title>_{360,720,1080,2160}p.mkv lossless masters (the 360/720/1080 are `scale=flags=area`
 # from the 2160p one), still_720p.png (one frame), pan_720p.mkv and pan_1080p.mkv (a panning cut).
@@ -63,6 +65,8 @@ JF_TOKEN="${BENCH_JELLYFIN_TOKEN:-}"
 SHIM_LOG="${BENCH_SHIM_LOG:-/var/log/jellyfin-upscale.log}"
 PSI_FILE="${BENCH_PSI_FILE:-/proc/pressure/memory}"
 NEURAL_LEVEL="${BENCH_NEURAL_LEVEL:-realesr-anime-x2}"
+BLOCK_TZ="${BENCH_TZ:-Australia/Melbourne}"
+BLOCK_WINDOWS="${BENCH_BLOCK_WINDOWS:-0100-0700,1630-1830}"
 
 ALL_ROWS=(1 2 3 4 5 6 7 8 9 10 11 12 13)
 DRY=0
@@ -174,7 +178,7 @@ print_plan() {
     local r
     echo "plan: bench-intel: rows=${ROWS[*]} runs=$RUNS mode=dry-run"
     echo "plan: required filters: $(ffmpeg_required_filters intel) fsr2"
-    echo "plan: gates: window outside 01:00-07:00 and 16:30-18:30 Australia/Melbourne; memory PSI some avg60 < 1%; BENCH_ASSERT_QUIET=1 (no vzdump, no Plex or production Jellyfin transcode: the pod cannot see them)"
+    echo "plan: gates: window outside $BLOCK_TEXT $BLOCK_TZ; memory PSI some avg60 < 1%; BENCH_ASSERT_QUIET=1 (no vzdump, no Plex or production Jellyfin transcode: the pod cannot see them)"
     echo "plan: binary: $PATCHED_FFMPEG; stock: $STOCK_FFMPEG; clips: $CLIPS ($TITLE); out: $OUT; render node: $NODE"
     for r in "${ROWS[@]}"; do
         printf 'plan: row %s: %s\n' "$r" "$(row_title "$r")"
@@ -241,15 +245,39 @@ median() { sort -n | awk '{ a[NR] = $1 } END { if (NR) print a[int((NR + 1) / 2)
 ge() { awk -v a="$1" -v b="$2" 'BEGIN { exit !(a >= b) }'; }
 le() { awk -v a="$1" -v b="$2" 'BEGIN { exit !(a <= b) }'; }
 
+BLOCK_LO=()
+BLOCK_HI=()
+BLOCK_TEXT=""
+
+# Fills BLOCK_LO/BLOCK_HI/BLOCK_TEXT from BLOCK_WINDOWS; a malformed list or zone is a refusal, never a gate left open.
+parse_block_windows() {
+    local item lo hi i items
+    [[ "$BLOCK_TZ" =~ ^[A-Za-z0-9_+/:.-]+$ ]] || die "BENCH_TZ must be a time zone name such as Australia/Melbourne, got: $BLOCK_TZ"
+    [[ "$BLOCK_WINDOWS" =~ ^[0-9]{4}-[0-9]{4}(,[0-9]{4}-[0-9]{4})*$ ]] \
+        || die "BENCH_BLOCK_WINDOWS must be a comma list of HHMM-HHMM such as 0100-0415,1630-1830, got: $BLOCK_WINDOWS"
+    IFS=, read -r -a items <<<"$BLOCK_WINDOWS"
+    for item in "${items[@]}"; do
+        lo=$((10#${item%-*}))
+        hi=$((10#${item#*-}))
+        (( lo % 100 <= 59 && lo < 2400 && hi % 100 <= 59 && hi <= 2400 && lo < hi )) \
+            || die "BENCH_BLOCK_WINDOWS: $item is not a time window (HHMM 0000-2359, end up to 2400, start before end), got: $BLOCK_WINDOWS"
+        BLOCK_LO+=("$lo")
+        BLOCK_HI+=("$hi")
+        BLOCK_TEXT+="${BLOCK_TEXT:+ and }$(printf '%02d:%02d-%02d:%02d' $((lo / 100)) $((lo % 100)) $((hi / 100)) $((hi % 100)))"
+    done
+}
+
 check_gates() {
-    local hm psi
+    local hm psi i
     [[ "${BENCH_ASSERT_QUIET:-}" == 1 ]] \
         || die "gate: set BENCH_ASSERT_QUIET=1 once you have checked there is no vzdump, no Plex transcode and no production Jellyfin transcode"
     # 10#: HHMM has a leading zero, which bash reads as octal (0830 and 0900 are then errors)
-    hm=$((10#$(TZ=Australia/Melbourne date +%H%M)))
-    if (( (hm >= 100 && hm < 700) || (hm >= 1630 && hm < 1830) )); then
-        die "gate: $(printf '%04d' "$hm") Australia/Melbourne is inside the night window, drain, trivy or backup time"
-    fi
+    hm=$((10#$(TZ="$BLOCK_TZ" date +%H%M)))
+    for i in "${!BLOCK_LO[@]}"; do
+        if (( hm >= BLOCK_LO[i] && hm < BLOCK_HI[i] )); then
+            die "gate: $(printf '%04d' "$hm") $BLOCK_TZ is inside a blocked window ($BLOCK_TEXT), drain, trivy or backup time"
+        fi
+    done
     if [[ -r "$PSI_FILE" ]]; then
         psi=$(awk '/^some/ { split($3, a, "="); print a[2] }' "$PSI_FILE")
         le "${psi:-0}" 1 || die "gate: memory PSI some avg60=$psi >= 1%"
@@ -617,7 +645,7 @@ row_13() {
 
 # ---- main ------------------------------------------------------------------------------------------
 
-usage() { sed -n '2,13p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,13p;21,42p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -638,6 +666,7 @@ case "$NEURAL_LEVEL" in
     realesr-anime-x2 | realesr-anime-x4 | realesr-general-x4) ;;
     *) die "BENCH_NEURAL_LEVEL must be realesr-anime-x2, realesr-anime-x4 or realesr-general-x4, got: $NEURAL_LEVEL" ;;
 esac
+parse_block_windows
 
 if [[ $DRY == 1 ]]; then
     print_plan
