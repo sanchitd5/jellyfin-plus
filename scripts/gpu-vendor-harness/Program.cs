@@ -1076,19 +1076,19 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
             JsonElement intel = Probe();
 
             Equal("Intel probe: Denoise", "off,light,strong,max,oidn", string.Join(",", Strings(intel, "Denoise")));
-            Equal("Intel probe: Neural keeps the ONNX level (PR 5 runs it on OpenVINO or the CPU) and loses DLPP and VSR", "off,realesr-anime-x2", string.Join(",", Strings(intel, "Neural")));
+            Equal("Intel probe: Neural loses the ONNX level as well as DLPP and VSR", "off", string.Join(",", Strings(intel, "Neural")));
             Equal("Intel probe: Game is off alone", "off", string.Join(",", Strings(intel, "Game")));
             Equal("Intel probe: GameOptionLevels is empty", string.Empty, string.Join(",", Strings(intel, "GameOptionLevels")));
-            Equal("Intel probe: the neural labels follow", "off,realesr-anime-x2", string.Join(",", Keys(intel.GetProperty("NeuralLabels")).OrderBy(n => n, StringComparer.Ordinal)));
+            Equal("Intel probe: the neural labels follow", "off", string.Join(",", Keys(intel.GetProperty("NeuralLabels")).OrderBy(n => n, StringComparer.Ordinal)));
             Equal("Intel probe: the game labels follow", "off", string.Join(",", Keys(intel.GetProperty("GameLabels"))));
 
             JsonElement withheld = intel.GetProperty("Withheld");
             Equal("Intel probe: Withheld, denoise", "optix,optix-temporal", string.Join(",", Keys(withheld.GetProperty("Denoise"))));
-            Equal("Intel probe: Withheld, neural", "vsr-rtcuda,dlpp-1,dlpp-2,dlpp-3,dlpp-4", string.Join(",", Keys(withheld.GetProperty("Neural"))));
+            Equal("Intel probe: Withheld, neural", "realesr-anime-x2,vsr-rtcuda,dlpp-1,dlpp-2,dlpp-3,dlpp-4", string.Join(",", Keys(withheld.GetProperty("Neural"))));
             Equal("Intel probe: Withheld, game", "fsr2,dlss,dlaa", string.Join(",", Keys(withheld.GetProperty("Game"))));
-            Check("Intel probe: every withheld level says needs NVIDIA",
-                Keys(withheld).All(axis => withheld.GetProperty(axis).EnumerateObject().All(l => l.Value.GetString() == "needs NVIDIA")));
-            Check("Intel probe: the ONNX level is offered, so it is not in Withheld under any reason", !withheld.GetProperty("Neural").TryGetProperty("realesr-anime-x2", out _));
+            Check("Intel probe: every withheld level but the ONNX one says needs NVIDIA",
+                Keys(withheld).All(axis => withheld.GetProperty(axis).EnumerateObject().All(l => l.Name.StartsWith("realesr-") || l.Value.GetString() == "needs NVIDIA")));
+            Equal("Intel probe: the ONNX level has its own reason", "not measured on Intel", withheld.GetProperty("Neural").GetProperty("realesr-anime-x2").GetString());
             Check("Intel probe: a level that is offered is not in Withheld", !withheld.GetProperty("Denoise").TryGetProperty("oidn", out _));
 
             // Nothing else in the probe moved: every other key is byte-identical to the NVIDIA one.
@@ -1201,24 +1201,40 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
             UpscaleEngine.Settings = rig;
             plan = UpscaleEngine.Decide(SessionJob("upscale", "1080", "neural", "realesr-anime-x2"));
             record = UpscaleEngine.Describe(null, plan, plan.Status, plan.Reason);
-            Check("Intel: an ONNX neural level is not withheld", plan.GpuWithheld == null && plan.GpuWithheldUnmeasured == null && plan.NeuralApplied, plan.Status + ": " + plan.Reason);
-            Check("Intel: and its description does not claim CUDA", record.Summary.Contains("this server's GPU is Intel, so no CUDA and the CPU provider") && !record.Summary.Contains("ONNX Runtime CUDA"), record.Summary);
+            Check("Intel: an ONNX neural level is withheld, not run", plan.GpuWithheldUnmeasured == "neural realesr-anime-x2" && !plan.NeuralApplied && plan.NeuralFilter == null, plan.Status + ": " + plan.Reason);
+            Check("Intel: it is not counted as needing NVIDIA", plan.GpuWithheld == null, plan.GpuWithheld);
             Equal("Intel: the neural level asked for is still recorded", "realesr-anime-x2", plan.NeuralRequested);
-            Check("Intel record: nothing is withheld for it, as NVIDIA-only or as unmeasured", record.GpuWithheld == null && record.GpuWithheldUnmeasured == null);
-            Check("Intel record: the summary says no level was left out", !record.Summary.Contains("NOT run"), record.Summary);
+            Equal("Intel record: GpuWithheldUnmeasured", "neural realesr-anime-x2", record.GpuWithheldUnmeasured);
+            Check("Intel record: GpuWithheld stays empty for it", record.GpuWithheld == null);
+            Check("Intel record: the summary gives the unmeasured reason, not the NVIDIA one",
+                record.Summary.Contains("neural realesr-anime-x2 NOT run: not measured on Intel") && !record.Summary.Contains("needs an NVIDIA GPU"), record.Summary);
+            Check("Intel record: the summary claims no neural pass", !record.Summary.Contains("Neural SR") && !record.Summary.Contains("ONNX"), record.Summary);
 
-            // PR 5 runs the ONNX levels on OpenVINO or the CPU, so an optix level beside one is the only one withheld.
+            // Both reasons in one session: each is said under its own wording.
             plan = UpscaleEngine.Decide(SessionJob("upscale", "1080", "denoise", "optix", "neural", "realesr-anime-x2"));
             record = UpscaleEngine.Describe(null, plan, plan.Status, plan.Reason);
-            Check("Intel: a session asking for optix and an ONNX level withholds only optix", plan.GpuWithheld == "denoise optix" && plan.GpuWithheldUnmeasured == null && plan.NeuralApplied, plan.GpuWithheld + " | " + plan.GpuWithheldUnmeasured);
-            Check("Intel record: the summary names optix and says nothing about the ONNX level being unmeasured",
-                record.Summary.Contains("denoise optix NOT run: needs an NVIDIA GPU and this server's is Intel") && !record.Summary.Contains("not measured on Intel"), record.Summary);
+            Check("Intel: a session with both reasons keeps them apart", plan.GpuWithheld == "denoise optix" && plan.GpuWithheldUnmeasured == "neural realesr-anime-x2", plan.GpuWithheld + " | " + plan.GpuWithheldUnmeasured);
+            Check("Intel record: both sentences are in the summary",
+                record.Summary.Contains("denoise optix NOT run: needs an NVIDIA GPU and this server's is Intel") && record.Summary.Contains("neural realesr-anime-x2 NOT run: not measured on Intel"), record.Summary);
 
             // Asked for nothing but an ONNX level: left with nothing, and the reason says why.
             UpscaleEngine.Settings = optIn;
             plan = UpscaleEngine.Decide(SessionJob("neural", "realesr-anime-x2"));
-            Check("Intel, only an ONNX level asked for: it is not left with nothing (PR 5 runs it)", plan.Act && plan.NeuralApplied, plan.Status + ": " + plan.Reason);
-            Check("Intel, only an ONNX level asked for: the reason does not say it is unmeasured", !(plan.Reason ?? string.Empty).Contains("not measured on Intel"), plan.Reason);
+            Check("Intel, only an ONNX level asked for: not enhanced", !plan.Act && plan.Status == "not-requested", plan.Status);
+            Check("Intel, only an ONNX level asked for: the reason says why", plan.Reason.Contains("neural realesr-anime-x2 not run: not measured on Intel"), plan.Reason);
+
+            // The withhold is the maintainer's condition: it stays until the OpenVINO path is MEASURED on an Arc, even though
+            // PR 5's path is present (provider file there, ffmpeg lists the device). Lifting it (a bench result) is one flag.
+            GpuDetector.UseEnvironment(Machine("renderD128", "0x8086"));
+            UpscaleEngine.Settings = rig;
+            plan = UpscaleEngine.Decide(SessionJob("upscale", "1080", "neural", "realesr-anime-x2"));
+            Check("Intel, not measured: the flag is off by default and the ONNX level is withheld", !UpscaleEngine.IntelOnnxMeasured && plan.GpuWithheldUnmeasured == "neural realesr-anime-x2" && !plan.NeuralApplied);
+            UpscaleEngine.IntelOnnxMeasured = true;
+            plan = UpscaleEngine.Decide(SessionJob("upscale", "1080", "neural", "realesr-anime-x2"));
+            record = UpscaleEngine.Describe(null, plan, plan.Status, plan.Reason);
+            Check("Intel, measured (flag on): an ONNX neural level is not withheld", plan.GpuWithheld == null && plan.GpuWithheldUnmeasured == null && plan.NeuralApplied, plan.Status + ": " + plan.Reason);
+            Check("Intel, measured (flag on): and its description does not claim CUDA", record.Summary.Contains("this server's GPU is Intel, so no CUDA and the CPU provider") && !record.Summary.Contains("ONNX Runtime CUDA"), record.Summary);
+            UpscaleEngine.IntelOnnxMeasured = false;
 
             GpuDetector.UseEnvironment(Machine("renderD128", "0x10de"));
             UpscaleEngine.Settings = rig;
@@ -1236,7 +1252,7 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
 
             Check("off, dlpp-2, vsr-rtcuda, banana and null are not ONNX levels",
                 !ShaderLibrary.IsOnnxNeural("off") && !ShaderLibrary.IsOnnxNeural("dlpp-2") && !ShaderLibrary.IsOnnxNeural("vsr-rtcuda") && !ShaderLibrary.IsOnnxNeural("banana") && !ShaderLibrary.IsOnnxNeural(null));
-            Check("reason: an ONNX level has none (PR 5 runs it on OpenVINO or the CPU)", UpscaleEngine.IntelWithholdReason("Neural", "realesr-general-x4") == null);
+            Equal("reason: an ONNX level", "not measured on Intel", UpscaleEngine.IntelWithholdReason("Neural", "realesr-general-x4"));
             Equal("reason: a CUDA-native level", "needs NVIDIA", UpscaleEngine.IntelWithholdReason("Neural", "dlpp-1"));
             Check("reason: off and banana have none", UpscaleEngine.IntelWithholdReason("Neural", "off") == null && UpscaleEngine.IntelWithholdReason("Neural", "banana") == null);
 
@@ -1331,6 +1347,7 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
         // Which ort device the node asks for. Intel only changes anything; every other server's node is the one it always was.
         private static void NeuralDevice()
         {
+            UpscaleEngine.IntelOnnxMeasured = true; // PR 5's path is what is under test; the withhold itself is tested in NvidiaOnlyLevels
             UpscaleEngine.EncoderListSource = () => Encoders(FullList);
             UpscaleEngine.DrmVulkanProbeSource = n => true;
             UpscaleEngine.Av1QsvProbeSource = _ => true;
@@ -1505,6 +1522,7 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
             UpscaleEngine.EncoderListSource = null;
             UpscaleEngine.DrmVulkanProbeSource = null;
             UpscaleEngine.Av1QsvProbeSource = null;
+            UpscaleEngine.IntelOnnxMeasured = false;
             UpscaleEngine.OrtOpenVinoProbeSource = null;
             UpscaleEngine.ResetOrtProbe();
             File.Delete(Path.Combine(NeuralRig(), "ffmpeg"));
@@ -1514,6 +1532,7 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
         // The auto-picked level is looked up once per directory per TTL, not stat'ed on every plan.
         private static void AutoNeuralCache()
         {
+            UpscaleEngine.IntelOnnxMeasured = true; // PR 5's path is what is under test; the withhold itself is tested in NvidiaOnlyLevels
             int stats = 0;
             var present = new HashSet<string>(StringComparer.Ordinal);
             long now = 1000;
@@ -1586,6 +1605,7 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
         // NeuralMaxSourceHeight: what it does for each source height, and that 0 does nothing.
         private static void NeuralRouting()
         {
+            UpscaleEngine.IntelOnnxMeasured = true; // PR 5's path is what is under test; the withhold itself is tested in NvidiaOnlyLevels
             UpscaleEngine.EncoderListSource = () => Encoders(FullList);
             UpscaleEngine.DrmVulkanProbeSource = n => true;
             UpscaleEngine.Av1QsvProbeSource = _ => true;

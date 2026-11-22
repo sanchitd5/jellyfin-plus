@@ -212,7 +212,7 @@ the QSV pin to the detected node at every render node, including an AMD card at 
 Intel one at `renderD129`, a node name that is not a plain render node, two-GPU machines in both orders (Intel first and
 NVIDIA first, `auto`, `nvidia`, `intel`, two Intel GPUs, an AMD node beside an Intel one), that nothing
 Intel emits `nvenc`, `cuda` or `vaapi`, that the probe lists lose exactly the NVIDIA-only levels and
-report each with its reason (`needs NVIDIA`; the ONNX levels are not withheld once PR 5 gives them a device), that a session asking for `optix`, `dlpp-2` and `dlss` (or defaulted to
+report each with its own reason (`needs NVIDIA`, or "not measured on Intel" for the ONNX levels), that a session asking for `optix`, `dlpp-2` and `dlss` (or defaulted to
 them) is enhanced without them, with `GpuWithheld` and the summary saying so, and that the same
 sessions on an NVIDIA box run them. A mutation check (the Intel gate off in the device resolution, in
 the level withholding and in the probe lists) failed 33, 12 and 6 of the earlier checks; the checks
@@ -251,7 +251,7 @@ verified on the real box.
 |---|---|---|---|
 | 1 | Detection and the report-only capability record (section 3) | none | Harness; the record shown live on an NVIDIA box and an Intel box; command lines unchanged |
 | 2 | Encoder per vendor and Intel load (the old PR 2 and PR 4 together, section 5.1 and 5.2): map the negotiated codec to `*_nvenc` or `*_qsv`; a `*_nvenc` setting on an Intel box is treated as auto and said so; Jellyfin's own `*_qsv` choice is kept; `GuardAv1` test-encodes `av1_qsv` on Intel; the GPU-resident encode (`hwmap=derive_device=cuda`) is NVIDIA-only and reported n/a on Intel; `Gpu/Load` gains `vendor`, `encoderSessions`, `gpuBusyPercent` from DRM fdinfo | 1 | Served segment codec and size on each vendor; NVIDIA command byte-identical; busy percentage under a known encode |
-| 3 | The Vulkan device from the render node instead of `vk:0`, on Intel only (section 5.3); the QSV device always pinned to the detected node; the NVIDIA-only levels (`optix`, `dlpp-*`, `vsr-rtcuda`, `fsr2`, `dlss`, `dlaa`) withheld from the probe on Intel, each with its reason (PR 3 also withheld the ONNX levels, `realesr-*`, as "not measured on Intel"; PR 5 lifts that); `MaxConcurrent` 1 for 4K output on a small Intel GPU recommended in docs, default unchanged | 1, 2 | Command on a two-GPU box names the right device; NVIDIA, `none` and one-GPU commands unchanged; the probe on an Intel box lacks the NVIDIA-only levels |
+| 3 | The Vulkan device from the render node instead of `vk:0`, on Intel only (section 5.3); the QSV device always pinned to the detected node; the NVIDIA-only levels (`optix`, `dlpp-*`, `vsr-rtcuda`, `fsr2`, `dlss`, `dlaa`) and the unmeasured ONNX levels (`realesr-*`) withheld from the probe on Intel, each with its reason; `MaxConcurrent` 1 for 4K output on a small Intel GPU recommended in docs, default unchanged | 1, 2 | Command on a two-GPU box names the right device; NVIDIA, `none` and one-GPU commands unchanged; the probe on an Intel box lacks the NVIDIA-only levels |
 | 4 | Folded into PR 2 (Intel load via DRM fdinfo, section 5.2) | 1 | see PR 2 |
 | 5 | `vf_ort` OpenVINO execution provider (`device=openvino`, CPU with a reason when the provider is absent); `NeuralMaxSourceHeight` (0 = off) routing the ONNX neural levels by source height; `scripts/build-ffmpeg.sh` `ORT_EP=cuda\|openvino` with a standalone build patch that no longer needs the OptiX chain (section 5.4) | 1 (8 only for the required-filter set) | Harness for the routing and the `device` option; `scripts/test-vf-ort.sh` compiles the filter and checks its provider calls; on Intel, a served segment larger than the source with `NeuralDevice` `openvino` |
 | 6 | `gu_inputs` without CUDA | 5 | Motion vectors from a non-NVOFA source, compared by the project's temporal measurements |
@@ -489,13 +489,13 @@ so: `SessionRecord.GpuWithheld` and a sentence in the summary ("... NOT run, nee
 the level's own reason) and the status route the same, **only on the Intel path**, so the NVIDIA probe
 and status are unchanged, and the dashboard's GPU line prints each as `Axis level (reason)`.
 
-The ONNX neural levels (`realesr-anime-x2`, `realesr-anime-x4`, `realesr-general-x4`) were withheld on
-Intel while they could only have fallen back to ONNX Runtime's CPU provider, which is almost certainly
-not real time and was never measured for this chain ("not measured on Intel", `GpuWithheldUnmeasured`).
-PR 5 (OpenVINO and `NeuralMaxSourceHeight`) is what brings them back: they are offered and run on
-Intel, on OpenVINO when the provider and the patched ffmpeg's `ort` device are there and on the CPU
-with the reason recorded otherwise (section 5.4). The unmeasured-withholding plumbing stays for a level
-that is not measured, and nothing uses it now.
+The ONNX neural levels (`realesr-anime-x2`, `realesr-anime-x4`, `realesr-general-x4`) are withheld on
+Intel as well, but with a different reason, "not measured on Intel" (`GpuWithheldUnmeasured`): they do not
+need CUDA, and PR 5 gives them an OpenVINO device, but nobody has measured that path on a real Arc. The
+maintainer's condition is that they stay withheld until it is in place **and measured**, so PR 5's path is
+present and unreachable on Intel until `UpscaleEngine.IntelOnnxMeasured` is set (a measured bench result
+lifts it; the tests set it to exercise the path). The Intel `Neural` list is `off`, and the session
+summary names the reason per group.
 
 **Recommended in documentation only: `MaxConcurrent` 1 for 4K output on a small Intel GPU.** The one
 measurement there is (section 6) is a single session, 1080p to 2160p at 38 to 40 fps on an A380.

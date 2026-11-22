@@ -2502,15 +2502,22 @@ namespace Jellyfin.Plugin.Plus.Patcher
         }
 
         /// <summary>
-        /// The reason a level is not run on a detected Intel GPU ("needs NVIDIA"), or null when it
-        /// is. The ONNX levels (<see cref="ShaderLibrary.IsOnnxNeural"/>) were withheld here as
-        /// <see cref="NotMeasuredOnIntel"/> while they would only have fallen back to the CPU
-        /// provider; the OpenVINO device (<see cref="NeuralDeviceFor"/>) is what brings them back,
-        /// so they are offered and run on Intel, on OpenVINO or on the CPU with the reason recorded.
+        /// Whether the ONNX levels' OpenVINO path has been MEASURED on a real Intel GPU. False: they stay
+        /// withheld on Intel as <see cref="NotMeasuredOnIntel"/> even though PR 5's path is present. A
+        /// measured bench result on an Arc will lift this (set it true, or delete it with the clause below).
+        /// The tests flip it to exercise the path.
         /// </summary>
+        internal static bool IntelOnnxMeasured = false;
+
+        /// <summary>The reason a level is not run on a detected Intel GPU ("needs NVIDIA", "not measured on Intel"), or null when it is.</summary>
         internal static string IntelWithholdReason(string axis, string level)
         {
-            return NvidiaOnly(axis, level) ? NeedsNvidia : null;
+            if (NvidiaOnly(axis, level))
+            {
+                return NeedsNvidia;
+            }
+
+            return axis == "Neural" && !IntelOnnxMeasured && ShaderLibrary.IsOnnxNeural(level) ? NotMeasuredOnIntel : null;
         }
 
         /// <summary>
