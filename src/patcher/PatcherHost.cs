@@ -254,6 +254,20 @@ namespace Jellyfin.Plugin.Plus.Patcher
         /// <summary>The non-sensitive subset of the GPU record, for routes any authenticated user can reach. Never throws.</summary>
         private static GpuSummary GpuPublic() => UpscaleEngine.CapabilitySummary();
 
+        /// <summary>
+        /// The session record as any authenticated user may read it: without the render-node paths
+        /// (<see cref="SessionRecord.VulkanDevice"/> and <see cref="SessionRecord.QsvDevice"/> name
+        /// the node). AGENTS.md invariant 13: those are for the administrator-only Status route,
+        /// which serves the records whole.
+        /// </summary>
+        private static System.Text.Json.Nodes.JsonObject PublicRecord(SessionRecord record)
+        {
+            var node = JsonSerializer.SerializeToNode(record) as System.Text.Json.Nodes.JsonObject;
+            node?.Remove("VulkanDevice");
+            node?.Remove("QsvDevice");
+            return node;
+        }
+
         /// <summary>Status plus recent sessions, as JSON.</summary>
         public static string StatusJson()
         {
@@ -341,7 +355,7 @@ namespace Jellyfin.Plugin.Plus.Patcher
             {
                 ["PatchActive"] = UpscalePatches.Active,
                 ["Known"] = true,
-                ["Record"] = record,
+                ["Record"] = PublicRecord(record),
                 ["UpscaleApplied"] = record.UpscaleApplied,
                 ["DeblurApplied"] = record.DeblurApplied,
                 ["DenoiseApplied"] = record.DenoiseApplied,
