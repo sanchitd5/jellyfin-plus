@@ -156,9 +156,10 @@ esbuild) support natively.
 | file | what it is |
 |---|---|
 | `docker/intel/Dockerfile` | the production Jellyfin image plus the `GPU_VENDOR=intel` ffmpeg, plugin, patcher, shim, shaders and injected web client; pinned base digest, FSR2 commit and .NET SDK sha512; fails the build on a missing filter, an unresolved library or a changed stock ffmpeg |
-| `docker/intel/stage-plugin.sh` | the image-time half of `proxmox-build.sh`: publishes the plugin and patcher against the image's own Jellyfin assemblies and writes `meta.json` |
+| `docker/intel/stage-plugin.sh` | the image-time half of `proxmox-build.sh`: publishes the plugin and patcher against the image's own Jellyfin assemblies and writes `meta.json`; sources `scripts/plugin-meta.sh` |
+| `scripts/plugin-meta.sh` | the plugin GUID, name, target ABI and `plugin_first_meta`, sourced by `proxmox-build.sh` and `stage-plugin.sh` (never by `bench-intel.sh`: the image's final stage does not carry it) |
 | `docker/intel/Dockerfile.dockerignore` | keeps `.git`, `docs`, build output and `web/node_modules` out of the build context |
-| `scripts/bench-intel.sh` | the 13-row Intel Arc matrix: `--dry-run` prints the plan, a run needs `BENCH_ASSERT_QUIET=1`; sources `scripts/ffmpeg-vendor.sh` |
+| `scripts/bench-intel.sh` | the 13-row Intel Arc matrix: `--dry-run` prints the plan, a run needs `BENCH_ASSERT_QUIET=1` (or `--no-gates` with `BENCH_CONFIRM_NO_GATES=1`); sources `scripts/ffmpeg-vendor.sh` |
 | `scripts/test_bench_intel.py` | the plan goldens, refusals, a stub run, mutants and the Dockerfile's static checks |
 
 ## Entry point

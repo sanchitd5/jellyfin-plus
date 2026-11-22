@@ -15,6 +15,8 @@
 #      whatever produced the plane - i.e. at the SR shader's output size, not at full output size
 #   4. rewrite the EASUTEX_* texture accessors to HOOKED_*
 #   5. substitute SHARPNESS
+#   6. prepend the comment lines above the first //! directive, so the MIT licence travels with
+#      every derived file
 #
 # SHARPNESS IS INVERTED AND CLAMPED. 0.0 is MAXIMUM sharpening, larger is gentler, and AMD's
 # shader hard-clamps it into [0, 2] - a value above 2.0 is silently identical to 2.0.
@@ -26,11 +28,21 @@ OUT=${2:-.}
 L=$(grep -n '^//!HOOK' "$SRC" | sed -n 2p | cut -d: -f1)
 [ -n "$L" ] || { echo "second //!HOOK not found in $SRC - is this agyild's FSR.glsl?" >&2; exit 1; }
 
-BASE=$(sed -n "${L},\$p" "$SRC" \
+BODY=$(sed -n "${L},\$p" "$SRC" \
   | sed -e 's|^//!BIND EASUTEX$|//!BIND HOOKED|' \
         -e '/^\/\/!WIDTH EASUTEX\.w$/d' \
         -e '/^\/\/!HEIGHT EASUTEX\.h$/d' \
         -e 's/EASUTEX_/HOOKED_/g')
+
+# The licence sits above the first //! directive, which step 1 drops: carry its comment lines over
+# so the MIT attribution stays attached to every derived file, and refuse to emit one without it.
+F=$(grep -n '^//!' "$SRC" | sed -n 1p | cut -d: -f1)
+HEADER=$(sed -n "1,$((F - 1))p" "$SRC" | grep -E '^(//|[[:space:]]*$)' || true)
+case "$HEADER" in
+  *'Permission is hereby granted, free of charge'*) : ;;
+  *) echo "MIT licence text not found above the first //! directive in $SRC" >&2; exit 1 ;;
+esac
+BASE=$(printf '%s\n\n%s' "$HEADER" "$BODY")
 
 case "$BASE" in
   *HOOKED_tex*) : ;;

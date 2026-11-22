@@ -4,6 +4,7 @@
 #   scripts/bench-intel.sh --dry-run            print the plan: gates, thresholds, the commands; run nothing
 #   scripts/bench-intel.sh [--rows 2,3,7]       run the rows (default: all 13), median of BENCH_RUNS runs
 #   scripts/bench-intel.sh --list               one line per row
+#   scripts/bench-intel.sh --no-gates ...       skip the quiet-box gates; needs BENCH_CONFIRM_NO_GATES=1 (exit 2 without it)
 #
 # It runs INSIDE the Intel image (docker/intel/Dockerfile) on the GPU node, from the bench Job. Rows
 # 1, 6, 10 and 12 and the end-to-end halves of rows 3 and 4 drive a Jellyfin through its API
@@ -33,6 +34,10 @@
 #   BENCH_JELLYFIN_TOKEN  an admin API token             (none)
 #   BENCH_ASSERT_QUIET=1  the caller asserts no vzdump, no Plex or production Jellyfin transcode
 #   BENCH_PLEX_TRANSCODING=1  the caller asserts one Plex hardware transcode is running (row 11 only)
+#   BENCH_CONFIRM_NO_GATES=1  required with --no-gates: the caller owns the quiet-box check the gates make
+#   BENCH_PSI_FILE        memory pressure file for the gate    /proc/pressure/memory
+#   BENCH_SHIM_LOG        the shim's log; rows 1 and 12 read only what is appended during the run   /var/log/jellyfin-upscale.log
+#   BENCH_NEURAL_LEVEL    the neural level row 6 asks for      realesr-anime-x2 (realesr-anime-x2|realesr-anime-x4|realesr-general-x4)
 #
 # Clips: <title>_{360,720,1080,2160}p.mkv lossless masters (the 360/720/1080 are `scale=flags=area`
 # from the 2160p one), still_720p.png (one frame), pan_720p.mkv and pan_1080p.mkv (a panning cut).
@@ -56,6 +61,8 @@ RUNS="${BENCH_RUNS:-3}"
 JF_URL="${BENCH_JELLYFIN_URL:-http://127.0.0.1:8096}"
 JF_TOKEN="${BENCH_JELLYFIN_TOKEN:-}"
 SHIM_LOG="${BENCH_SHIM_LOG:-/var/log/jellyfin-upscale.log}"
+PSI_FILE="${BENCH_PSI_FILE:-/proc/pressure/memory}"
+NEURAL_LEVEL="${BENCH_NEURAL_LEVEL:-realesr-anime-x2}"
 
 ALL_ROWS=(1 2 3 4 5 6 7 8 9 10 11 12 13)
 DRY=0
@@ -185,9 +192,9 @@ print_plan() {
                 echo "plan: row 4 threshold: fps>=$FPS_R4 e2e>=${E2E_X}x xpsnr>=+$XPSNR_R4" ;;
             5)  cmd_run "$(clip 360)" "$(chain_ort 1920 1080)"; plan_cmd 5
                 cmd_run "$(clip 720)" "$(chain_ort 1920 1080)"; plan_cmd 5
-                echo "plan: row 5 cmd: session record NeuralDevice via $JF_URL/JellyfinPlus/Session/<PlaySessionId>"
+                echo "plan: row 5 cmd: a 360p stream with neural=realesr-anime-x2, then NeuralDevice from $JF_URL/JellyfinPlus/Session/<its PlaySessionId>"
                 echo "plan: row 5 threshold: device=openvino; largest NeuralMaxSourceHeight holding >=${E2E_X}x" ;;
-            6)  echo "plan: row 6 cmd: set NeuralMaxSourceHeight=480, transcode $(clip 720), read Session/<id> NeuralRouting" ;;
+            6)  echo "plan: row 6 cmd: set NeuralMaxSourceHeight=480 (restored after), transcode $(clip 720) with neural=$NEURAL_LEVEL, read Session/<id> NeuralRouting" ;;
             7)  cmd_still "$CLIPS/still_720p.png" "$(chain_fsr2 1920 1080)" "$OUT/still-fsr2.txt"; plan_cmd 7
                 cmd_still "$CLIPS/still_720p.png" "$(chain_shader 1920 1080)" "$OUT/still-control.txt"; plan_cmd 7
                 echo "plan: row 7 skip frames: 3x=$(still_skip 3) 2x=$(still_skip 2) 1.5x=$(still_skip 1.5)"
@@ -215,14 +222,16 @@ FAILED=0
 STREAM_SID=""
 STREAM_SEG=""
 STREAM_SPEED=0
+STREAM_ERR=""
+SHIM_LOG_START=0
 
+# detail can carry server text (quotes, backslashes, newlines): jq writes the JSONL, the console line is one line.
 record() { # row status detail
-    local detail="${3//\"/\'}"
-    printf 'result: row %s %s %s\n' "$1" "$2" "$3"
+    printf 'result: row %s %s %s\n' "$1" "$2" "${3//$'\n'/ }"
     RESULTS+=("$1 $2")
     [[ "$2" != FAIL ]] || FAILED=1
     mkdir -p "$OUT"
-    printf '{"row":%s,"status":"%s","detail":"%s"}\n' "$1" "$2" "$detail" >> "$OUT/results.jsonl"
+    jq -nc --argjson row "$1" --arg status "$2" --arg detail "$3" '{row:$row,status:$status,detail:$detail}' >> "$OUT/results.jsonl"
 }
 
 need() { command -v "$1" >/dev/null 2>&1 || [[ -x "$1" ]] || die "missing tool: $1"; }
@@ -236,12 +245,13 @@ check_gates() {
     local hm psi
     [[ "${BENCH_ASSERT_QUIET:-}" == 1 ]] \
         || die "gate: set BENCH_ASSERT_QUIET=1 once you have checked there is no vzdump, no Plex transcode and no production Jellyfin transcode"
-    hm=$(TZ=Australia/Melbourne date +%H%M)
-    if { [[ $hm -ge 0100 && $hm -lt 0700 ]]; } || { [[ $hm -ge 1630 && $hm -lt 1830 ]]; }; then
-        die "gate: $hm Australia/Melbourne is inside the night window, drain, trivy or backup time"
+    # 10#: HHMM has a leading zero, which bash reads as octal (0830 and 0900 are then errors)
+    hm=$((10#$(TZ=Australia/Melbourne date +%H%M)))
+    if (( (hm >= 100 && hm < 700) || (hm >= 1630 && hm < 1830) )); then
+        die "gate: $(printf '%04d' "$hm") Australia/Melbourne is inside the night window, drain, trivy or backup time"
     fi
-    if [[ -r /proc/pressure/memory ]]; then
-        psi=$(awk '/^some/ { split($3, a, "="); print a[2] }' /proc/pressure/memory)
+    if [[ -r "$PSI_FILE" ]]; then
+        psi=$(awk '/^some/ { split($3, a, "="); print a[2] }' "$PSI_FILE")
         le "${psi:-0}" 1 || die "gate: memory PSI some avg60=$psi >= 1%"
     fi
 }
@@ -286,16 +296,21 @@ ffmpeg_pid() {
 
 # run_fps <clip> <chain> [output]: the median fps of RUNS runs (frames over wall time, from -benchmark).
 run_fps() {
-    local i log n
+    local i log n v vals=()
     log=$(mktemp)
     for ((i = 0; i < RUNS; i++)); do
         cmd_run "$1" "$2" "${3:-}"
+        # collected in this shell, not piped into median from the loop: a return inside a pipe is lost
         "${CMD[@]}" 2>"$log" >/dev/null || { echo 0; rm -f "$log"; return 1; }
-        n=$(tr '\r' '\n' <"$log" | awk '/^frame=/ { gsub(/frame= */, ""); f = $1 } END { print f + 0 }')
-        awk -v n="$n" -v r="$(awk -F'[= ]+' '/^bench:.*rtime/ { for (i = 1; i <= NF; i++) if ($i == "rtime") { v = $(i + 1); sub(/s/, "", v); print v } }' "$log" | tail -1)" \
-            'BEGIN { if (r > 0) printf "%.2f\n", n / r; else print 0 }'
-    done | median
-    rm -f "$log"
+        # -stats separates its updates with \r, so the bench: line can share a line with the last one
+        tr '\r' '\n' <"$log" >"$log.n"
+        n=$(awk '/^frame=/ { gsub(/frame= */, ""); f = $1 } END { print f + 0 }' "$log.n")
+        v=$(awk -v n="$n" -v r="$(awk -F'[= ]+' '/^bench:.*rtime/ { for (i = 1; i <= NF; i++) if ($i == "rtime") { v = $(i + 1); sub(/s/, "", v); print v } }' "$log.n" | tail -1)" \
+            'BEGIN { if (r > 0) printf "%.2f\n", n / r; else print 0 }')
+        vals+=("$v")
+    done
+    rm -f "$log" "$log.n"
+    printf '%s\n' "${vals[@]}" | median
 }
 
 # xpsnr_y <candidate> <master>: the luma XPSNR of a candidate against its master.
@@ -312,25 +327,37 @@ src_fps() { "$FFPROBE" -v error -select_streams v:0 -show_entries stream=r_frame
 
 # ---- Jellyfin API ----------------------------------------------------------------------------------
 
-api() { curl -fsS -H "X-Emby-Token: $JF_TOKEN" "$JF_URL$1"; }
+# api <path> [curl args]: the token goes in on stdin (--config -), so it is never on a command line (ps, /proc).
+# -f makes an HTTP error a non-zero exit: every caller handles it and records FAIL.
+api() {
+    local p="$1" tok="$JF_TOKEN"
+    shift
+    tok="${tok//\\/\\\\}"; tok="${tok//\"/\\\"}"
+    printf 'header = "X-Emby-Token: %s"\n' "$tok" | curl -fsS --config - "$@" "$JF_URL$p"
+}
 have_api() { [[ -n "$JF_TOKEN" ]] && api /System/Info/Public >/dev/null 2>&1; }
 
-item_id() { # a clip file name
-    api "/Items?Recursive=true&Fields=Path&SearchTerm=${1%.*}" | jq -r --arg n "$1" '.Items[] | select(.Path | endswith("/" + $n)) | .Id' | head -1
+# The bytes the shim log gained since this run began: a line from an earlier session says nothing about this one.
+shim_log_new() { if [[ -r "$SHIM_LOG" ]]; then tail -c +$((SHIM_LOG_START + 1)) "$SHIM_LOG"; fi; }
+
+item_id() { # a clip file name; empty when the library lacks it or the API fails
+    api "/Items?Recursive=true&Fields=Path&SearchTerm=${1%.*}" | jq -r --arg n "$1" 'first(.Items[] | select(.Path | endswith("/" + $n)) | .Id) // empty' || true
 }
 
-# api_stream <item id> <height> <extra query> -> sets STREAM_SPEED (media seconds per wall second over
-# the first 5 segments) and STREAM_SID (the PlaySessionId). Bitrates map to the plugin's bitrate_targets.
+# api_stream <item id> <height> <extra query>: 0 and STREAM_SPEED (media seconds per wall second over the
+# first 5 segments), STREAM_SID (the PlaySessionId) and STREAM_SEG on success; 1 and STREAM_ERR when the
+# item is unknown, a request fails or no segment comes back. Bitrates map to the plugin's bitrate_targets.
 api_stream() {
-    local id="$1" h="$2" extra="${3:-}" br m3u8 seg i t0 t1 n=0 dir
+    local id="$1" h="$2" extra="${3:-}" br m3u8 seg t0 t1 n=0 dir variant
     case "$h" in 2160) br=20000000 ;; 1440) br=8000000 ;; *) br=4000000 ;; esac
-    STREAM_SID="bench-$(date +%s)-$h"
+    STREAM_SID="bench-$(date +%s)-$h"; STREAM_SEG=""; STREAM_SPEED=0; STREAM_ERR=""
+    [[ -n "$id" ]] || { STREAM_ERR="the clip is not in the Jellyfin library"; return 1; }
     dir="$OUT/stream-$h"; mkdir -p "$dir"
     m3u8="/Videos/$id/master.m3u8?MediaSourceId=$id&PlaySessionId=$STREAM_SID&VideoCodec=hevc,h264&MaxHeight=$h&VideoBitrate=$br&TranscodingMaxAudioChannels=2&allowVideoStreamCopy=false&allowAudioStreamCopy=false${extra:+&$extra}"
-    api "$m3u8" >"$dir/master.m3u8"
-    local variant
+    api "$m3u8" >"$dir/master.m3u8" || { STREAM_ERR="GET master.m3u8 failed"; return 1; }
     variant=$(awk '!/^#/ && NF { print; exit }' "$dir/master.m3u8")
-    api "/Videos/$id/$variant" >"$dir/main.m3u8"
+    [[ -n "$variant" ]] || { STREAM_ERR="master.m3u8 lists no variant"; return 1; }
+    api "/Videos/$id/$variant" >"$dir/main.m3u8" || { STREAM_ERR="GET $variant failed"; return 1; }
     t0=$(date +%s.%N)
     while read -r seg; do
         [[ -n "$seg" ]] || continue
@@ -338,8 +365,10 @@ api_stream() {
         n=$((n + 1)); [[ $n -lt 5 ]] || break
     done < <(awk '!/^#/ && NF' "$dir/main.m3u8")
     t1=$(date +%s.%N)
-    STREAM_SPEED=$(awk -v n="$n" -v a="$t0" -v b="$t1" 'BEGIN { printf "%.2f\n", (b > a) ? n * 6 / (b - a) : 0 }')
-    for i in "$dir"/seg0.bin; do STREAM_SEG="$i"; done
+    [[ $n -gt 0 ]] || { STREAM_ERR="no segment came back"; return 1; }
+    # a clock without sub-second resolution reads 0 elapsed for a fast stream: count it as 1 s, a lower bound
+    STREAM_SPEED=$(awk -v n="$n" -v a="$t0" -v b="$t1" 'BEGIN { d = b - a; if (d < 0.001) d = 1; printf "%.2f\n", n * 6 / d }')
+    STREAM_SEG="$dir/seg0.bin"
 }
 
 # ---- the rows --------------------------------------------------------------------------------------
@@ -360,7 +389,7 @@ row_1() {
     [[ -f "$PREFIX/fsr2-nocuda" ]] || bad+=" marker-missing"
     if [[ -r "$SHIM_LOG" ]]; then
         local hits
-        hits=$(grep -ciE 'nvenc|cuda' "$SHIM_LOG" || true)
+        hits=$(shim_log_new | grep -ciE 'nvenc|cuda' || true)
         [[ "${hits:-0}" -eq 0 ]] || bad+=" nvenc/cuda-in-log:$hits"
     else
         why=" (no $SHIM_LOG yet: the command-line check needs a session first)"
@@ -388,10 +417,14 @@ shader_row() { # row src-height dst-w dst-h fps-min xpsnr-min [e2e]
     ge "$d" "$xmin" || status=FAIL
     if [[ "$e2e" == 1 ]]; then
         if have_api; then
-            id=$(item_id "${TITLE}_${sh}p.mkv"); src=$(src_fps "$(clip "$sh")")
-            api_stream "${id:-none}" "$h" "sr=fsrcnnx"
-            detail+=" e2e=${STREAM_SPEED}x_realtime src_fps=$src"
-            ge "$STREAM_SPEED" "$E2E_X" || status=FAIL
+            id=$(item_id "${TITLE}_${sh}p.mkv"); src=$(src_fps "$(clip "$sh")" 2>/dev/null || true)
+            if api_stream "$id" "$h" "sr=fsrcnnx"; then
+                detail+=" e2e=${STREAM_SPEED}x_realtime src_fps=$src"
+                ge "$STREAM_SPEED" "$E2E_X" || status=FAIL
+            else
+                detail+=" e2e=FAIL($STREAM_ERR)"
+                status=FAIL
+            fi
         else
             detail+=" e2e=SKIP(no API)"
             [[ "$status" == PASS ]] && status=SKIP
@@ -406,24 +439,74 @@ row_4() { shader_row 4 1080 3840 2160 "$FPS_R4" "$XPSNR_R4" 1; }
 
 row_5() {
     [[ -n "$ORT_MODEL" ]] || { record 5 SKIP "no BENCH_ORT_MODEL"; return; }
-    local f360 f720 note=""
-    f360=$(run_fps "$(clip 360)" "$(chain_ort 1920 1080)") || f360="failed"
-    f720=$(run_fps "$(clip 720)" "$(chain_ort 1920 1080)") || f720="failed"
-    if have_api; then
-        note=" device=$(api "/JellyfinPlus/Session/${STREAM_SID:-bench}" 2>/dev/null | jq -r '.NeuralDevice // "none"')"
-    else
-        note=" device=SKIP(no API: the session record is what proves openvino)"
+    local f360 f720 rec dev applied status=MANUAL note
+    f360=$(run_fps "$(clip 360)" "$(chain_ort 1920 1080)") || { record 5 FAIL "the ort chain failed at 360p (fps_360p=$f360)"; return; }
+    f720=$(run_fps "$(clip 720)" "$(chain_ort 1920 1080)") || { record 5 FAIL "the ort chain failed at 720p (fps_720p=$f720)"; return; }
+    note="fps_360p=$f360 fps_720p=$f720 (real time = source fps; choose NeuralMaxSourceHeight from these)"
+    if ! have_api; then
+        record 5 MANUAL "$note device=SKIP(no API: the session record is what proves openvino)"
+        return
     fi
-    record 5 MANUAL "fps_360p=$f360 fps_720p=$f720 (real time = source fps; choose NeuralMaxSourceHeight from these)$note"
+    # the device comes from a neural stream of this run: the record is per PlaySessionId
+    if ! api_stream "$(item_id "${TITLE}_360p.mkv")" 1080 "neural=$NEURAL_LEVEL"; then
+        record 5 FAIL "$note neural stream: $STREAM_ERR"
+        return
+    fi
+    rec=$(api "/JellyfinPlus/Session/$STREAM_SID") || { record 5 FAIL "$note GET /JellyfinPlus/Session/$STREAM_SID failed"; return; }
+    dev=$(jq -r '.NeuralDevice // "none"' <<<"$rec")
+    applied=$(jq -r '.NeuralApplied // false' <<<"$rec")
+    [[ "$dev" == openvino ]] || status=FAIL
+    record 5 "$status" "$note device=$dev neural_applied=$applied"
+}
+
+# The plugin's configuration is changed for row 6 and put back as it was found, on any exit.
+CFG_ID=""
+CFG_ORIG=""
+cfg_post() { # a file holding the JSON body
+    api "/Plugins/$CFG_ID/Configuration" -X POST -H "Content-Type: application/json" --data-binary "@$1" >/dev/null
+}
+cfg_restore() {
+    [[ -n "$CFG_ORIG" && -f "$CFG_ORIG" ]] || return 0
+    cfg_post "$CFG_ORIG" || echo "bench: could not restore the plugin configuration: POST it back from $CFG_ORIG" >&2
+    CFG_ORIG=""
 }
 
 row_6() {
     have_api || { record 6 SKIP "no Jellyfin API"; return; }
-    local id rec
+    local cfg id rec routing applied seen new
+    CFG_ID=$(api /Plugins | jq -r 'first(.[] | select(.Name == "Jellyfin Plus") | .Id) // empty' || true)
+    [[ -n "$CFG_ID" ]] || { record 6 FAIL "the Jellyfin Plus plugin is not listed by GET /Plugins"; return; }
+    cfg=$(api "/Plugins/$CFG_ID/Configuration") || { record 6 FAIL "GET the plugin configuration failed"; return; }
+    mkdir -p "$OUT"
+    if [[ "$(jq -r '.NeuralMaxSourceHeight // 0' <<<"$cfg")" != 480 || "$(jq -r '.NeuralAllowed // false' <<<"$cfg")" != true ]]; then
+        CFG_ORIG="$OUT/plugin-config.orig.json"
+        printf '%s' "$cfg" >"$CFG_ORIG"
+        new="$OUT/plugin-config.row6.json"
+        jq -c '.NeuralMaxSourceHeight = 480 | .NeuralAllowed = true' <<<"$cfg" >"$new"
+        cfg_post "$new" || { cfg_restore; record 6 FAIL "could not set NeuralMaxSourceHeight=480 on the plugin configuration"; return; }
+    fi
+    seen=$(api /JellyfinPlus/Session/bench-probe | jq -r '.Levels.NeuralMaxSourceHeight // 0' || true)
+    if [[ "$seen" != 480 ]]; then
+        cfg_restore
+        record 6 FAIL "the probe shows NeuralMaxSourceHeight=${seen:-none}, not 480: the plugin does not apply the setting, so row 6 proves nothing"
+        return
+    fi
     id=$(item_id "${TITLE}_720p.mkv")
-    api_stream "${id:-none}" 1080 "neural=${BENCH_NEURAL_LEVEL:-fast}"
-    rec=$(api "/JellyfinPlus/Session/$STREAM_SID" | jq -r '.NeuralRouting // "none"')
-    if [[ "$rec" != none ]]; then record 6 PASS "NeuralRouting=$rec (run with NeuralMaxSourceHeight=480 set in the plugin)"; else record 6 FAIL "NeuralRouting is empty: NeuralMaxSourceHeight=480 must be set first, and the record must say why"; fi
+    if ! api_stream "$id" 1080 "neural=$NEURAL_LEVEL"; then
+        cfg_restore
+        record 6 FAIL "neural stream: $STREAM_ERR"
+        return
+    fi
+    rec=$(api "/JellyfinPlus/Session/$STREAM_SID") || { cfg_restore; record 6 FAIL "GET /JellyfinPlus/Session/$STREAM_SID failed"; return; }
+    cfg_restore
+    routing=$(jq -r '.NeuralRouting // empty' <<<"$rec")
+    applied=$(jq -r '.NeuralApplied // false' <<<"$rec")
+    # the record must say the neural level was NOT run and why; a "was chosen" record is the opposite
+    if [[ "$routing" == *"NOT run"* && "$applied" != true ]]; then
+        record 6 PASS "NeuralRouting=$routing"
+    else
+        record 6 FAIL "a 720p source with NeuralMaxSourceHeight=480 must go to the shader path with a record saying so: NeuralRouting=${routing:-none} neural_applied=$applied"
+    fi
 }
 
 row_7() {
@@ -478,15 +561,16 @@ row_9() {
 
 row_10() {
     have_api || { record 10 SKIP "no Jellyfin API"; return; }
-    local id codec load fd status=PASS
+    local id codec load fd status=PASS stream_err=""
     id=$(item_id "${TITLE}_1080p.mkv")
     mkdir -p "$OUT"
     rm -f "$OUT/r10-load" "$OUT/r10-fd"
     # Sampled while the stream's segments are being produced; both read the same window.
     ( sleep 4; api /JellyfinPlus/Gpu/Load | jq -r '.gpuBusyPercent // empty' >"$OUT/r10-load" ) &
     ( sleep 4; pid=$(ffmpeg_pid); [[ -z "$pid" ]] || fdinfo_busy "$pid" 3 | sort -k2 -nr | awk 'NR == 1 { print $2 }' >"$OUT/r10-fd" ) &
-    api_stream "${id:-none}" 1080 "sr=fsrcnnx"
+    api_stream "$id" 1080 "sr=fsrcnnx" || stream_err="$STREAM_ERR"
     wait
+    [[ -z "$stream_err" ]] || { record 10 FAIL "stream: $stream_err"; return; }
     load=$(cat "$OUT/r10-load" 2>/dev/null || true)
     fd=$(cat "$OUT/r10-fd" 2>/dev/null || true)
     codec=$("$FFPROBE" -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "${STREAM_SEG:-/dev/null}" 2>/dev/null || true)
@@ -508,17 +592,22 @@ row_11() {
 
 row_12() {
     have_api || { record 12 SKIP "no Jellyfin API"; return; }
-    local h id bad="" seen=""
+    local h id bad="" seen="" got codec new
     id=$(item_id "${TITLE}_2160p.mkv")
     for h in 480 720 1080 2160; do
-        api_stream "${id:-none}" "$h" "sr=fsrcnnx"
-        local got codec
+        if ! api_stream "$id" "$h" "sr=fsrcnnx"; then
+            bad+=" ${h}p:$STREAM_ERR"
+            continue
+        fi
         got=$("$FFPROBE" -v error -select_streams v:0 -show_entries stream=height,codec_name -of csv=p=0 "$STREAM_SEG" 2>/dev/null || true)
         codec=${got%%,*}
         seen+=" ${h}p:${got:-none}"
         [[ "$codec" == h264 || "$codec" == hevc ]] || bad+=" ${h}p"
     done
-    if [[ -r "$SHIM_LOG" ]]; then grep -q 'libplacebo' "$SHIM_LOG" || bad+=" no-libplacebo-in-log"; fi
+    if [[ -r "$SHIM_LOG" ]]; then
+        new=$(shim_log_new)
+        grep -q 'libplacebo' <<<"$new" || bad+=" no-libplacebo-in-log"
+    fi
     if [[ -z "$bad" ]]; then record 12 PASS "$seen"; else record 12 FAIL "bad:$bad seen:$seen"; fi
 }
 
@@ -528,7 +617,7 @@ row_13() {
 
 # ---- main ------------------------------------------------------------------------------------------
 
-usage() { sed -n '2,12p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,13p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -545,21 +634,34 @@ done
 [[ ${#ROWS[@]} -gt 0 ]] || ROWS=("${ALL_ROWS[@]}")
 for r in "${ROWS[@]}"; do row_title "$r" >/dev/null || die "no such row: $r (rows are 1 to 13)"; done
 [[ "$RUNS" =~ ^[1-9][0-9]*$ ]] || die "BENCH_RUNS must be a positive integer, got: $RUNS"
+case "$NEURAL_LEVEL" in
+    realesr-anime-x2 | realesr-anime-x4 | realesr-general-x4) ;;
+    *) die "BENCH_NEURAL_LEVEL must be realesr-anime-x2, realesr-anime-x4 or realesr-general-x4, got: $NEURAL_LEVEL" ;;
+esac
 
 if [[ $DRY == 1 ]]; then
     print_plan
     exit 0
 fi
 
-[[ $GATES == 0 ]] || check_gates
+if [[ $GATES == 1 ]]; then
+    check_gates
+elif [[ "${BENCH_CONFIRM_NO_GATES:-}" != 1 ]]; then
+    die "--no-gates skips the quiet-box checks (no vzdump, no Plex or production transcode, no memory pressure): set BENCH_CONFIRM_NO_GATES=1 to say you have made them"
+fi
 FFPROBE="$(dirname "$STOCK_FFMPEG")/ffprobe"
 need "$PATCHED_FFMPEG"; need "$FFPROBE"; need curl; need jq; need awk
 [[ -d "$CLIPS" ]] || die "no clips directory: $CLIPS"
 mkdir -p "$OUT"
+# The list is captured, then searched: `-filters | grep -q` lets grep quit at its match, the writer takes
+# SIGPIPE, and pipefail reports a filter that is there as missing.
+FILTERS=$("$PATCHED_FFMPEG" -hide_banner -filters 2>/dev/null) || die "$PATCHED_FFMPEG -filters failed"
 for filter in $(ffmpeg_required_filters intel) fsr2 libplacebo xpsnr; do
-    "$PATCHED_FFMPEG" -hide_banner -filters 2>/dev/null | grep -qE "^ [A-Z.]+ +$filter " \
-        || die "$PATCHED_FFMPEG lists no $filter filter: this is not the Intel build"
+    grep -qE "^ [A-Z.]+ +$filter " <<<"$FILTERS" || die "$PATCHED_FFMPEG lists no $filter filter: this is not the Intel build"
 done
+if [[ -r "$SHIM_LOG" ]]; then SHIM_LOG_START=$(wc -c <"$SHIM_LOG" | tr -d ' '); fi
+trap cfg_restore EXIT
+trap 'exit 130' INT TERM
 
 for r in "${ROWS[@]}"; do
     say "row $r: $(row_title "$r")"

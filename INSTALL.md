@@ -2,7 +2,11 @@
 
 A complete walkthrough, from a plain Jellyfin server to working realtime upscaling.
 
-Targets **Jellyfin 12.3.0**. The walkthrough was first done on Jellyfin 12.1.0, Ubuntu 24.04, an **NVIDIA RTX 3090** with driver
+Targets **Jellyfin 12.3 and 12.4** (`targetAbi` 12.3.0.0; verified live on 12.4.0: all five core
+patches, every optional patch except the pre-existing `MetadataService.RefreshMetadata` scan-timing
+miss, a served segment upscaled 1280x720 -> 1920x1080, and both assemblies compile against the 12.4
+DLLs). 12.4 no longer accepts the legacy `api_key=` query parameter - use `ApiKey=` or the
+`Authorization: MediaBrowser Token=` header in hand-built probe URLs. The walkthrough was first done on Jellyfin 12.1.0, Ubuntu 24.04, an **NVIDIA RTX 3090** with driver
 595.84, inside an **unprivileged Proxmox LXC** with GPU passthrough. Adjust paths to your setup.
 
 > This installs software that patches Jellyfin's running code. Take a backup of
@@ -57,10 +61,12 @@ add the service user to the `video` and `render` groups.
 sudo ./scripts/install-shaders.sh
 ```
 
-This fetches FSRCNNX (igv, LGPL-3.0-or-later) and Anime4K (bloc97, MIT) from their upstream
-releases, derives the RCAS sharpening shaders from AMD's FSR (MIT, via agyild's mpv port) using
-`shaders/make-rcas.sh`, and installs this project's CAS shaders as a rollback path. Nothing upstream
-is vendored, so each licence stays attached to the file it belongs to.
+This fetches FSRCNNX (igv release 1.1, LGPL-3.0-or-later), Anime4K (bloc97, MIT, pinned to commit
+`4029bf7`), NVIDIA Image Scaling (agyild's mpv port, MIT), SSimSuperRes, KrigBilateral, RAVU-Zoom and
+CuNNy, and derives the RCAS sharpening shaders from AMD's FSR (MIT, via agyild's mpv port) using
+`shaders/make-rcas.sh`. Nothing upstream is vendored, so each licence stays attached to the file it
+belongs to. It does not install this project's own CAS shaders (`shaders/`, the rollback levels
+`cas-low`/`cas-medium`/`cas-high`): copy those in yourself if you want that path.
 
 Result, in `/usr/share/jellyfin-shaders/`:
 
@@ -68,11 +74,15 @@ Result, in `/usr/share/jellyfin-shaders/`:
 FSRCNNX_x2_8-0-4-1.glsl        FSRCNNX_x2_16-0-4-1.glsl
 Anime4K_Upscale_CNN_x2_S.glsl  Anime4K_Upscale_CNN_x2_M.glsl
 RCAS-2.0.glsl  RCAS-1.7.glsl  RCAS-1.4.glsl
-CAS-low.glsl   CAS-medium.glsl  CAS-high.glsl
+NVScaler.glsl  NVSharpen-0.25.glsl  NVSharpen-0.65.glsl
+SSimSuperRes.glsl  KrigBilateral.glsl  ravu-zoom-r3.glsl
+CuNNy-fast-SOFT-Q.glsl  CuNNy-4x16-SOFT-Q.glsl  CuNNy-4x32-SOFT-Q.glsl  CuNNy-4x16-DS-Q.glsl
 ```
 
-The installer verifies the fetched FSR file carries AMD's version string and MIT header before
-deriving anything. `FSR_GLSL=/path/to/FSR.glsl` installs from a local copy for an offline build.
+The FSRCNNX, Anime4K and NIS files are checked against a pinned sha256, and every file against its
+licence and hook markers; a mismatch stops the install. The installer ends by checking that every file
+above exists. `FSR_GLSL=/path/to/FSR.glsl` installs from a local copy for an offline build, and
+`FSRCNNX_DIR`, `ANIME4K_DIR`, `NIS_DIR` and `CUNNY_DIR` do the same for their families (the sha256 still applies).
 
 The directory must be readable by the Jellyfin service user.
 

@@ -9,3 +9,6 @@ web/node_modules
 web/jellyfin-plus.js
 **/bin
 **/obj
+**/.env*
+**/*.pem
+**/*.key

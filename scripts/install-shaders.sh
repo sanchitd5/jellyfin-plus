@@ -38,7 +38,7 @@ grep -q 'Permission is hereby granted, free of charge' "$TMP/FSR.glsl" \
     || { echo "MIT licence header missing from the fetched file" >&2; exit 1; }
 
 mkdir -p "$DIR"
-bash "$HERE/make-rcas.sh" "$TMP/FSR.glsl" "$TMP"
+bash "$HERE/../shaders/make-rcas.sh" "$TMP/FSR.glsl" "$TMP"
 install -m 0644 "$TMP"/RCAS-2.0.glsl "$TMP"/RCAS-1.7.glsl "$TMP"/RCAS-1.4.glsl "$DIR/"
 
 # ---------------------------------------------------------------------------------------------
@@ -51,10 +51,25 @@ install -m 0644 "$TMP"/RCAS-2.0.glsl "$TMP"/RCAS-1.7.glsl "$TMP"/RCAS-1.4.glsl "
 # output is always larger than the source, so as published the pass would silently never run - a
 # no-op that measures as "no difference" and looks like a result. The guard is removed here, and
 # the two sharpness builds are cut from the same file so the licence header travels with them.
-NIS_URL=${NIS_GLSL_URL:-https://gist.githubusercontent.com/agyild/7e8951915b2bf24526a9343d951db214/raw}
+#
+# The gist's unversioned /raw URL serves whatever is newest, and it stopped being v1.0.2. The fetch
+# is pinned to one revision and each file is checked against its sha256 before anything reads it.
+NIS_REV=05f00864228871ffd157daa9beb2db8fa7412cfa
+NIS_URL=${NIS_GLSL_URL:-https://gist.githubusercontent.com/agyild/7e8951915b2bf24526a9343d951db214/raw/$NIS_REV}
+NIS_SHA256_NVScaler_glsl=${NIS_SCALER_SHA256:-bac778ec0108d272e4dad97794a3c257e65bbebd52aa762f95bce930cbd6b73c}
+NIS_SHA256_NVSharpen_glsl=${NIS_SHARPEN_SHA256:-3d51ac2a9da18284c1f77e46a019e783eac0c609924e6b32e8011889f54f9a12}
+
+sha256_of() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | cut -d' ' -f1
+    else
+        shasum -a 256 "$1" | cut -d' ' -f1
+    fi
+}
 
 fetch_nis() {
     name=$1
+    want=$(eval "echo \$NIS_SHA256_${name//./_}")
     if [ -n "${NIS_DIR:-}" ]; then
         cp "$NIS_DIR/$name" "$TMP/$name"
     elif command -v curl >/dev/null 2>&1; then
@@ -63,6 +78,9 @@ fetch_nis() {
         wget -qO "$TMP/$name" "$NIS_URL/$name"
     fi
 
+    got=$(sha256_of "$TMP/$name")
+    [ "$got" = "$want" ] \
+        || { echo "$name sha256 is $got, expected $want (pinned revision $NIS_REV)" >&2; exit 1; }
     grep -q 'NVIDIA Image Scaling v1.0.2' "$TMP/$name" \
         || { echo "$name is not NVIDIA Image Scaling v1.0.2" >&2; exit 1; }
     grep -q 'Permission is hereby granted, free of charge' "$TMP/$name" \
@@ -226,6 +244,85 @@ fetch_cunny soft CuNNy-fast-SOFT-Q.glsl
 fetch_cunny soft CuNNy-4x16-SOFT-Q.glsl
 fetch_cunny soft CuNNy-4x32-SOFT-Q.glsl
 fetch_cunny ds   CuNNy-4x16-DS-Q.glsl
+
+# =================================================================================================
+# FSRCNNX and Anime4K: the default and the menued SR levels (ShaderLibrary "fsrcnnx",
+# "fsrcnnx-heavy", "anime4k-s", "anime4k-m"). FETCHED, never vendored, each pinned and verified.
+#
+#   FSRCNNX  igv, LGPL-3.0-or-later. A release asset, so the pin is the tag plus the sha256 of the
+#            file. The guard it carries is left alone, like CuNNy's: it matches SrMinScaleFactor.
+#   Anime4K  bloc97, MIT. Fetched by COMMIT (tag v4.0.1), the content pin, plus the sha256.
+#
+# The 16-weight FSRCNNX is the "fsrcnnx-heavy" level; "fsrcnnx-max" (FSRCNN_x2_r1_32-0-2) has no
+# upstream release asset and is not installed here.
+# -------------------------------------------------------------------------------------------------
+FSRCNNX_BASE=${FSRCNNX_URL_BASE:-https://github.com/igv/FSRCNN-TensorFlow/releases/download/1.1}
+FSRCNNX_8_SHA256=${FSRCNNX_8_SHA256:-e800dbc5c1c95185cc82216c597724533ff5f2880179f256eef600f03e8dc2ae}
+FSRCNNX_16_SHA256=${FSRCNNX_16_SHA256:-d5a24a271e5d9a3f7f7a053b150c460a44c25b3cf7f770857d57cc3a2e1c9965}
+ANIME4K_REV=4029bf701ecaa15f163cdc49cffe5501c1acf410
+ANIME4K_BASE=${ANIME4K_URL_BASE:-https://raw.githubusercontent.com/bloc97/Anime4K/$ANIME4K_REV/glsl/Upscale}
+ANIME4K_S_SHA256=${ANIME4K_S_SHA256:-4c53ec2e287908f7ee7bcb266b0170421626d663576468b7d7dafc62962649a4}
+ANIME4K_M_SHA256=${ANIME4K_M_SHA256:-716e02098a68f0d648761f2b96b4dd139e1cb09b174bb369fca3aa34328fff7e}
+
+# fetch_pinned <name> <url> <sha256> [local-dir]: download (or copy) into $TMP and check the hash.
+fetch_pinned() {
+    name=$1
+    url=$2
+    want=$3
+    if [ -n "${4:-}" ]; then
+        cp "$4/$name" "$TMP/$name"
+    elif command -v curl >/dev/null 2>&1; then
+        curl -fsSL "$url" -o "$TMP/$name"
+    else
+        wget -qO "$TMP/$name" "$url"
+    fi
+    got=$(sha256_of "$TMP/$name")
+    [ "$got" = "$want" ] \
+        || { echo "$name sha256 is $got, expected $want" >&2; exit 1; }
+}
+
+fetch_fsrcnnx() {
+    name=$1
+    fetch_pinned "$name" "$FSRCNNX_BASE/$name" "$2" "${FSRCNNX_DIR:-}"
+    grep -q 'Copyright (C) 2017-2021 igv' "$TMP/$name" \
+        || { echo "$name is not igv's FSRCNNX" >&2; exit 1; }
+    grep -q 'GNU Lesser General Public' "$TMP/$name" \
+        || { echo "LGPL header missing from $name" >&2; exit 1; }
+    install -m 0644 "$TMP/$name" "$DIR/$name"
+}
+
+fetch_anime4k() {
+    name=$1
+    variant=$2
+    fetch_pinned "$name" "$ANIME4K_BASE/$name" "$3" "${ANIME4K_DIR:-}"
+    grep -q 'Copyright (c) 2019-2021 bloc97' "$TMP/$name" \
+        || { echo "$name is not bloc97's Anime4K" >&2; exit 1; }
+    grep -q 'Permission is hereby granted, free of charge' "$TMP/$name" \
+        || { echo "MIT licence header missing from $name" >&2; exit 1; }
+    grep -qF "//!DESC Anime4K-v3.2-Upscale-CNN-x2-($variant)" "$TMP/$name" \
+        || { echo "$name is not the ($variant) Upscale CNN x2 network" >&2; exit 1; }
+    grep -q '^//!HOOK MAIN' "$TMP/$name" \
+        || { echo "$name no longer hooks MAIN - the composition order assumption is void" >&2; exit 1; }
+    install -m 0644 "$TMP/$name" "$DIR/$name"
+}
+
+fetch_fsrcnnx FSRCNNX_x2_8-0-4-1.glsl "$FSRCNNX_8_SHA256"
+fetch_fsrcnnx FSRCNNX_x2_16-0-4-1.glsl "$FSRCNNX_16_SHA256"
+fetch_anime4k Anime4K_Upscale_CNN_x2_S.glsl S "$ANIME4K_S_SHA256"
+fetch_anime4k Anime4K_Upscale_CNN_x2_M.glsl M "$ANIME4K_M_SHA256"
+
+# Everything the plugin and the Arc image's own check rely on, named here so a future edit that
+# drops a fetch fails the install instead of the last image step.
+for f in RCAS-2.0 RCAS-1.7 RCAS-1.4 NVScaler NVSharpen-0.25 NVSharpen-0.65 \
+         FSRCNNX_x2_8-0-4-1 FSRCNNX_x2_16-0-4-1 Anime4K_Upscale_CNN_x2_S Anime4K_Upscale_CNN_x2_M \
+         SSimSuperRes KrigBilateral ravu-zoom-r3 \
+         CuNNy-fast-SOFT-Q CuNNy-4x16-SOFT-Q CuNNy-4x32-SOFT-Q CuNNy-4x16-DS-Q; do
+    [ -s "$DIR/$f.glsl" ] || { echo "install-shaders.sh did not produce $DIR/$f.glsl" >&2; exit 1; }
+done
+
+echo
+echo "FSRCNNX and Anime4K installed into $DIR:"
+ls -l "$DIR"/FSRCNNX_*.glsl "$DIR"/Anime4K_*.glsl
 
 echo
 echo "session-10 shaders installed into $DIR:"

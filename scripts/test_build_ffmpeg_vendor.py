@@ -273,7 +273,8 @@ def suite_proxmox(s, scripts, tmp):
     repo = os.path.join(tmp, "repo")
     os.makedirs(os.path.join(repo, ".git"))
     os.makedirs(os.path.join(repo, "scripts"))
-    shutil.copy(os.path.join(scripts, "ffmpeg-vendor.sh"), os.path.join(repo, "scripts"))
+    for name in ("ffmpeg-vendor.sh", "plugin-meta.sh"):
+        shutil.copy(os.path.join(scripts, name), os.path.join(repo, "scripts"))
     # The stub build records what proxmox-build.sh handed it and writes a fake ffmpeg listing STUB_FILTERS.
     stub_build = (
         '#!/bin/bash\n'
@@ -426,7 +427,7 @@ def mutation_phase():
     caught = 0
     for name, fname, old, new in MUTANTS:
         with tempfile.TemporaryDirectory(prefix="test-ffmpeg-vendor-mutant.") as tmp:
-            for f in ("build-ffmpeg.sh", "proxmox-build.sh", "ffmpeg-vendor.sh"):
+            for f in ("build-ffmpeg.sh", "proxmox-build.sh", "ffmpeg-vendor.sh", "plugin-meta.sh"):
                 shutil.copy(os.path.join(HERE, f), os.path.join(tmp, f))
             text = read(os.path.join(tmp, fname))
             if text.count(old) != 1:

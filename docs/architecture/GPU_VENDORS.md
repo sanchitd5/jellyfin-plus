@@ -793,7 +793,7 @@ Deployment may override it. The GPU node needs `/dev/dri` and the host's VA-API 
 | Base image | `docker.io/jellyfin/jellyfin:12.4.20261026-211555@sha256:fea863d0cd9ec445985d9c75fc6ed64e38a1d2766cf0c250a33d553f4fc1b771` |
 | FidelityFX-FSR2 | commit `1680d1edd5c034f88ebbbb793d8b88f8842cf804` (a git commit id is a content hash; the build checks `git rev-parse HEAD`) |
 | .NET 10 SDK | `10.0.404` tarball, checked against its published sha512 (`DOTNET_SDK_SHA512`) |
-| Runtime libraries | not hand-listed: derived from the built binary's `ldd`, minus what the base has, and installed in the final stage |
+| Runtime libraries | not hand-listed: derived from the built binary's `ldd`, minus what the base has, and installed in the final stage; a library the build puts under `/usr/local` (shaderc, which has no package) is copied to `/usr/local/lib` and `ldconfig` runs before the acceptance check |
 
 **Acceptance, enforced by the build.** `ldd` of the patched ffmpeg shows no `not found`; `-filters`
 lists `oidn ort fsr2 libplacebo xpsnr`; the `fsr2-nocuda` marker exists; `-hwaccels` lists `vaapi`;
@@ -801,8 +801,9 @@ lists `oidn ort fsr2 libplacebo xpsnr`; the `fsr2-nocuda` marker exists; `-hwacc
 inject, patcher and plugin files are in place. A failed check fails the build.
 
 **Known gaps (not pinned).** The shared scripts fetch FFmpeg, OIDN, ONNX Runtime, shaderc and
-libplacebo sources, the shader files (`install-shaders.sh`), apt packages and NuGet packages from
-mutable URLs without a hash; this image inherits that and does not edit those scripts. The in-image
+libplacebo sources, the unpinned shader files (`install-shaders.sh`: FSR, SSimSuperRes,
+KrigBilateral, ravu, CuNNy; the FSRCNNX, Anime4K and NIS files are pinned and hashed), apt packages
+and NuGet packages from mutable URLs without a hash; this image inherits that and does not edit those scripts. The in-image
 checks above are what stands in for a pin. FFmpeg 8.1.2's sha256 exists only in
 `scripts/test-vf-ort.sh`. Reusing it in `build-ffmpeg.sh` is a separate change. The binary links
 GPL components: it stays in the owner's registry and is never published.
@@ -819,8 +820,8 @@ never `PASS`.
 | 2 | FSRCNNX 360p to 1080p, software decode | fps >= 100; xpsnr >= bicubic + 0.5 dB |
 | 3 | FSRCNNX 720p to 1080p | end-to-end fps >= 1.2x source; xpsnr >= bicubic + 0.3 dB |
 | 4 | FSRCNNX 1080p to 2160p | scaler-only fps >= 34; end-to-end with QSV >= 1.2x; xpsnr >= bicubic + 0.3 dB |
-| 5 | Neural (ORT on OpenVINO) | record says `openvino`, not CPU; fps measured at 360p and 720p; slower than real time is a valid result |
-| 6 | Routing by source height | `NeuralMaxSourceHeight=480` sends a 720p source to the shader path, and the record says why |
+| 5 | Neural (ORT on OpenVINO) | a 360p neural stream's session record says `openvino`, not CPU (`FAIL` otherwise); fps measured at 360p and 720p; slower than real time is a valid result (`MANUAL`) |
+| 6 | Routing by source height | `NeuralMaxSourceHeight=480` sends a 720p source to the shader path, and the record says why. The row sets it through the plugin configuration API (`/Plugins`, `/Plugins/{id}/Configuration`), checks the probe shows 480, streams `BENCH_NEURAL_LEVEL`, and puts the configuration back as found, on any exit |
 | 7 | fsr2 without CUDA, still pixels | after the first ceil(8*scale^2) frames (72 at 3x, 32 at 2x, 18 at 1.5x): mean consecutive-frame luma difference <= 0.5, per-frame max <= 16 in 99% of frames; FSRCNNX control exactly 0 |
 | 8 | fsr2 without CUDA, moving content | xpsnr on the panning cut >= bicubic (a miss is a result, not a blocker) |
 | 9 | Hardware decode off/on | on: `-hwaccel vaapi`, `hwmap=derive_device=vulkan`, no `Conversion failed!`, cpu time per frame >= 30% lower, xpsnr(on,off) >= 50 dB |
@@ -831,7 +832,10 @@ never `PASS`.
 
 **Gates.** A real run refuses to start unless `BENCH_ASSERT_QUIET=1` (the pod cannot see vzdump or
 other transcodes: the caller must), outside 01:00 to 07:00 and 16:30 to 18:30 Australia/Melbourne
-(drain, trivy, backups), and with memory PSI `some avg60` under 1%. Exit codes: 0, 1 if any row
+(drain, trivy, backups), and with memory PSI `some avg60` under 1%. `--no-gates` skips them only
+with `BENCH_CONFIRM_NO_GATES=1` as well. Rows 1 and 12 read only the shim-log lines appended during
+the run. The admin token reaches curl on stdin, never on a command line. A failed API call, or a
+stream that returns no segment, is a `FAIL` of that row, not a figure. Exit codes: 0, 1 if any row
 `FAIL`, 2 for a refusal.
 
 **Inputs the owner supplies.** The lossless clips (`<title>_{360,720,1080,2160}p.mkv`, `still_720p.png`,
@@ -839,8 +843,10 @@ other transcodes: the caller must), outside 01:00 to 07:00 and 16:30 to 18:30 Au
 row 5. No library content is committed (AGENTS.md invariant 18).
 
 **Test.** `python3 scripts/test_bench_intel.py` checks the plan goldens (13 rows, must-pass lines,
-thresholds, command shapes), the refusals, a hermetic stub run, mutants of the script, and the
-Dockerfile's pins and checks (including this section's digest). It needs no GPU, network or docker.
+thresholds, command shapes), the refusals, a hermetic stub run, a run against a fake Jellyfin
+(a stub curl serving JSON by path) for the API rows, mutants of the script, and the Dockerfile's pins
+and checks (including this section's digest). It needs no GPU, network or docker. The Jellyfin
+plugin-configuration calls of row 6 are checked against the fake only, not a live server.
 
 **Not verified.** An image build; any run on an Arc card (so the real execution of every row,
 the jq parsing of the plugin's API, the stream URL parameters and the fsr2 filter options are

@@ -23,6 +23,9 @@ VERSION="${PLUGIN_VERSION:-1.0.0.0}"
 [[ -d "$BIN" ]] || { echo "stage-plugin: no Jellyfin assemblies at $BIN" >&2; exit 1; }
 [[ -d "$REPO/src/patcher" ]] || { echo "stage-plugin: no $REPO/src/patcher" >&2; exit 1; }
 
+# shellcheck source=../../scripts/plugin-meta.sh
+. "$REPO/scripts/plugin-meta.sh"
+
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
@@ -37,17 +40,7 @@ cp -a "$WORK/out-patcher/Jellyfin.Plugin.Plus.Patcher.dll" "$PATCHER/"
 cp -a "$WORK/out-patcher/0Harmony.dll"                      "$PATCHER/"
 install -m 0644 "$REPO/assets/jellyfinplus.png" "$PLUGIN_DIR/jellyfinplus.png"
 
-cat > "$PLUGIN_DIR/meta.json" <<META
-{
-  "guid": "6f2a9c31-4d7b-4e2a-9d15-8a1c0b7e3f44",
-  "name": "Jellyfin Plus",
-  "version": "$VERSION",
-  "targetAbi": "12.3.0.0",
-  "owner": "",
-  "overview": "GPU video enhancement plus search, filtering and library quality-of-life improvements for Jellyfin.",
-  "category": "General"
-}
-META
+plugin_first_meta "$VERSION" > "$PLUGIN_DIR/meta.json"
 
 python3 - "$PLUGIN_DIR/meta.json" "$REPO/assets/plugin-meta.json" <<'PYEOF'
 import json, os, sys

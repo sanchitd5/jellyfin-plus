@@ -5,8 +5,8 @@ server's GPU and in the viewer's browser, and it improves the player, search, li
 tag management. It ships as one plugin plus one injected client script. Every feature installs on its
 own and falls back to stock Jellyfin when it cannot attach.
 
-Supports stock Jellyfin **12.3** as is: no Jellyfin rebuild or source changes, every patch attaches to the
-released 12.3 server. The server-side video enhancement was measured, on 12.1.0, on an NVIDIA RTX 3090.
+Supports stock Jellyfin **12.3 and 12.4** as is: no Jellyfin rebuild or source changes, every patch attaches to the
+released 12.3 and 12.4 servers (12.4.0 verified live, no code change needed). The server-side video enhancement was measured, on 12.1.0, on an NVIDIA RTX 3090.
 
 > **This is not an official Jellyfin plugin, and it works by runtime-patching Jellyfin.**
 > Read [Limitations and risks](#limitations-and-risks) before installing it anywhere you care about.
@@ -43,7 +43,7 @@ why; a feature that cannot attach leaves stock Jellyfin in place.
 
 ## Requirements
 
-- Jellyfin **12.3**, stock package (other versions: see [Limitations and risks](#limitations-and-risks))
+- Jellyfin **12.3 or 12.4**, stock package (other versions: see [Limitations and risks](#limitations-and-risks))
 - .NET SDK matching the server's runtime, plus Node.js and npm, on the build machine
 - The jellyfin-web client in a browser for the client features; other apps get only the server-side
   changes
@@ -106,7 +106,7 @@ GPLv2+ and links Apache-2.0 code. Build it for yourself.
   More in [the manual](docs/video-enhancement.md).
 - **Browser upscaling** switches off while native subtitles show, in iOS native fullscreen and in
   picture-in-picture. It is measured only on a desktop GPU.
-- `targetAbi` is the oldest Jellyfin that loads the plugin (12.3.0.0); a newer server still loads it, so re-verify the patches after every Jellyfin upgrade.
+- `targetAbi` is the oldest Jellyfin that loads the plugin (12.3.0.0); a newer server still loads it (verified on 12.4.0), so re-verify the patches after every Jellyfin upgrade.
 
 ## Licences and credits
 

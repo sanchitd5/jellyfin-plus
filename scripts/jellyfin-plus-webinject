@@ -24,7 +24,9 @@ SRC=${JP_SRC:-/usr/lib/jellyfin-plus/jellyfin-plus.js}
 # file is not what dpkg installed but our saved original is, put the original back byte for byte;
 # dpkg then upgrades silently and the Post-Invoke run of this script re-adds the entry.
 # The md5 dpkg recorded for the file (empty when unknown: then nothing is restored or refreshed).
-CONF_MD5=${JP_CONF_MD5:-$(dpkg-query -W -f='${Conffiles}\n' jellyfin-web 2>/dev/null | awk -v f="$WEB/config.json" '$1==f{print $2}')}
+# `|| true`: dpkg-query exits 1 when jellyfin-web is not a dpkg package (the container image's plain
+# tree), and under set -e + pipefail that killed the script with no output.
+CONF_MD5=${JP_CONF_MD5:-$(dpkg-query -W -f='${Conffiles}\n' jellyfin-web 2>/dev/null | awk -v f="$WEB/config.json" '$1==f{print $2}' || true)}
 if [ "${1:-}" = "--restore-conffile" ]; then
     cfg="$WEB/config.json"; orig="$cfg.jellyfin-plus-orig"
     if [ -n "$CONF_MD5" ] && [ -f "$cfg" ] && [ -f "$orig" ] \

@@ -37,9 +37,12 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PATH=/opt/dotnet:$PATH
 
 # What must exist before build-ffmpeg.sh's own preflight: the FSR2 library is built out of tree and the
-# script refuses to start without it. build-ffmpeg.sh installs the rest of its own apt list.
+# script refuses to start without it, and its Vulkan backend needs vulkan/vulkan.h. The rest is the
+# script's own intel apt list (scripts/test_bench_intel.py keeps the two equal), so its apt step is a no-op.
+# Not libshaderc-dev: the script builds shaderc from source, the distro one breaks nlmeans_vulkan.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl git python3 build-essential glslang-tools nodejs npm \
+        pkg-config nasm yasm meson ninja-build cmake libx264-dev libxcb1-dev libvulkan-dev libva-dev libvpl-dev libdrm-dev \
  && rm -rf /var/lib/apt/lists/*
 
 RUN curl -fsSL "$DOTNET_SDK_URL" -o /tmp/dotnet.tar.gz \
@@ -75,12 +78,14 @@ RUN GPU_VENDOR=intel WITH_ORT=1 ORT_EP=openvino WITH_FSR2=1 \
     bash scripts/build-ffmpeg.sh
 
 # The apt packages the new binary needs at run time that the base does not carry, named from its own ldd
-# so the final stage installs exactly those and nothing is guessed.
+# so the final stage installs exactly those and nothing is guessed. A library built from source under
+# /usr/local (shaderc: the distro one breaks nlmeans_vulkan) has no package, so it is copied under the
+# soname the binary asks for and the final stage carries it.
 COPY --from=base-pkgs /base-pkgs.txt /base-pkgs.txt
-RUN set -eu; mkdir -p /out; P=/usr/lib/jellyfin-ffmpeg-oidn; \
-    ldd "$P/ffmpeg" | awk '/=>/ && $3 ~ /^\// { print $3 }' | while read -r l; do \
+RUN set -eu; mkdir -p /out/local-libs; P=/usr/lib/jellyfin-ffmpeg-oidn; \
+    ldd "$P/ffmpeg" | awk '/=>/ && $3 ~ /^\// { print $1, $3 }' | while read -r n l; do \
         r=$(readlink -f "$l"); \
-        case "$r" in "$P"/*) continue ;; esac; \
+        case "$r" in "$P"/*) continue ;; /usr/local/*) cp "$r" "/out/local-libs/$n"; echo "local: $n" >&2; continue ;; esac; \
         dpkg -S "$r" 2>/dev/null | head -1 | cut -d: -f1; \
     done | sort -u > /tmp/needed.txt; \
     comm -23 /tmp/needed.txt /base-pkgs.txt > /out/runtime-packages.txt; \
@@ -91,16 +96,28 @@ RUN bash docker/intel/stage-plugin.sh /src "$JELLYFIN_BIN" /out/plugin-dist /out
 
 # The web client, built from web/src and injected into the web root now: the pod's root filesystem is
 # read-only, so the runtime injector (scripts/jellyfin-plus-webinject) cannot run there.
-RUN cd web && npm ci --no-audit --no-fund && cd .. \
- && bash scripts/build-web-panel.sh \
- && install -m 0644 web/jellyfin-plus.js /out/patcher/jellyfin-plus.js \
- && install -m 0644 web/theme/jellyfinplus.css /out/patcher/jellyfinplus-theme.css \
- && JP_WEB="$JELLYFIN_WEB" JP_SRC=/out/patcher/jellyfin-plus.js JP_THEME_SRC=/out/patcher/jellyfinplus-theme.css \
-    bash scripts/jellyfin-plus-webinject
+RUN set -eux; \
+    echo "web: npm ci"; \
+    (cd web && npm ci --no-audit --no-fund); \
+    echo "web: build"; \
+    bash scripts/build-web-panel.sh; \
+    echo "web: install bundle and theme"; \
+    install -m 0644 web/jellyfin-plus.js /out/patcher/jellyfin-plus.js; \
+    install -m 0644 web/theme/jellyfinplus.css /out/patcher/jellyfinplus-theme.css; \
+    echo "web: inject into $JELLYFIN_WEB"; \
+    JP_WEB="$JELLYFIN_WEB" JP_SRC=/out/patcher/jellyfin-plus.js JP_THEME_SRC=/out/patcher/jellyfinplus-theme.css \
+        bash scripts/jellyfin-plus-webinject
 
-# The shaders. install-shaders.sh fetches from mutable upstream URLs with no hash (a recorded gap).
+# The shaders. install-shaders.sh pins and hashes the FSRCNNX, Anime4K and NIS files; the gist and
+# raw/master ones (FSR, SSimSuperRes, KrigBilateral, ravu, CuNNy) are still mutable (a recorded gap).
+# The test -f list is every SR file the plugin offers by default or in its menu, plus the sharpeners.
 RUN bash scripts/install-shaders.sh /usr/share/jellyfin-shaders \
- && test -f /usr/share/jellyfin-shaders/FSRCNNX_x2_8-0-4-1.glsl
+ && test -f /usr/share/jellyfin-shaders/FSRCNNX_x2_8-0-4-1.glsl \
+ && test -f /usr/share/jellyfin-shaders/FSRCNNX_x2_16-0-4-1.glsl \
+ && test -f /usr/share/jellyfin-shaders/Anime4K_Upscale_CNN_x2_S.glsl \
+ && test -f /usr/share/jellyfin-shaders/Anime4K_Upscale_CNN_x2_M.glsl \
+ && test -f /usr/share/jellyfin-shaders/NVScaler.glsl \
+ && test -f /usr/share/jellyfin-shaders/RCAS-1.7.glsl
 
 # ---- the image -----------------------------------------------------------------------------------
 FROM ${JELLYFIN_IMAGE}
@@ -117,6 +134,10 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/* /tmp/runtime-packages.txt
 
 COPY --from=build /usr/lib/jellyfin-ffmpeg-oidn /usr/lib/jellyfin-ffmpeg-oidn
+# The base lists /usr/local/lib in /etc/ld.so.conf.d/libc.conf (checked on the pinned image); the cache
+# is rebuilt here, before the acceptance check below resolves the binary's libraries.
+COPY --from=build /out/local-libs/ /usr/local/lib/
+RUN ldconfig
 COPY --from=build /out/patcher /usr/lib/jellyfin-plus
 COPY --from=build /out/plugin-dist /usr/lib/jellyfin-plus-dist
 COPY --from=build /usr/share/jellyfin-shaders /usr/share/jellyfin-shaders
