@@ -126,12 +126,34 @@ operator has actually installed the provider.
 
 ### 3.5 Where it is reported
 
-- **Probe** (`PatcherHost.Levels()`, served as `Levels.Gpu` by `GET /JellyfinPlus/Session/probe`).
+Only the **Status** route is administrator-only. `GET /JellyfinPlus/Session/{id}` is open to any
+authenticated user (it answers for the caller's own session), so everything it serves carries the
+summary alone: `Vendor`, `Detected`, `EncoderFamily`, `CudaOnlyLevelsAvailable`, `OpenVinoAvailable`
+(`GpuSummary`). `Devices`, `RenderNode`, `Reason`, `Setting` and `DecodeType` are never served there
+(AGENTS.md invariant 13).
+
+- **Probe** (`PatcherHost.Levels()`, served as `Levels.Gpu` by `GET /JellyfinPlus/Session/probe`): summary.
   The probe is what the client builds its menu from, so this is where later PRs will filter levels.
-- **Status** (`GET /JellyfinPlus/Status`, `Gpu`), and the dashboard's status line.
+- **Status** (`GET /JellyfinPlus/Status`, `Gpu`), and the dashboard's status line: the full record.
 - **SessionRecord** (`Gpu`), written when the session's command is built, so Recent sessions and
   `GET /JellyfinPlus/Session/{id}` (`Record.Gpu`, and flat `Gpu`) say what the server looked like for
-  that session.
+  that session: summary, one immutable instance shared by every record built under the same detection.
+
+### 3.5.1 The shared probe helper
+
+`CachedProbe<T>` (`src/patcher/CachedProbe.cs`) is how the patcher asks the machine something slow
+from a path that must not wait for it. PRs 2, 3 and 7 reuse it rather than probing under a lock:
+
+- `Start()` runs the probe on the thread pool at plug-in start-up (`PatcherHost.Apply`); `Peek()` is
+  all the transcode path calls, takes a lock for a few field reads and never runs the probe.
+- A conclusive answer (the `conclusive` predicate) is kept for the life of the process. A null,
+  throwing or inconclusive one stands only for `retryAfter` (60 s for GPU detection); the next `Peek()`
+  after that schedules a new probe and returns the last answer meanwhile. This is the fix for
+  `nvidia-smi` failing while the driver loads at boot and pinning the box to `none` until restart.
+- Before the first answer lands the record says so ("GPU detection has not finished; reported as
+  none") rather than guessing.
+- `Reset()` discards the answer and any probe in flight. Tests pass a fake clock and a queue as the
+  scheduler (`scripts/gpu-vendor-harness`).
 
 ### 3.6 Tests
 
@@ -150,7 +172,13 @@ running Jellyfin. It checks:
   `HwaccelArgs` (both forms), `BuildChain` (plain, deband with download, CUDA-native, CUDA-native
   bridged through libplacebo) and `EncoderFor` return the exact strings they returned before the
   setting existed. The expected strings are written out by hand from the code, not computed;
-- that the probe, the status route and `SessionRecord` carry the record.
+- **access:** the probe and a recorded session (what any authenticated user can fetch) carry the five
+  summary fields and none of `Devices`, `RenderNode`, `Reason`, `Setting`, nor a device path or PCI
+  id anywhere in the body; the status route keeps the full record;
+- `CachedProbe<T>` with a fake clock: the probe never runs on the caller, a negative answer is retried
+  after the window and replaced, a conclusive one is never re-asked, a throw is no answer, and a
+  probe in flight across `Reset()` is discarded;
+- `GpuVendor=none` with an NVIDIA card present says the setting overrode detection.
 
 PR 2 extends the same harness (it now compiles the DRM fdinfo reader and the load controller as
 well). The NVIDIA strings above are asserted on a machine with no GPU, an NVIDIA one and a mixed one,

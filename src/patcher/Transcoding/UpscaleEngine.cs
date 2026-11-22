@@ -182,13 +182,15 @@ namespace Jellyfin.Plugin.Plus.Patcher
         public string EncoderReason { get; set; }
 
         /// <summary>
-        /// The GPU capability record as the plugin saw it when this session's command was built:
-        /// vendor, render node, encoder family, decode type, whether the CUDA-only levels and
-        /// OpenVINO are available. On Intel the vendor and Detected decided the encoder and the end
-        /// of the chain (docs/architecture/GPU_VENDORS.md, PR 2); the other fields are descriptive.
-        /// Null only when the session was recorded by a build that predates the field.
+        /// The non-sensitive GPU summary as the plugin saw it when this session's command was
+        /// built: vendor, encoder family, whether it was detected, whether the CUDA-only levels and
+        /// OpenVINO are available. Never the render node, PCI ids, setting or reason: this record
+        /// is served by a route any authenticated user can reach. On Intel the vendor and Detected
+        /// decided the encoder and the end of the chain (docs/architecture/GPU_VENDORS.md, PR 2);
+        /// the other fields are descriptive. Null only when the session was recorded by a build
+        /// that predates the field.
         /// </summary>
-        public GpuCapability Gpu { get; set; }
+        public GpuSummary Gpu { get; set; }
 
         /// <summary>
         /// Whether the encoder was fed straight from the GPU (the frame mapped from Vulkan to CUDA
@@ -604,10 +606,11 @@ namespace Jellyfin.Plugin.Plus.Patcher
                 Status = status,
                 Reason = reason,
 
-                // Current never throws and asks the machine once per process, so after the first
-                // session it costs the transcode path one small allocation (plus a file-exists
-                // check on Intel); the encode family is resolved against ffmpeg's cached list.
-                Gpu = Capability(),
+                // The summary, not the full record: GET Session/{id} is not elevation-gated. It
+                // never throws and never probes or spawns, so after the first session it costs the
+                // transcode path a cached read (plus a file-exists check on Intel); the encode
+                // family is resolved against ffmpeg's cached list.
+                Gpu = CapabilitySummary(),
             };
 
             // GetVideoEncoder and GetVideoProcessingFilterParam are separate call sites and
@@ -1932,21 +1935,48 @@ namespace Jellyfin.Plugin.Plus.Patcher
         /* ----------------------------------------------------------------------- GPU vendor */
 
         /// <summary>
-        /// The GPU capability record with the Intel encode family resolved against this ffmpeg.
-        /// The detector alone cannot say whether ffmpeg has a QSV encoder; this can, so a server
-        /// without one reports software rather than a family the encoder choice will not use.
+        /// The full GPU capability record with the Intel encode family resolved against this
+        /// ffmpeg, for the administrator-only status route and the plugin side. The detector alone
+        /// cannot say whether ffmpeg has a QSV encoder; this can, so a server without one reports
+        /// software rather than a family the encoder choice will not use. A copy when it changes
+        /// anything: the detector's record is shared and cached, and must not be written to.
         /// </summary>
         public static GpuCapability Capability()
         {
             GpuCapability cap = GpuDetector.Current(Settings?.GpuVendor, Settings?.NeuralModelDirectory);
-            if (cap.Vendor == GpuVendors.Intel && cap.Detected && !IntelHasQsvEncoder())
-            {
-                cap.EncoderFamily = "software";
-                cap.Reason += "; ffmpeg lists no QSV encoder, so the encode is software (a VA-API encoder cannot take this chain's system-memory frames)";
-            }
-
-            return cap;
+            return LacksQsvEncoder(cap) ? WithSoftwareFamily(cap) : cap;
         }
+
+        /// <summary>
+        /// The non-sensitive subset of <see cref="Capability"/> (no render node, PCI ids, setting
+        /// or reason), for the probe route and the session records, which any authenticated user
+        /// can read. The detector's shared instance unless the family had to be downgraded.
+        /// </summary>
+        public static GpuSummary CapabilitySummary()
+        {
+            GpuCapability cap = GpuDetector.Current(Settings?.GpuVendor, Settings?.NeuralModelDirectory);
+            return LacksQsvEncoder(cap)
+                ? WithSoftwareFamily(cap).ToSummary()
+                : GpuDetector.CurrentSummary(Settings?.GpuVendor, Settings?.NeuralModelDirectory);
+        }
+
+        private static bool LacksQsvEncoder(GpuCapability cap)
+            => cap.Vendor == GpuVendors.Intel && cap.Detected && !IntelHasQsvEncoder();
+
+        private static GpuCapability WithSoftwareFamily(GpuCapability cap)
+            => new GpuCapability
+            {
+                Vendor = cap.Vendor,
+                Setting = cap.Setting,
+                Detected = cap.Detected,
+                RenderNode = cap.RenderNode,
+                EncoderFamily = "software",
+                DecodeType = cap.DecodeType,
+                CudaOnlyLevelsAvailable = cap.CudaOnlyLevelsAvailable,
+                OpenVinoAvailable = cap.OpenVinoAvailable,
+                Reason = cap.Reason + "; ffmpeg lists no QSV encoder, so the encode is software (a VA-API encoder cannot take this chain's system-memory frames)",
+                Devices = cap.Devices,
+            };
 
         /// <summary>
         /// True when this server's GPU is an Intel one that was actually seen. Every Intel
