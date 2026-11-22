@@ -1330,7 +1330,8 @@ namespace Jellyfin.Plugin.Plus.Patcher
         {
             try
             {
-                return path != null && File.Exists(path);
+                return path != null
+                    && (WeightFileExistsSource != null ? WeightFileExistsSource(path) : File.Exists(path));
             }
             catch (Exception)
             {
@@ -1467,15 +1468,59 @@ namespace Jellyfin.Plugin.Plus.Patcher
         /// </summary>
         public static string AutoNeuralLevel(UpscaleSettings cfg = null)
         {
+            // Planned for every session at or below the height line: stat the weights once per
+            // directory per AutoNeuralTtlMs, not on every plan. A weight installed later shows up
+            // within the TTL, with no restart.
+            string dir = NeuralModelDirectoryFor(cfg);
+            long now = AutoNeuralClockMs();
+            lock (_autoNeuralLock)
+            {
+                if (_autoNeuralCache.TryGetValue(dir, out (string Level, long At) hit)
+                    && now - hit.At < AutoNeuralTtlMs)
+                {
+                    return hit.Level;
+                }
+            }
+
+            string picked = null;
             foreach (string level in _neuralMenu)
             {
                 if (IsOnnxNeuralLevel(level) && NeuralWeightsPresent(NeuralModelPath(level, cfg)))
                 {
-                    return level;
+                    picked = level;
+                    break;
                 }
             }
 
-            return null;
+            lock (_autoNeuralLock)
+            {
+                _autoNeuralCache[dir] = (picked, now);
+            }
+
+            return picked;
+        }
+
+        private const long AutoNeuralTtlMs = 30000;
+        private static readonly object _autoNeuralLock = new object();
+        private static readonly Dictionary<string, (string Level, long At)> _autoNeuralCache =
+            new Dictionary<string, (string Level, long At)>(StringComparer.Ordinal);
+
+        /// <summary>Replaces the file-exists check the weights are looked up with. For the tests.</summary>
+        internal static Func<string, bool> WeightFileExistsSource { get; set; }
+
+        /// <summary>Replaces the clock the auto-pick cache ages by (milliseconds). For the tests.</summary>
+        internal static Func<long> AutoNeuralClockSource { get; set; }
+
+        private static long AutoNeuralClockMs() =>
+            AutoNeuralClockSource != null ? AutoNeuralClockSource() : Environment.TickCount64;
+
+        /// <summary>Forgets the cached auto-pick. For the tests.</summary>
+        internal static void ResetAutoNeuralCache()
+        {
+            lock (_autoNeuralLock)
+            {
+                _autoNeuralCache.Clear();
+            }
         }
 
         /// <summary>
@@ -1627,11 +1672,11 @@ namespace Jellyfin.Plugin.Plus.Patcher
         /// installed. Derived from the directory the runtime assets already live in, so the path
         /// is stated once rather than spelled out at each use.
         /// </summary>
-        public static string PatchedFfmpegPath()
+        public static string PatchedFfmpegPath(UpscaleSettings cfg = null)
         {
             try
             {
-                string dir = Path.GetDirectoryName(NeuralModelDirectory);
+                string dir = Path.GetDirectoryName(NeuralModelDirectoryFor(cfg));
                 if (string.IsNullOrEmpty(dir))
                 {
                     return null;

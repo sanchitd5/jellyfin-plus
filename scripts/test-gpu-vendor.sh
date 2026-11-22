@@ -34,7 +34,9 @@
 #     provider file and device=cpu without it, with the reason in the record; and NeuralMaxSourceHeight
 #     (0 changes nothing, the probe has no new key) routes the ONNX levels by upright source height:
 #     chosen at or below it only when nobody asked and an accelerator is there, dropped above it with
-#     the reason, never for the CUDA-native levels, a viewer's Off, or a source with no upscale.
+#     the reason, never for the CUDA-native levels, a viewer's Off, or a source with no upscale;
+#     device=openvino is asked for only when a stub patched ffmpeg's `-h filter=ort` lists it,
+#     else device=cpu with a rebuild note (the real probe runs, off the request path).
 #     The C side of the filter is scripts/test-vf-ort.sh (compile check and provider calls), not this.
 #
 # Exit status: 0 every check passed, 1 a check failed, 2 the harness could not be built.

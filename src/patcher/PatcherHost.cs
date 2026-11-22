@@ -34,6 +34,7 @@ namespace Jellyfin.Plugin.Plus.Patcher
                 if (settings != null)
                 {
                     UpscaleEngine.Settings = settings;
+                    Task.Run(UpscaleEngine.WarmOrtProbeIfWanted);
                 }
             }
             catch (Exception)

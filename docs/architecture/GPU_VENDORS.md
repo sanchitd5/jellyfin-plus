@@ -193,7 +193,8 @@ PR 5 extends it in the same two directions, plus the C side. With `NeuralMaxSour
 Intel GPU seen, the `ort` node is the string it was (written out by hand) on a no-GPU, an NVIDIA and
 a mixed machine, for every `GpuVendor` value, with the OpenVINO provider file present and absent, and
 on an Intel box the setting did not choose; the probe has no new key. On Intel the node carries
-`device=openvino` with the provider file and `device=cpu` without it, with the plan's and the record's
+`device=openvino` with the provider file and a binary that lists it (a stub `ffmpeg` beside the model
+directory, through the real probe) and `device=cpu` without either, with the plan's and the record's
 device and note and the summary's words; `ShaderLibrary.NeuralFilter` takes only those two values. The
 routing is asserted by value on NVIDIA and on Intel with OpenVINO at 240, 360 and 480 (chosen) and 481
 to 1080 (shader path), for a level asked for by the session and by the dashboard (runs below the line,
@@ -455,8 +456,19 @@ run):
 
 | Intel GPU seen and | The node the engine builds | The record says |
 |---|---|---|
-| the OpenVINO provider file is present (`OpenVinoAvailable`) | `ort=model=...:device=openvino` | `NeuralDevice` `openvino` |
-| it is not | `ort=model=...:device=cpu` | `NeuralDevice` `cpu` and why: the provider is not installed, ONNX Runtime's CPU provider runs, not measured for this chain |
+| the OpenVINO provider file is present (`OpenVinoAvailable`) and the patched ffmpeg's `-h filter=ort` lists `openvino` | `ort=model=...:device=openvino` | `NeuralDevice` `openvino` |
+| the provider file is not present | `ort=model=...:device=cpu` | `NeuralDevice` `cpu` and why: the provider is not installed, ONNX Runtime's CPU provider runs, not measured for this chain |
+| the provider file is present but the binary does not list `openvino` (built before the device existed, or without `ORT_EP=openvino`), or that has not been confirmed yet | `ort=model=...:device=cpu` | `NeuralDevice` `cpu` and why: the ort filter has no openvino device (rebuild with `ORT_EP=openvino`) or the check has not answered yet |
+
+The binary check (`UpscaleEngine.OrtOpenVinoState`) runs `ffmpeg -h filter=ort` on the binary beside the
+configured `NeuralModelDirectory` (`ShaderLibrary.PatchedFfmpegPath(settings)`), and only for a session
+that names a neural level or has `NeuralMaxSourceHeight` set, once, off the request path:
+`Decide` only reads the cache and, when it is empty or expired, starts one background probe and treats the
+device as not confirmed meanwhile (an unknown option kills the stream, so unknown counts as missing, as
+`HasFilter` does). A yes is kept for the life of the process; a no or an inconclusive answer is asked again
+after about 60 s, because the shim picks up a swapped binary without a restart. `PatcherHost.Configure`
+warms it where an Intel server with the provider file would ask. `device=cpu` exists in every build of
+`vf_ort.c`, so it is safe on a stale binary.
 
 Any other server's node carries no `device` option, as today (the filter's default is CUDA). Today an
 Intel server also ends on the CPU, but by way of a failed CUDA attempt and a warning; saying `cpu` is
@@ -478,7 +490,7 @@ CUDA-native levels (`dlpp-*`, `vsr-rtcuda`) are not routed:
   it only happens because an operator set this value. The record says it was chosen, in
   `NeuralRouting`, and `NeuralRequested` stays `off`: the viewer did not ask.
 - **Not on the CPU by choice.** On the Intel path this automatic choice needs the OpenVINO provider
-  (`OpenVinoAvailable`). Without it nothing is chosen and `NeuralRouting` says why, because a network
+  (`OpenVinoAvailable`) and a binary whose ort filter lists openvino. Without them nothing is chosen and `NeuralRouting` says why, because a network
   on the CPU is far from real time and choosing it for a viewer is a dead stream, not a worse picture.
   A level the session or the dashboard asked for by name still runs on the CPU as before, with the
   device reason.

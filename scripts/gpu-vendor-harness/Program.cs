@@ -91,6 +91,7 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
             NvidiaOnlyLevels();
             NeuralDevice();
             NeuralRouting();
+            AutoNeuralCache();
             Fdinfo();
             IdleResidency();
             LoadRoute();
@@ -1122,6 +1123,7 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
             UpscaleEngine.EncoderListSource = () => Encoders(FullList);
             UpscaleEngine.DrmVulkanProbeSource = n => true;
             UpscaleEngine.Av1QsvProbeSource = () => true;
+            UpscaleEngine.OrtOpenVinoProbeSource = () => true;
             SetFilters("optix", "oidn", "ort", "fsr2", "dlss", "libplacebo", "nlmeans_vulkan");
 
             string golden = "format=gbrpf32le,ort=model=" + X2() + ",format=yuv420p";
@@ -1181,8 +1183,16 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
             Check("mixed box, intel chosen, provider present: openvino", mixedIntel.NeuralDevice == "openvino" && mixedIntel.NeuralFilter.Contains(":device=openvino,"));
 
             // Nothing neural ran: no device, no note, nothing in the record.
+            int probeCalls = 0;
+            UpscaleEngine.OrtOpenVinoProbeSource = () => { probeCalls++; return true; };
             UpscaleEngine.Plan plain = DecideOn(NeuralMachine(true, "renderD128", "0x8086"), NeuralSettings("auto", 0), 1280, 720, "upscale", "1080");
             Check("Intel, no neural level: no device and no note", !plain.NeuralApplied && plain.NeuralDevice == null && plain.NeuralDeviceNote == null);
+            Equal("Intel, no neural level, no routing: the OpenVINO probe is not asked", "0", probeCalls.ToString());
+            DecideOn(NeuralMachine(true, "renderD128", "0x8086"), NeuralSettings("auto", 0), 1280, 720, ask);
+            Equal("Intel, a neural level named: the probe is asked", "1", probeCalls.ToString());
+            DecideOn(NeuralMachine(true, "renderD128", "0x8086"), NeuralSettings("auto", 480), 640, 360, "upscale", "1080");
+            Equal("Intel, NeuralMaxSourceHeight set: the probe is asked", "2", probeCalls.ToString());
+            UpscaleEngine.OrtOpenVinoProbeSource = () => true;
             SessionRecord plainRecord = UpscaleEngine.Describe(null, plain, plain.Status, plain.Reason);
             Check("Intel, no neural level: the record has no device", plainRecord.NeuralDevice == null && plainRecord.NeuralDeviceNote == null && plainRecord.NeuralRouting == null);
 
@@ -1202,7 +1212,80 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
             UpscaleEngine.Plan dlpp = DecideOn(NeuralMachine(false, "renderD128", "0x10de"), rig, 1280, 720, "upscale", "1080", "neural", "dlpp-2");
             Check("NVIDIA, dlpp-2: CUDA-native, no ort device", dlpp.UsesCudaNeural && dlpp.NeuralDevice == null);
 
+            // The provider file is there, but the patched ffmpeg has to list the device too. The real probe runs
+            // here against a stub binary beside the model directory, with no seam: one that lists openvino, one that does not.
+            UpscaleEngine.OrtOpenVinoProbeSource = null;
+            UpscaleEngine.ResetOrtProbe();
+            string openvinoNode = "format=gbrpf32le,ort=model=" + X2() + ":device=openvino,format=yuv420p";
+            string cpuNode = "format=gbrpf32le,ort=model=" + X2() + ":device=cpu,format=yuv420p";
+
+            StubFfmpeg(listsOpenVino: false);
+            UpscaleEngine.Plan cold = DecideOn(NeuralMachine(true, "renderD128", "0x8086"), NeuralSettings("auto", 0), 1280, 720, ask);
+            Equal("Intel, provider present, probe not answered yet: the node asks for cpu, not openvino", cpuNode, cold.NeuralFilter);
+            Check("Intel, provider present, probe not answered yet: the note says it is not confirmed",
+                cold.NeuralDevice == "cpu" && cold.NeuralDeviceNote != null && cold.NeuralDeviceNote.Contains("has not been confirmed"), cold.NeuralDeviceNote);
+            UpscaleEngine.WarmOrtProbe().Wait();
+
+            UpscaleEngine.Plan stale = DecideOn(NeuralMachine(true, "renderD128", "0x8086"), NeuralSettings("auto", 0), 1280, 720, ask);
+            Equal("Intel, provider present, binary without openvino: the node asks for cpu", cpuNode, stale.NeuralFilter);
+            Check("Intel, provider present, binary without openvino: the note says rebuild with ORT_EP=openvino",
+                stale.NeuralDevice == "cpu" && stale.NeuralDeviceNote != null && stale.NeuralDeviceNote.Contains("no openvino device") && stale.NeuralDeviceNote.Contains("ORT_EP=openvino"), stale.NeuralDeviceNote);
+            SessionRecord staleRecord = UpscaleEngine.Describe(null, stale, stale.Status, stale.Reason);
+            Check("Intel, binary without openvino: the summary says CPU provider and why", staleRecord.Summary.Contains("the CPU provider (the patched ffmpeg's ort filter has no openvino device"), staleRecord.Summary);
+            UpscaleEngine.Plan staleRouted = DecideOn(NeuralMachine(true, "renderD128", "0x8086"), NeuralSettings("auto", 480), 640, 360, "upscale", "1080");
+            Check("Intel, binary without openvino, 480, 360p: no network is chosen, and it says why",
+                staleRouted.Act && !staleRouted.NeuralApplied && staleRouted.NeuralRouting != null
+                && staleRouted.NeuralRouting.Contains("no neural level was chosen") && staleRouted.NeuralRouting.Contains("no openvino device") && staleRouted.NeuralRouting.Contains("far from real time"), staleRouted.NeuralRouting);
+            UpscaleEngine.Plan nvidiaStale = DecideOn(NeuralMachine(true, "renderD128", "0x10de"), NeuralSettings("auto", 0), 1280, 720, ask);
+            Equal("NVIDIA, binary without openvino: the node is the one it always was", golden, nvidiaStale.NeuralFilter);
+
+            StubFfmpeg(listsOpenVino: true);
+            UpscaleEngine.ResetOrtProbe();
+            UpscaleEngine.WarmOrtProbe().Wait();
+            UpscaleEngine.Plan fresh = DecideOn(NeuralMachine(true, "renderD128", "0x8086"), NeuralSettings("auto", 0), 1280, 720, ask);
+            Equal("Intel, provider present, binary lists openvino: the node asks for openvino", openvinoNode, fresh.NeuralFilter);
+            Check("Intel, provider present, binary lists openvino: no note", fresh.NeuralDevice == "openvino" && fresh.NeuralDeviceNote == null);
+
+            // Without the provider file the binary is not asked at all: the CPU, for the provider reason.
+            UpscaleEngine.Plan noProvider = DecideOn(NeuralMachine(false, "renderD128", "0x8086"), NeuralSettings("auto", 0), 1280, 720, ask);
+            Check("Intel, no provider file, binary lists openvino: still cpu, for the provider reason", noProvider.NeuralDevice == "cpu" && noProvider.NeuralDeviceNote.Contains("OpenVINO provider (ort/lib/libonnxruntime_providers_openvino.so) is not installed"));
+
+            // A binary that takes seconds to answer: the session is planned at once on the CPU, with
+            // the probe left running in the background, and the answer is used once it lands.
+            StubFfmpeg(listsOpenVino: true, delaySeconds: 5);
+            UpscaleEngine.ResetOrtProbe();
+            var clock = System.Diagnostics.Stopwatch.StartNew();
+            UpscaleEngine.Plan slow = DecideOn(NeuralMachine(true, "renderD128", "0x8086"), NeuralSettings("auto", 0), 1280, 720, ask);
+            clock.Stop();
+            Check("Intel, slow probe, cold cache: the plan does not wait for the binary (" + clock.ElapsedMilliseconds + " ms)", clock.ElapsedMilliseconds < 2000);
+            Equal("Intel, slow probe, cold cache: the node asks for cpu", cpuNode, slow.NeuralFilter);
+            Check("Intel, slow probe, cold cache: the note says it is not confirmed", slow.NeuralDevice == "cpu" && slow.NeuralDeviceNote != null && slow.NeuralDeviceNote.Contains("has not been confirmed"), slow.NeuralDeviceNote);
+            UpscaleEngine.WarmOrtProbe().Wait();
+            UpscaleEngine.Plan slowDone = DecideOn(NeuralMachine(true, "renderD128", "0x8086"), NeuralSettings("auto", 0), 1280, 720, ask);
+            Equal("Intel, slow probe answered: the node asks for openvino", openvinoNode, slowDone.NeuralFilter);
+
             ResetNeuralHarness();
+        }
+
+        // A stand-in patched ffmpeg beside the model directory (where PatchedFfmpegPath looks) whose
+        // `-h filter=ort` prints the device list with or without openvino, after an optional delay.
+        // Moved into place, not written in place, so a process is never started from a file that is
+        // still open for writing.
+        private static void StubFfmpeg(bool listsOpenVino, int delaySeconds = 0)
+        {
+            string path = Path.Combine(NeuralRig(), "ffmpeg");
+            string temp = path + ".tmp";
+            string script = "#!/bin/sh\n"
+                + (delaySeconds > 0 ? "sleep " + delaySeconds + "\n" : string.Empty)
+                + "echo 'Filter ort'\n"
+                + "echo '  device <int> ..FV...... which device to run on (from 0 to 2) (default cuda)'\n"
+                + "echo '     cuda            0'\n"
+                + "echo '     cpu             1'\n"
+                + (listsOpenVino ? "echo '     openvino        2'\n" : string.Empty)
+                + "exit 0\n";
+            File.WriteAllText(temp, script);
+            File.SetUnixFileMode(temp, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+            File.Move(temp, path, overwrite: true);
         }
 
         private static void ResetNeuralHarness()
@@ -1211,7 +1294,82 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
             UpscaleEngine.EncoderListSource = null;
             UpscaleEngine.DrmVulkanProbeSource = null;
             UpscaleEngine.Av1QsvProbeSource = null;
+            UpscaleEngine.OrtOpenVinoProbeSource = null;
+            UpscaleEngine.ResetOrtProbe();
+            File.Delete(Path.Combine(NeuralRig(), "ffmpeg"));
             UpscaleEngine.Settings = new UpscaleSettings();
+        }
+
+        // The auto-picked level is looked up once per directory per TTL, not stat'ed on every plan.
+        private static void AutoNeuralCache()
+        {
+            int stats = 0;
+            var present = new HashSet<string>(StringComparer.Ordinal);
+            long now = 1000;
+            ShaderLibrary.WeightFileExistsSource = p => { stats++; return present.Contains(p); };
+            ShaderLibrary.AutoNeuralClockSource = () => now;
+            ShaderLibrary.ResetAutoNeuralCache();
+            try
+            {
+                var cfg = new UpscaleSettings { NeuralModelDirectory = "/nonexistent/auto-neural-cache-rig" };
+                present.Add(ShaderLibrary.NeuralModelPath("realesr-general-x4", cfg));
+
+                string first = ShaderLibrary.AutoNeuralLevel(cfg);
+                int afterFirst = stats;
+                Check("auto neural cache: the first lookup stats the weights and picks the cheapest installed", first == "realesr-general-x4" && afterFirst > 0, first + " stats=" + afterFirst);
+
+                for (int i = 0; i < 50; i++)
+                {
+                    ShaderLibrary.AutoNeuralLevel(cfg);
+                }
+
+                Check("auto neural cache: 50 further lookups inside the TTL stat nothing", stats == afterFirst, "stats=" + stats + " first=" + afterFirst);
+
+                present.Add(ShaderLibrary.NeuralModelPath("realesr-anime-x2", cfg));
+                Equal("auto neural cache: a weight installed inside the TTL is not seen yet", "realesr-general-x4", ShaderLibrary.AutoNeuralLevel(cfg));
+
+                now += 31000;
+                Equal("auto neural cache: past the TTL it looks again and sees it", "realesr-anime-x2", ShaderLibrary.AutoNeuralLevel(cfg));
+                Check("auto neural cache: past the TTL it did stat again", stats > afterFirst);
+
+                int before = stats;
+                var other = new UpscaleSettings { NeuralModelDirectory = "/nonexistent/auto-neural-cache-other" };
+                Check("auto neural cache: another directory is its own entry (none installed there)", ShaderLibrary.AutoNeuralLevel(other) == null && stats > before);
+
+                // Through the engine: planning a small source repeatedly stats the weights once.
+                before = stats;
+                UpscaleEngine.EncoderListSource = () => Encoders(FullList);
+                UpscaleEngine.DrmVulkanProbeSource = n => true;
+                UpscaleEngine.Av1QsvProbeSource = () => true;
+                UpscaleEngine.OrtOpenVinoProbeSource = () => true;
+                SetFilters("optix", "oidn", "ort", "fsr2", "dlss", "dlpp_rtcuda", "vsr_rtcuda", "libplacebo", "nlmeans_vulkan");
+                var routed = new UpscaleSettings { Encoder = "auto", GpuVendor = "auto", NeuralMaxSourceHeight = 480, NeuralModelDirectory = "/nonexistent/auto-neural-cache-rig" };
+                // A session that names the level never goes through the auto pick, so its stat count is
+                // the cost of planning alone; an auto-picked session must cost exactly the same.
+                DecideOn(NeuralMachine(false, "renderD128", "0x10de"), routed, 640, 360, "upscale", "1080", "neural", "realesr-anime-x2");
+                int named = stats - before;
+                bool flat = true;
+                UpscaleEngine.Plan p = null;
+                for (int i = 0; i < 20; i++)
+                {
+                    before = stats;
+                    p = DecideOn(NeuralMachine(false, "renderD128", "0x10de"), routed, 640, 360, "upscale", "1080");
+                    flat &= stats - before == named;
+                }
+
+                Check("auto neural cache: an auto-picked Decide stats no more files than one that names the level", flat && p.NeuralLevel == "realesr-anime-x2" && p.NeuralRouting != null && p.NeuralRouting.Contains("was chosen"), "named=" + named + " last=" + (stats - before) + " " + p.NeuralRouting);
+            }
+            finally
+            {
+                ShaderLibrary.WeightFileExistsSource = null;
+                ShaderLibrary.AutoNeuralClockSource = null;
+                ShaderLibrary.ResetAutoNeuralCache();
+                UpscaleEngine.EncoderListSource = null;
+                UpscaleEngine.DrmVulkanProbeSource = null;
+                UpscaleEngine.Av1QsvProbeSource = null;
+                UpscaleEngine.OrtOpenVinoProbeSource = null;
+                UpscaleEngine.Settings = new UpscaleSettings();
+            }
         }
 
         // NeuralMaxSourceHeight: what it does for each source height, and that 0 does nothing.
@@ -1220,6 +1378,7 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
             UpscaleEngine.EncoderListSource = () => Encoders(FullList);
             UpscaleEngine.DrmVulkanProbeSource = n => true;
             UpscaleEngine.Av1QsvProbeSource = () => true;
+            UpscaleEngine.OrtOpenVinoProbeSource = () => true;
             SetFilters("optix", "oidn", "ort", "fsr2", "dlss", "dlpp_rtcuda", "vsr_rtcuda", "libplacebo", "nlmeans_vulkan");
 
             Equal("the setting defaults to 0 in the patcher mirror", "0", new UpscaleSettings().NeuralMaxSourceHeight.ToString());

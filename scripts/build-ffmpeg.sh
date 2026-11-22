@@ -217,6 +217,8 @@ VFXLIBS_DIR="${VFXLIBS_DIR:-/root/gameupscale/vfx/pywheel-libs}"
 # are checked against ORT_OPENVINO_API (the minor of the version, ORT_API_VERSION). The hashes are of
 # the wheel as pypi.org lists it and of the two headers inside Microsoft.ML.OnnxRuntime 1.24.1 on
 # nuget.org. Bump all of them together or the build refuses.
+# The soname staged in the lib loop below (libopenvino.so.2541) belongs to this wheel too: the wheel URL,
+# the sha256 and that soname change together.
 ORT_OPENVINO_VER="1.24.1"
 ORT_OPENVINO_API="24"
 ORT_OPENVINO_WHEEL="onnxruntime_openvino-1.24.1-cp312-cp312-manylinux_2_28_x86_64.whl"
@@ -896,7 +898,9 @@ if [[ "$WITH_ORT" == "1" ]]; then
         && echo "  ort: present" || die "ort filter missing from the build"
 fi
 if [[ "$WITH_ORT" == "1" && "$ORT_EP" == "openvino" ]]; then
-    "$PREFIX/ffmpeg" -hide_banner -h filter=ort 2>/dev/null | grep -q "openvino" \
+    # Captured first: grep -q closing the pipe early would SIGPIPE ffmpeg, which fails under pipefail.
+    ort_help="$("$PREFIX/ffmpeg" -hide_banner -h filter=ort 2>/dev/null || true)"
+    grep -q "openvino" <<<"$ort_help" \
         && echo "  ort: device=openvino offered" || die "the ort filter in this build has no device=openvino"
     # What the plugin's OpenVinoAvailable looks for (GpuVendor.cs): the provider beside the core.
     [[ -f "$PREFIX/ort/lib/libonnxruntime_providers_openvino.so" ]] \

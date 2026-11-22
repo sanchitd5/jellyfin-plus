@@ -6,6 +6,7 @@ using System.IO;
 using System.Linq;
 using System.Text;
 using System.Threading;
+using System.Threading.Tasks;
 using MediaBrowser.Controller.MediaEncoding;
 using MediaBrowser.Controller.Streaming;
 using MediaBrowser.MediaEncoding.Transcoding;
@@ -1416,7 +1417,9 @@ namespace Jellyfin.Plugin.Plus.Patcher
 
                 // The OptiX levels need CUDA frames. On a detected Intel GPU they are not offered
                 // and not run, and the session says so (GPU_VENDORS.md 5.3); nothing else stands in.
-                bool onIntel = IsIntelPath();
+                // One read of the capability serves every Intel and ort-device decision below.
+                GpuCapability gpu = CurrentGpu();
+                bool onIntel = IsIntel(gpu);
                 denoiseLevel = Withhold(plan, onIntel, "denoise", denoiseLevel, ShaderLibrary.IsNvidiaOnlyDenoise(denoiseLevel));
 
                 // ---- deblocking and deringing ---------------------------------------------
@@ -1472,11 +1475,18 @@ namespace Jellyfin.Plugin.Plus.Patcher
                 // what was asked for, so the record reads "asked for, did not run".
                 neuralLevel = Withhold(plan, onIntel, "neural", neuralLevel, ShaderLibrary.IsNvidiaOnlyNeural(neuralLevel));
 
+                // The device (and so the help probe behind it) is only asked about when a network can
+                // run: one was named, or the routing may choose one.
+                (string Arg, string Name, string Note, string Reason) neuralDevice =
+                    plan.NeuralRequested != "off" || (cfg.NeuralMaxSourceHeight > 0 && cfg.NeuralAllowed)
+                        ? NeuralDeviceFor(gpu)
+                        : (null, "cuda", null, null);
+
                 // NeuralMaxSourceHeight: the ONNX levels are for small sources. 0 skips this whole
                 // call, so a server that never set it takes exactly the path it always did.
                 if (cfg.NeuralMaxSourceHeight > 0 && cfg.NeuralAllowed)
                 {
-                    neuralLevel = RouteNeuralBySourceHeight(plan, cfg, state, sh, neuralLevel, clientSaidOff);
+                    neuralLevel = RouteNeuralBySourceHeight(plan, cfg, state, sh, neuralLevel, clientSaidOff, onIntel, neuralDevice);
                 }
 
                 plan.UsesCudaNeural = ShaderLibrary.IsCudaNeuralLevel(neuralLevel);
@@ -1546,7 +1556,6 @@ namespace Jellyfin.Plugin.Plus.Patcher
                     // The device is asked for only on the Intel path (OpenVINO, or the CPU with the
                     // reason); every other server's node has no device option and so keeps the
                     // filter's default, CUDA, exactly as before.
-                    var neuralDevice = NeuralDeviceNow();
                     plan.NeuralFilter = ShaderLibrary.NeuralFilter(
                         neuralLevel, plan.SourceHeight, plan.Height, out string neuralUsed, cfg, neuralDevice.Arg);
                     plan.NeuralLevel = neuralUsed;
@@ -2078,18 +2087,22 @@ namespace Jellyfin.Plugin.Plus.Patcher
         /// vendor, an NVIDIA GPU, or an Intel setting with no Intel GPU behind it takes the code
         /// path that existed before the vendor setting did, byte for byte. Never throws.
         /// </summary>
-        internal static bool IsIntelPath()
+        internal static bool IsIntelPath() => IsIntel(CurrentGpu());
+
+        /// <summary>The capability under the settings in force, or null when it could not be read. Never throws.</summary>
+        private static GpuCapability CurrentGpu()
         {
             try
             {
-                GpuCapability cap = GpuDetector.Current(Settings?.GpuVendor, Settings?.NeuralModelDirectory);
-                return cap.Vendor == GpuVendors.Intel && cap.Detected;
+                return GpuDetector.Current(Settings?.GpuVendor, Settings?.NeuralModelDirectory);
             }
             catch (Exception)
             {
-                return false;
+                return null;
             }
         }
+
+        private static bool IsIntel(GpuCapability cap) => cap != null && cap.Vendor == GpuVendors.Intel && cap.Detected;
 
         /// <summary>
         /// Whether the chain hands the encoder a frame straight from the GPU: the GpuResidentEncode
@@ -2103,24 +2116,46 @@ namespace Jellyfin.Plugin.Plus.Patcher
         private const string OpenVinoMissingNote =
             "the OpenVINO provider (ort/lib/libonnxruntime_providers_openvino.so) is not installed beside the patched ffmpeg";
 
+        private const string OrtNoOpenVinoNote =
+            "the patched ffmpeg's ort filter has no openvino device (rebuild it with ORT_EP=openvino)";
+
+        private const string OrtOpenVinoUncheckedNote =
+            "the patched ffmpeg's ort filter has not been confirmed to have an openvino device yet";
+
+        private const string CpuProviderRuns = ", so ONNX Runtime's CPU provider runs";
+
         /// <summary>
         /// What the ort filter is told to run on. The device option on the node (Arg), the name the
-        /// record uses (Name) and, when the CPU is what an Intel server gets, why (Note).
+        /// record uses (Name) and, when the CPU is what an Intel server gets, why (Note, and Reason
+        /// without the trailing clause).
         ///
-        /// Only a detected Intel GPU changes anything: OpenVINO when the provider file is there, the
-        /// CPU with the reason when it is not. Every other server gets a null Arg, so its node has no
-        /// device option and the filter's default (CUDA) applies, as it always has. Never throws.
+        /// Only a detected Intel GPU changes anything: OpenVINO when the provider file is there and
+        /// the patched ffmpeg's ort filter lists it, the CPU with the reason when either is missing.
+        /// Every other server gets a null Arg, so its node has no device option and the filter's
+        /// default (CUDA) applies, as it always has. Never throws.
         /// </summary>
-        internal static (string Arg, string Name, string Note) NeuralDeviceNow()
+        internal static (string Arg, string Name, string Note, string Reason) NeuralDeviceFor(GpuCapability cap)
         {
             try
             {
-                GpuCapability cap = GpuDetector.Current(Settings?.GpuVendor, Settings?.NeuralModelDirectory);
-                if (cap.Vendor == GpuVendors.Intel && cap.Detected)
+                if (IsIntel(cap))
                 {
-                    return cap.OpenVinoAvailable
-                        ? ("openvino", "openvino", null)
-                        : ("cpu", "cpu", OpenVinoMissingNote + ", so ONNX Runtime's CPU provider runs");
+                    if (!cap.OpenVinoAvailable)
+                    {
+                        return ("cpu", "cpu", OpenVinoMissingNote + CpuProviderRuns, OpenVinoMissingNote);
+                    }
+
+                    // A binary built before this device existed rejects the option and the stream
+                    // dies, so only a binary that was seen to list it is asked for it. device=cpu
+                    // predates openvino in the filter, so it is safe on that binary.
+                    bool? offered = OrtOpenVinoState();
+                    if (offered == true)
+                    {
+                        return ("openvino", "openvino", null, null);
+                    }
+
+                    string why = offered == false ? OrtNoOpenVinoNote : OrtOpenVinoUncheckedNote;
+                    return ("cpu", "cpu", why + CpuProviderRuns, why);
                 }
             }
             catch (Exception)
@@ -2128,7 +2163,172 @@ namespace Jellyfin.Plugin.Plus.Patcher
                 // fall through to the default
             }
 
-            return (null, "cuda", null);
+            return (null, "cuda", null, null);
+        }
+
+        internal static (string Arg, string Name, string Note, string Reason) NeuralDeviceNow() => NeuralDeviceFor(CurrentGpu());
+
+        /* ------------------------------------------------- does the patched ffmpeg's ort list openvino */
+
+        private static readonly object _ortLock = new object();
+        private static bool _ortProbed;
+        private static bool? _ortOpenVino;
+        private static string _ortProbedPath;
+        private static long _ortProbedAt;
+        private static Task _ortProbeTask;
+
+        // A "no" or "could not tell" is asked again after this long, because the shim picks up a
+        // swapped binary without a restart; a "yes" is kept for the life of the process.
+        private const long OrtProbeTtlMs = 60000;
+
+        /// <summary>Replaces the help probe (null result = could not tell). For the tests.</summary>
+        internal static Func<bool?> OrtOpenVinoProbeSource { get; set; }
+
+        /// <summary>Forgets the cached answer. For the tests.</summary>
+        internal static void ResetOrtProbe()
+        {
+            lock (_ortLock)
+            {
+                _ortProbed = false;
+                _ortOpenVino = null;
+                _ortProbedPath = null;
+                _ortProbeTask = null;
+            }
+        }
+
+        /// <summary>
+        /// Starts the help probe if no fresh answer is cached and returns it, so startup can warm it
+        /// and a test can wait for it. Never blocks a caller that does not wait on the task.
+        /// </summary>
+        internal static Task WarmOrtProbe()
+        {
+            OrtOpenVinoState();
+            lock (_ortLock)
+            {
+                return _ortProbeTask ?? Task.CompletedTask;
+            }
+        }
+
+        /// <summary>
+        /// Warms the probe so the answer is normally ready before the first session. Only where an
+        /// Intel server with the provider file would ask it; elsewhere it does nothing. Never throws.
+        /// </summary>
+        internal static void WarmOrtProbeIfWanted()
+        {
+            try
+            {
+                GpuCapability cap = CurrentGpu();
+                if (IsIntel(cap) && cap.OpenVinoAvailable)
+                {
+                    WarmOrtProbe();
+                }
+            }
+            catch (Exception)
+            {
+                // the first session asks instead
+            }
+        }
+
+        /// <summary>
+        /// Whether the patched ffmpeg's ort filter lists the openvino device: true when it was seen
+        /// to, false when it was seen not to, null when not known yet or it could not be asked. Reads
+        /// the cache only; when the entry is missing or has expired it starts one background probe
+        /// and reports what it has meanwhile, so no request ever waits on a process.
+        /// </summary>
+        private static bool? OrtOpenVinoState()
+        {
+            if (OrtOpenVinoProbeSource != null)
+            {
+                return OrtOpenVinoProbeSource();
+            }
+
+            // The binary beside the configured model directory, as the detector looks there too.
+            string exe = ShaderLibrary.PatchedFfmpegPath(Settings);
+            lock (_ortLock)
+            {
+                bool sameBinary = _ortProbed && string.Equals(_ortProbedPath, exe, StringComparison.Ordinal);
+                if (sameBinary && (_ortOpenVino == true || Environment.TickCount64 - _ortProbedAt < OrtProbeTtlMs))
+                {
+                    return _ortOpenVino;
+                }
+
+                if (_ortProbeTask == null || _ortProbeTask.IsCompleted)
+                {
+                    _ortProbeTask = Task.Run(() => RunOrtProbe(exe));
+                }
+
+                return sameBinary ? _ortOpenVino : null;
+            }
+        }
+
+        private static void RunOrtProbe(string exe)
+        {
+            bool? result = null;
+            try
+            {
+                result = AskOrtHelp(exe, 15000);
+            }
+            catch (Exception)
+            {
+                // could not tell
+            }
+
+            lock (_ortLock)
+            {
+                _ortProbed = true;
+                _ortProbedPath = exe;
+                _ortOpenVino = result;
+                _ortProbedAt = Environment.TickCount64;
+            }
+        }
+
+        /// <summary>
+        /// Runs <c>ffmpeg -h filter=ort</c> and looks for the word openvino in what it printed: true
+        /// when found, false on a clean exit without it, null when it could not be run or timed out.
+        /// Both pipes are drained before the wait, as in the other probes here.
+        /// </summary>
+        private static bool? AskOrtHelp(string exe, int timeoutMs)
+        {
+            if (string.IsNullOrWhiteSpace(exe) || !File.Exists(exe))
+            {
+                return null;
+            }
+
+            var psi = new System.Diagnostics.ProcessStartInfo(exe, "-hide_banner -h filter=ort")
+            {
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+            };
+
+            using (var proc = System.Diagnostics.Process.Start(psi))
+            {
+                var stdoutRead = proc.StandardOutput.ReadToEndAsync();
+                var stderrRead = proc.StandardError.ReadToEndAsync();
+                if (!proc.WaitForExit(timeoutMs))
+                {
+                    try
+                    {
+                        proc.Kill();
+                    }
+                    catch (Exception)
+                    {
+                        // already gone
+                    }
+
+                    return null;
+                }
+
+                Task.WaitAll(new Task[] { stdoutRead, stderrRead }, 5000);
+                string text = (stdoutRead.IsCompletedSuccessfully ? stdoutRead.Result : string.Empty)
+                    + (stderrRead.IsCompletedSuccessfully ? stderrRead.Result : string.Empty);
+                if (text.IndexOf("openvino", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    return true;
+                }
+
+                return proc.ExitCode == 0 ? false : (bool?)null;
+            }
         }
 
         /// <summary>
@@ -2145,7 +2345,8 @@ namespace Jellyfin.Plugin.Plus.Patcher
         /// Above the height an ONNX level that was asked for is not run.
         /// </summary>
         private static string RouteNeuralBySourceHeight(
-            Plan plan, UpscaleSettings cfg, EncodingJobInfo state, int sourceHeight, string neuralLevel, bool clientSaidOff)
+            Plan plan, UpscaleSettings cfg, EncodingJobInfo state, int sourceHeight, string neuralLevel, bool clientSaidOff,
+            bool onIntel, (string Arg, string Name, string Note, string Reason) device)
         {
             int max = cfg.NeuralMaxSourceHeight;
             if (sourceHeight > max)
@@ -2173,7 +2374,7 @@ namespace Jellyfin.Plugin.Plus.Patcher
             string game = cfg.GameAllowed ? (Option(state, "game") ?? cfg.GameLevel) : "off";
             if (ShaderLibrary.IsGameLevel(game)
                 && !string.Equals(game.Trim(), "off", StringComparison.OrdinalIgnoreCase)
-                && !IsIntelPath())
+                && !onIntel)
             {
                 return neuralLevel;
             }
@@ -2190,10 +2391,9 @@ namespace Jellyfin.Plugin.Plus.Patcher
                 return neuralLevel;
             }
 
-            var device = NeuralDeviceNow();
             if (device.Name == "cpu")
             {
-                plan.NeuralRouting = prefix + "no neural level was chosen, " + OpenVinoMissingNote
+                plan.NeuralRouting = prefix + "no neural level was chosen, " + device.Reason
                     + " and a network on the CPU is far from real time (a level asked for by name still runs there)";
                 return neuralLevel;
             }

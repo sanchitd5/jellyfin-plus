@@ -211,8 +211,9 @@ keeps the code path that existed before the setting did:
   (`device_id` is the GPU number, 0 meaning OpenVINO's `GPU`). If the provider will not append, or a
   session will not build with it, the filter warns and builds a CPU session, as the CUDA branch always
   did. On a detected Intel server `ShaderLibrary.NeuralFilter` adds `:device=openvino` when
-  `libonnxruntime_providers_openvino.so` is in `ort/lib` (the record's `OpenVinoAvailable`) and
-  `:device=cpu` when it is not; on every other server the node carries no `device` option and is the
+  `libonnxruntime_providers_openvino.so` is in `ort/lib` (the record's `OpenVinoAvailable`) and the
+  patched ffmpeg's `-h filter=ort` lists `openvino` (a cached background probe, never run on a request),
+  and `:device=cpu` when either is missing; on every other server the node carries no `device` option and is the
   string it always was. `SessionRecord.NeuralDevice` (`openvino`, `cpu`, `cuda`; null when no ONNX
   level ran) says what the command **asked for** (whether ONNX Runtime loaded the provider is only in
   ffmpeg's log), `NeuralDeviceNote` says why it is the CPU on Intel, and both are flat on the session
