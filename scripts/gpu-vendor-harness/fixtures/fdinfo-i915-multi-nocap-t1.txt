@@ -1,0 +1,11 @@
+pos:	0
+flags:	02100002
+mnt_id:	27
+ino:	1043
+drm-driver:	i915
+drm-pdev:	0000:03:00.0
+drm-client-id:	83
+drm-engine-render:	0 ns
+drm-engine-copy:	0 ns
+drm-engine-video:	2800000000 ns
+drm-engine-video-enhance:	0 ns

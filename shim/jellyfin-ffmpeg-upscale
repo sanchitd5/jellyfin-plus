@@ -70,7 +70,8 @@ DEFAULTS = {
     # Unset keeps "-init_hw_device vulkan=vk:0", the first Vulkan device. On an Intel GPU, or a
     # server with more than one, name the render node (for example "/dev/dri/renderD129") and the
     # Vulkan device is derived from it. Nothing here detects a GPU or tests the node: set it only
-    # where you know it, and use an encoder that GPU can run ("hevc_qsv" on Intel).
+    # where you know it, and use an encoder that GPU can run ("hevc_qsv" on Intel). Hand-set only:
+    # the plugin's ShimBridge.Sync keeps a value found here but never writes it.
     "render_node": None,
     "min_scale_factor": 1.15,     # skip near-identity upscales
     # Below this ratio the fixed-2x network is skipped and the chain is plain scaling plus the
