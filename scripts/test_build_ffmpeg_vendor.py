@@ -22,6 +22,9 @@ the real scripts/proxmox-build.sh against a stub repo with a fake id, dotnet and
     with the binary untouched; the override, nvidia, and an intel-only or unrunnable binary go through;
   - Intel needs libvpl-dev from apt (a stub apt-cache stands in for the host's), refused before the plan;
   - a refusal with BUILD unset leaves no temp dir, and the BUILD default and its trap sit after the plan exit;
+  - ffmpeg-vendor.sh is POSIX sh: no bashism in its text, and under dash (the image's /bin/sh, which
+    has no here-strings) its guard and filter lists behave as they do under bash. Without dash the
+    sh-sourcing checks print SKIP; the text scan still runs;
   - mutation: each deliberate breakage of the scripts is caught by this suite.
 
 It does not run apt, patch, configure or make, and it does not build ffmpeg. Exit status: 0 every check
@@ -371,6 +374,63 @@ def suite_wiring(s, scripts):
             'nvidia) echo "oidn optix ort fsr2 dlss"' in v and 'intel)  echo "oidn ort"' in v)
 
 
+BASHISMS = [
+    (r"<<<", "here-string"),
+    (r"\[\[", "[[ ]]"),
+    (r"&>", "&> redirect"),
+    (r"<\(|>\(", "process substitution"),
+    (r"\$\{[A-Za-z_0-9]+(//|/|,,|\^\^|:[0-9])", "bash parameter expansion"),
+    (r"(^|\s)function\s", "function keyword"),
+    (r"\w=\(", "array assignment"),
+    (r"(^|[;&|]\s*)source\s", "source builtin"),
+]
+
+
+def suite_posix(s, scripts, tmp):
+    # ffmpeg-vendor.sh is sourced by /bin/sh (dash) in an image that has no bash, so it must stay POSIX sh.
+    # Every other check here sources it under bash, which accepts a here-string dash rejects.
+    path = os.path.join(scripts, "ffmpeg-vendor.sh")
+    code = [ln for ln in read(path).splitlines() if not ln.lstrip().startswith("#")]
+    for pattern, what in BASHISMS:
+        hits = [ln.strip() for ln in code if re.search(pattern, ln)]
+        s.check("ffmpeg-vendor.sh has no bashism: %s" % what, not hits, "; ".join(hits))
+
+    dash = shutil.which("dash", path="/usr/bin:/bin")
+    if dash is None:
+        if not s.quiet:
+            print("SKIP  dash not found: the sh-sourcing checks did not run (the text scan above still did)")
+        return
+    env = {"PATH": "/usr/bin:/bin", "HOME": tmp}
+
+    def sh(script, *args, **extra):
+        return run([dash, "-c", script, "sh", path] + list(args), dict(env, **extra))
+
+    rc, _, err = run([dash, "-n", path], env)
+    s.check("dash -n ffmpeg-vendor.sh", rc == 0, err)
+
+    guard = '. "$1"; shift; ffmpeg_vendor_switch_guard "$@"'
+    optix = fake_ffmpeg(os.path.join(tmp, "optix"), "oidn optix ort fsr2 dlss")
+    plain = fake_ffmpeg(os.path.join(tmp, "plain"), "oidn ort")
+    missing = os.path.join(tmp, "absent", "ffmpeg")
+    rc, _, err = sh(guard, "intel", optix)
+    s.check("dash: intel over an optix binary is refused naming ALLOW_VENDOR_SWITCH",
+            rc == 1 and "ALLOW_VENDOR_SWITCH" in err, "rc=%s stderr=%r" % (rc, err))
+    rc, _, err = sh(guard, "intel", plain)
+    s.check("dash: intel over a binary without optix goes through", rc == 0 and err == "", "rc=%s stderr=%r" % (rc, err))
+    rc, _, err = sh(guard, "nvidia", optix)
+    s.check("dash: nvidia over an optix binary goes through", rc == 0 and err == "", "rc=%s stderr=%r" % (rc, err))
+    rc, _, err = sh(guard, "intel", optix, ALLOW_VENDOR_SWITCH="1")
+    s.check("dash: ALLOW_VENDOR_SWITCH=1 overrides the refusal", rc == 0 and err == "", "rc=%s stderr=%r" % (rc, err))
+    rc, _, err = sh(guard, "intel", missing)
+    s.check("dash: intel over a missing binary goes through", rc == 0 and err == "", "rc=%s stderr=%r" % (rc, err))
+
+    for vendor, want in (("nvidia", "oidn optix ort fsr2 dlss"), ("intel", "oidn ort")):
+        rc, out, err = sh('. "$1"; ffmpeg_required_filters "$2"', vendor)
+        s.check("dash: required filters for %s" % vendor, rc == 0 and out.strip() == want, "rc=%s out=%r stderr=%r" % (rc, out, err))
+    rc, _, _ = sh('. "$1"; ffmpeg_vendor_valid "$2"', "amd")
+    s.check("dash: an unknown vendor is not valid", rc == 1)
+
+
 def suite_proxmox(s, scripts, tmp):
     bindir = os.path.join(tmp, "bin")
     os.makedirs(bindir)
@@ -502,11 +562,13 @@ def suite_proxmox(s, scripts, tmp):
 def run_suite(scripts, quiet):
     s = Suite(quiet)
     with tempfile.TemporaryDirectory(prefix="test-ffmpeg-vendor.") as tmp:
-        for name, fn, args in (("build", suite_build_ffmpeg, (scripts,)), ("proxmox", suite_proxmox, (scripts,))):
+        for name, fn, args in (("build", suite_build_ffmpeg, (scripts,)), ("proxmox", suite_proxmox, (scripts,)),
+                               ("posix", suite_posix, (scripts,))):
             sub = os.path.join(tmp, name)
             os.makedirs(sub)
             if not quiet:
-                print("\n" + {"build": "build-ffmpeg.sh PLAN_ONLY", "proxmox": "proxmox-build.sh against a stub repo"}[name])
+                print("\n" + {"build": "build-ffmpeg.sh PLAN_ONLY", "proxmox": "proxmox-build.sh against a stub repo",
+                              "posix": "ffmpeg-vendor.sh under dash"}[name])
             fn(s, *args, sub)
     if not quiet:
         print("\nstatic wiring")
@@ -568,6 +630,9 @@ MUTANTS = [
      '"${ALLOW_VENDOR_SWITCH:-0}" = "1"', '"${ALLOW_VENDOR_SWITCH:-0}" = "never"'),
     ("the vendor-switch guard looks for the wrong filter", "ffmpeg-vendor.sh",
      "'^ *[TSC.]* *optix '", "'^ *[TSC.]* *oidn '"),
+    ("the vendor-switch guard goes back to a here-string", "ffmpeg-vendor.sh",
+     """printf '%s\\n' "$filters" | grep -qE '^ *[TSC.]* *optix ' || return 0""",
+     """grep -qE '^ *[TSC.]* *optix ' <<<"$filters" || return 0"""),
     ("the vendor-switch guard also fires on nvidia", "ffmpeg-vendor.sh",
      '[ "${1:-}" = "intel" ] || return 0', ':'),
     ("the libvpl-dev preflight is removed", "build-ffmpeg.sh",
