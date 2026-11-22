@@ -50,7 +50,10 @@ class HttpFile(io.RawIOBase):
             return b""
         end = min(self.pos + n, self.size) - 1
         req = urllib.request.Request(self.url, headers={"Range": "bytes=%d-%d" % (self.pos, end)})
-        data = urllib.request.urlopen(req, timeout=120).read()
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            if resp.status != 206:
+                sys.exit("%s ignored the Range request and sent HTTP %d, not 206 Partial Content" % (self.url, resp.status))
+            data = resp.read()
         self.pos += len(data)
         return data
 
