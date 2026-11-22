@@ -127,10 +127,11 @@ LABEL org.opencontainers.image.title="jellyfin-plus-arc" \
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Run-time libraries the new binary links (named by the build stage), and jq for bench-intel.sh.
+# Run-time libraries the new binary links (named by the build stage), python3 for the shim (the base has
+# none; full python3, not -minimal: the shim imports json, subprocess and re), and jq for bench-intel.sh.
 COPY --from=build /out/runtime-packages.txt /tmp/runtime-packages.txt
 RUN apt-get update \
- && xargs -a /tmp/runtime-packages.txt apt-get install -y --no-install-recommends jq \
+ && xargs -a /tmp/runtime-packages.txt apt-get install -y --no-install-recommends python3 jq \
  && rm -rf /var/lib/apt/lists/* /tmp/runtime-packages.txt
 
 COPY --from=build /usr/lib/jellyfin-ffmpeg-oidn /usr/lib/jellyfin-ffmpeg-oidn
@@ -144,6 +145,12 @@ COPY --from=build /usr/share/jellyfin-shaders /usr/share/jellyfin-shaders
 COPY --from=build /jellyfin/jellyfin-web /jellyfin/jellyfin-web
 COPY --chmod=0755 shim/jellyfin-ffmpeg-upscale /usr/local/bin/jellyfin-ffmpeg-upscale
 COPY --chmod=0755 scripts/bench-intel.sh scripts/ffmpeg-vendor.sh /usr/local/lib/jellyfin-plus/scripts/
+
+# Jellyfin loads plugins only from $JELLYFIN_DATA_DIR/plugins, an empty volume on first start: the wrapper
+# seeds the staged plugin there, then execs the base image's own ENTRYPOINT (/jellyfin/jellyfin) with the
+# same arguments. Without it the image starts a stock Jellyfin.
+COPY --chmod=0755 docker/intel/entrypoint.py /usr/local/bin/jellyfin-plus-entrypoint
+ENTRYPOINT ["/usr/local/bin/jellyfin-plus-entrypoint"]
 
 # The shim's config and log paths are fixed and the pod's root filesystem is read-only, so they are links
 # into /var/cache/jellyfin, which the Deployment mounts as an emptyDir (as the shader cache already is).
@@ -172,8 +179,15 @@ RUN --mount=type=bind,from=base-pkgs,source=/usr/lib/jellyfin-ffmpeg/ffmpeg,targ
     "$F" -hide_banner -hwaccels | grep -qx vaapi; \
     "$F" -hide_banner -encoders | grep -q h264_qsv; \
     cmp /tmp/base-ffmpeg /usr/lib/jellyfin-ffmpeg/ffmpeg; \
+    v=$(/usr/local/bin/jellyfin-ffmpeg-upscale -version); \
+    echo "$v" | grep -q '^ffmpeg version'; \
     test -f /jellyfin/jellyfin-web/jellyfin-plus.js; \
     grep -q 'jellyfin-plus.js' /jellyfin/jellyfin-web/index.html; \
     test -f /usr/lib/jellyfin-plus/Jellyfin.Plugin.Plus.Patcher.dll; \
     test -f /usr/lib/jellyfin-plus/0Harmony.dll; \
     test -f /usr/lib/jellyfin-plus-dist/JellyfinPlus_1.0.0.0/Jellyfin.Plugin.Plus.dll
+
+# The plugin acceptance: a headless start through the entrypoint must seed the plugin dir and log
+# "Loaded plugin: Jellyfin Plus". Last, so it runs against the finished image.
+RUN --mount=type=bind,source=docker/intel/accept-plugin.sh,target=/tmp/accept-plugin.sh \
+    bash /tmp/accept-plugin.sh /usr/local/bin/jellyfin-plus-entrypoint

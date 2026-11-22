@@ -660,6 +660,56 @@ def local_libs_checks(df):
     check("mutant: a build stage that copies nothing is caught", bool(local_libs_failures(no_build)))
 
 
+SHIM_PATH = "/usr/local/bin/jellyfin-ffmpeg-upscale"
+
+
+def shim_interpreter_failures(df, shim_src):
+    """What lets an image ship whose shim Jellyfin cannot start (build 8: no python3, 'Failed to find valid ffmpeg').
+
+    The shim is a script, so its interpreter must be in the FINAL stage (the build stage's python3 does not
+    ship), and the acceptance RUN must make the exact call Jellyfin makes, not only test the real binary.
+    python3-minimal is not enough: json, subprocess and re live in the stdlib package only python3 pulls in.
+    """
+    bad = []
+    final = df.rpartition("\nFROM ")[2]
+    shebang = shim_src.split("\n", 1)[0]
+    if not re.search(r"^#!/usr/bin/env python3$", shebang):
+        bad.append(f"the shim's interpreter is no longer python3 ({shebang!r}); update this check")
+    apt = re.search(r"apt-get install[^\n]*(?:\\\n[^\n]*)*", final)
+    if not apt or not re.search(r"(?<![\w.-])python3(?![\w.-])", apt.group(0)):
+        bad.append("the final stage does not apt-get install python3 (python3-minimal does not count)")
+    copy = final.find("jellyfin-ffmpeg-upscale /usr/local/bin/jellyfin-ffmpeg-upscale")
+    call = final.find(f"$({SHIM_PATH} -version)")
+    if copy < 0:
+        bad.append("the final stage does not copy the shim")
+    if call < 0:
+        bad.append("the acceptance RUN does not run the shim with -version (the call Jellyfin makes)")
+    elif copy > call:
+        bad.append("the shim -version check runs before the shim is copied in")
+    if call >= 0 and "grep -q '^ffmpeg version'" not in final[call:]:
+        bad.append("the shim -version output is not required to start with 'ffmpeg version'")
+    return bad
+
+
+def shim_interpreter_checks(df):
+    shim_src = open(os.path.join(REPO, "shim", "jellyfin-ffmpeg-upscale")).read()
+    check("the final image carries the shim's interpreter and checks the shim", not shim_interpreter_failures(df, shim_src),
+          str(shim_interpreter_failures(df, shim_src)))
+    no_py = df.replace(" python3 jq", " jq")
+    check("mutant: no python3 in the final stage is caught", bool(shim_interpreter_failures(no_py, shim_src)))
+    minimal = df.replace(" python3 jq", " python3-minimal jq")
+    check("mutant: python3-minimal is caught", bool(shim_interpreter_failures(minimal, shim_src)))
+    no_call = df.replace(f"$({SHIM_PATH} -version)", "$(true)")
+    check("mutant: no shim -version check is caught", bool(shim_interpreter_failures(no_call, shim_src)))
+    no_grep = df.replace("grep -q '^ffmpeg version'", "true")
+    check("mutant: a shim check that does not read the output is caught", bool(shim_interpreter_failures(no_grep, shim_src)))
+    early = df.replace(f"$({SHIM_PATH} -version)", "$(true)").replace("ENV DEBIAN_FRONTEND=noninteractive\n",
+                       f"ENV DEBIAN_FRONTEND=noninteractive\nRUN v=$({SHIM_PATH} -version); echo \"$v\" | grep -q '^ffmpeg version'\n", 1)
+    check("mutant: a shim check before the shim is copied is caught", bool(shim_interpreter_failures(early, shim_src)))
+    other = shim_src.replace("#!/usr/bin/env python3", "#!/usr/bin/env python3.12", 1)
+    check("mutant: a changed shebang is caught", bool(shim_interpreter_failures(df, other)))
+
+
 def dockerfile_checks(tmp):
     df = open(DOCKERFILE).read()
     spec = open(SPEC).read()
@@ -686,6 +736,8 @@ def dockerfile_checks(tmp):
 
     build_apt_checks(df)
     local_libs_checks(df)
+    shim_interpreter_checks(df)
+    entrypoint_checks(df)
     web_step_checks(df)
 
     ignore = open(os.path.join(REPO, "docker", "intel", "Dockerfile.dockerignore")).read().split()
@@ -694,15 +746,78 @@ def dockerfile_checks(tmp):
     for rel in ["shim/jellyfin-ffmpeg-upscale", "scripts/bench-intel.sh", "scripts/ffmpeg-vendor.sh", "scripts/build-ffmpeg.sh",
                 "scripts/install-shaders.sh", "scripts/jellyfin-plus-webinject", "scripts/build-web-panel.sh",
                 "ffmpeg/gen_perm.py", "ffmpeg/fsr2compat.h", "web/theme/jellyfinplus.css", "web/package-lock.json",
-                "assets/jellyfinplus.png", "assets/plugin-meta.json", "docker/intel/stage-plugin.sh"]:
+                "assets/jellyfinplus.png", "assets/plugin-meta.json", "docker/intel/stage-plugin.sh",
+                "docker/intel/entrypoint.py", "docker/intel/accept-plugin.sh", "scripts/test_entrypoint.py"]:
         check(f"{rel} exists", os.path.isfile(os.path.join(REPO, rel)))
-    for rel in ["scripts/bench-intel.sh", "docker/intel/stage-plugin.sh"]:
+    for rel in ["scripts/bench-intel.sh", "docker/intel/stage-plugin.sh", "docker/intel/accept-plugin.sh"]:
         p = subprocess.run([BASH, "-n", os.path.join(REPO, rel)], capture_output=True, text=True)
         check(f"bash -n {rel}", p.returncode == 0, p.stderr)
     check("the spec page has section 5.8", "### 5.8 " in spec)
 
     out = subprocess.run([BASH, "-c", f". {VENDOR}; ffmpeg_required_filters intel"], capture_output=True, text=True).stdout.split()
     check("the Intel filter list the image checks is oidn ort", out == ["oidn", "ort"], str(out))
+
+
+def entrypoint_failures(df):
+    """What lets an image ship that starts Jellyfin without the plugin (the first Arc image did).
+
+    The plugin is only staged in /usr/lib/jellyfin-plus-dist; Jellyfin loads from $JELLYFIN_DATA_DIR/plugins.
+    So the final stage must set the seeding wrapper as ENTRYPOINT, copy it executable, and end with a RUN
+    that starts the server headless and requires the plugin to load, after everything it depends on.
+    """
+    bad = []
+    final = df.rpartition("\nFROM ")[2]
+    wrapper = "/usr/local/bin/jellyfin-plus-entrypoint"
+    if not re.search(r"^ENTRYPOINT \[\"" + re.escape(wrapper) + r"\"\]$", final, re.M):
+        bad.append("the final stage does not set the seeding wrapper as ENTRYPOINT (exec form, no args)")
+    if re.search(r"^CMD ", final, re.M):
+        bad.append("a CMD would be passed to Jellyfin as arguments")
+    copy = re.search(r"^COPY --chmod=0755 docker/intel/entrypoint\.py " + re.escape(wrapper) + r"$", final, re.M)
+    if not copy:
+        bad.append("the wrapper is not copied executable to " + wrapper)
+    accept = re.search(r"^RUN --mount=type=bind,source=docker/intel/accept-plugin\.sh,target=(\S+) \\\n\s+bash \1 " + re.escape(wrapper) + r"$",
+                       final, re.M)
+    if not accept:
+        bad.append("the final stage has no acceptance RUN of accept-plugin.sh against the wrapper")
+    plugin_copy = final.find("COPY --from=build /out/plugin-dist /usr/lib/jellyfin-plus-dist")
+    patcher_copy = final.find("COPY --from=build /out/patcher /usr/lib/jellyfin-plus\n")
+    ffmpeg_accept = final.find("RUN --mount=type=bind,from=base-pkgs")
+    if accept and copy:
+        if not 0 <= patcher_copy < accept.start():
+            bad.append("the acceptance RUN runs before the patcher is copied in")
+        if not 0 <= plugin_copy < copy.start() < accept.start():
+            bad.append("order must be the plugin COPY, the wrapper COPY, then the acceptance RUN")
+        if not 0 <= ffmpeg_accept < accept.start():
+            bad.append("the acceptance RUN runs before the ffmpeg acceptance RUN")
+    return bad
+
+
+def entrypoint_checks(df):
+    check("the final image seeds the plugin through an ENTRYPOINT wrapper and proves it loads", not entrypoint_failures(df),
+          str(entrypoint_failures(df)))
+    no_ep = df.replace('ENTRYPOINT ["/usr/local/bin/jellyfin-plus-entrypoint"]\n', "")
+    check("mutant: no ENTRYPOINT is caught", bool(entrypoint_failures(no_ep)))
+    base_ep = df.replace('ENTRYPOINT ["/usr/local/bin/jellyfin-plus-entrypoint"]', 'ENTRYPOINT ["/jellyfin/jellyfin"]')
+    check("mutant: the base ENTRYPOINT is caught", bool(entrypoint_failures(base_ep)))
+    shell_form = df.replace('ENTRYPOINT ["/usr/local/bin/jellyfin-plus-entrypoint"]', "ENTRYPOINT /usr/local/bin/jellyfin-plus-entrypoint")
+    check("mutant: a shell-form ENTRYPOINT is caught", bool(entrypoint_failures(shell_form)))
+    not_exec = df.replace("COPY --chmod=0755 docker/intel/entrypoint.py", "COPY docker/intel/entrypoint.py")
+    check("mutant: a wrapper that is not executable is caught", bool(entrypoint_failures(not_exec)))
+    no_accept = re.sub(r"\nRUN --mount=type=bind,source=docker/intel/accept-plugin\.sh.*?jellyfin-plus-entrypoint\n", "\n", df, flags=re.S)
+    check("mutant: no acceptance RUN is caught", bool(entrypoint_failures(no_accept)) and no_accept != df)
+    with_cmd = df.replace("ENTRYPOINT [", 'CMD ["--x"]\nENTRYPOINT [', 1)
+    check("mutant: a CMD is caught", bool(entrypoint_failures(with_cmd)))
+    early = (df.replace(re.search(r"\n# The plugin acceptance:.*?jellyfin-plus-entrypoint\n", df, re.S).group(0), "\n")
+               .replace("COPY --from=build /out/patcher /usr/lib/jellyfin-plus\n",
+                        "RUN --mount=type=bind,source=docker/intel/accept-plugin.sh,target=/tmp/accept-plugin.sh \\\n"
+                        "    bash /tmp/accept-plugin.sh /usr/local/bin/jellyfin-plus-entrypoint\n"
+                        "COPY --from=build /out/patcher /usr/lib/jellyfin-plus\n", 1))
+    check("mutant: an acceptance RUN before the plugin is in place is caught", bool(entrypoint_failures(early)))
+
+    script = open(os.path.join(REPO, "docker", "intel", "accept-plugin.sh")).read()
+    check("the acceptance script greps for the plugin's load line", "Loaded plugin: Jellyfin Plus" in script)
+    check("the acceptance script asserts the plugin dir was seeded", "plugins/JellyfinPlus_" in script)
+    check("the acceptance script stops the server it started", "kill " in script and "rm -rf" in script)
 
 
 def web_step(df):

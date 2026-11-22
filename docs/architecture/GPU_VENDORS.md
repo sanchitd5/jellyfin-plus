@@ -781,9 +781,12 @@ the binary will meet:
 The root filesystem of the pod is read-only, so the runtime install steps become build-time ones: the
 web inject runs at build time, and `/etc/jellyfin-upscale.json` and `/var/log/jellyfin-upscale.log`
 are symlinks into `/var/cache/jellyfin`. The Deployment must mount emptyDirs at `/var/cache/jellyfin`
-and `/run/jellyfin-upscale` (the shim's slot directory), and an initContainer must copy
-`/usr/lib/jellyfin-plus-dist/JellyfinPlus_1.0.0.0` into `/config/plugins/`. The patcher and
-`0Harmony.dll` are read from `/usr/lib/jellyfin-plus`. `JELLYFIN_FFMPEG` defaults to the shim and the
+and `/run/jellyfin-upscale` (the shim's slot directory). No initContainer is needed for the plugin: the
+image's ENTRYPOINT is `/usr/local/bin/jellyfin-plus-entrypoint` (`docker/intel/entrypoint.py`), which
+seeds `/usr/lib/jellyfin-plus-dist/JellyfinPlus_<ver>` into `$JELLYFIN_DATA_DIR/plugins/` and then execs
+`/jellyfin/jellyfin` with the original arguments. It is idempotent, an upgrade replaces only our files
+(Jellyfin's `meta.json` keys, other files in the plugin dir and `plugins/configurations/` are kept) and a
+seed failure never stops the server. The patcher and `0Harmony.dll` are read from `/usr/lib/jellyfin-plus`. `JELLYFIN_FFMPEG` defaults to the shim and the
 Deployment may override it. The GPU node needs `/dev/dri` and the host's VA-API and QSV driver.
 
 **Pins.**
@@ -797,8 +800,12 @@ Deployment may override it. The GPU node needs `/dev/dri` and the host's VA-API 
 
 **Acceptance, enforced by the build.** `ldd` of the patched ffmpeg shows no `not found`; `-filters`
 lists `oidn ort fsr2 libplacebo xpsnr`; the `fsr2-nocuda` marker exists; `-hwaccels` lists `vaapi`;
-`-encoders` lists `h264_qsv`; the stock ffmpeg is byte-identical to the base's (`cmp`); the web
-inject, patcher and plugin files are in place. A failed check fails the build.
+`-encoders` lists `h264_qsv`; the stock ffmpeg is byte-identical to the base's (`cmp`); the shim
+answers `-version` with an `ffmpeg version` line, the exact call Jellyfin makes at start-up (the shim
+is a `python3` script and the base has no python3, so the final stage installs it); the web
+inject, patcher and plugin files are in place; a last RUN (`docker/intel/accept-plugin.sh`) starts
+Jellyfin headless through the entrypoint against temp directories and requires `plugins/JellyfinPlus_*`
+to be seeded and the log to say `Loaded plugin: Jellyfin Plus`. A failed check fails the build.
 
 **Known gaps (not pinned).** The shared scripts fetch FFmpeg, OIDN, ONNX Runtime, shaderc and
 libplacebo sources, the unpinned shader files (`install-shaders.sh`: FSR, SSimSuperRes,
@@ -850,8 +857,10 @@ plugin-configuration calls of row 6 are checked against the fake only, not a liv
 
 **Not verified.** An image build; any run on an Arc card (so the real execution of every row,
 the jq parsing of the plugin's API, the stream URL parameters and the fsr2 filter options are
-untested); the initContainer copy and the symlinks; the base image's layout (`/jellyfin`,
-`/jellyfin/jellyfin-web`); the derived runtime package names. The OpenCL compute runtime that
+untested); the entrypoint wrapper and the headless plugin acceptance inside a real build (the wrapper
+is unit-tested by `scripts/test_entrypoint.py`; that the base's ENTRYPOINT is `/jellyfin/jellyfin` with no
+arguments is matched to upstream, not to the pinned digest) and the symlinks; the base image's layout
+(`/jellyfin`, `/jellyfin/jellyfin-web`); the derived runtime package names. The OpenCL compute runtime that
 OpenVINO's GPU device needs is not installed by the image and whether the base carries it is unchecked:
 row 5's `device=` figure is what shows a CPU fallback.
 
