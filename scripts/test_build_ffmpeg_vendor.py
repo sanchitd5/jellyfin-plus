@@ -18,6 +18,10 @@ the real scripts/proxmox-build.sh against a stub repo with a fake id, dotnet and
   - proxmox-build.sh requires the vendor's filter set (plus fsr2 on Intel when asked for), restores the
     previous binary when one is missing, refuses an unknown vendor before snapshotting, and passes the
     NVIDIA-only filters at 0 to an Intel build;
+  - GPU_VENDOR=intel over a binary that lists optix is refused by both scripts, naming ALLOW_VENDOR_SWITCH,
+    with the binary untouched; the override, nvidia, and an intel-only or unrunnable binary go through;
+  - Intel needs libvpl-dev from apt (a stub apt-cache stands in for the host's), refused before the plan;
+  - a refusal with BUILD unset leaves no temp dir, and the BUILD default and its trap sit after the plan exit;
   - mutation: each deliberate breakage of the scripts is caught by this suite.
 
 It does not run apt, patch, configure or make, and it does not build ffmpeg. Exit status: 0 every check
@@ -118,9 +122,35 @@ def read(path):
         return f.read()
 
 
+def fake_ffmpeg(directory, filters):
+    # An existing binary that answers -filters with these names, as the real one lists them.
+    os.makedirs(directory, exist_ok=True)
+    path = os.path.join(directory, "ffmpeg")
+    lines = "".join("echo ' T.. %s            V->V       stub'; " % f for f in filters.split())
+    with open(path, "w") as f:
+        f.write("#!/bin/sh\ncase \"$*\" in *-filters*) %sexit 0 ;; esac\nexit 0\n" % lines)
+    os.chmod(path, 0o755)
+    return path
+
+
+def stub_apt_cache(tmp):
+    # STUB_APT_LIBVPL: candidate (default), none ('Candidate: (none)') or unknown (no output at all).
+    bindir = os.path.join(tmp, "aptbin")
+    os.makedirs(bindir, exist_ok=True)
+    path = os.path.join(bindir, "apt-cache")
+    with open(path, "w") as f:
+        f.write('#!/bin/sh\necho "$*" >> "$STUB_APT_LOG"\n'
+                'case "${STUB_APT_LIBVPL:-candidate}" in\n'
+                '  candidate) printf "libvpl-dev:\\n  Installed: (none)\\n  Candidate: 2:2023.3.0-1\\n" ;;\n'
+                '  none) printf "libvpl-dev:\\n  Installed: (none)\\n  Candidate: (none)\\n" ;;\n'
+                'esac\nexit 0\n')
+    os.chmod(path, 0o755)
+
+
 def plan_env(tmp, extra, with_build=True):
     env = {
-        "PATH": "/usr/bin:/bin",
+        "PATH": os.path.join(tmp, "aptbin") + ":/usr/bin:/bin",
+        "STUB_APT_LOG": os.path.join(tmp, "apt-calls"),
         "HOME": tmp,
         "TMPDIR": os.path.join(tmp, "tmpdir"),
         "PLAN_ONLY": "1",
@@ -159,6 +189,7 @@ def fake_fsr2_sdk(tmp):
 
 def suite_build_ffmpeg(s, scripts, tmp):
     os.makedirs(os.path.join(tmp, "tmpdir"), exist_ok=True)
+    stub_apt_cache(tmp)
     prefix = os.path.join(tmp, "prefix")
     fsr2 = fake_fsr2_sdk(tmp)
 
@@ -207,6 +238,68 @@ def suite_build_ffmpeg(s, scripts, tmp):
     rc, out, err = plan(scripts, tmp, {"BRIDGE_TEST": "1"})
     s.check("nvidia accepts BRIDGE_TEST=1", rc == 0 and plan_lines(out) == GOLDEN_NVIDIA, err)
 
+    # A mistyped GPU_VENDOR must not replace the NVIDIA binary: build-ffmpeg.sh installs over $PREFIX/ffmpeg.
+    # The fake binary sits under its own prefix so untouched() keeps meaning "the script wrote nothing".
+    optix_prefix = os.path.join(tmp, "optix-prefix")
+    optix_bin = fake_ffmpeg(optix_prefix, "oidn optix ort fsr2 dlss")
+    before = read(optix_bin)
+    intel_only_prefix = os.path.join(tmp, "intel-prefix")
+    fake_ffmpeg(intel_only_prefix, "oidn ort")
+    broken_prefix = os.path.join(tmp, "broken-prefix")
+    os.makedirs(broken_prefix)
+    with open(os.path.join(broken_prefix, "ffmpeg"), "w") as f:
+        f.write("OLD-BINARY")
+    os.chmod(os.path.join(broken_prefix, "ffmpeg"), 0o755)
+
+    for with_build in (True, False):
+        tag = "" if with_build else " (BUILD not given)"
+        rc, out, err = plan(scripts, tmp, {"GPU_VENDOR": "intel", "PREFIX": optix_prefix}, with_build)
+        s.check("intel over an optix binary: refused naming ALLOW_VENDOR_SWITCH" + tag,
+                rc == 1 and "ALLOW_VENDOR_SWITCH" in err and "plan:" not in out, "rc=%s stderr=%r" % (rc, err))
+        s.check("the refused binary is untouched and nothing else was created" + tag,
+                read(optix_bin) == before and untouched(tmp))
+    rc, out, err = plan(scripts, tmp, {"GPU_VENDOR": "intel", "PREFIX": optix_prefix, "ALLOW_VENDOR_SWITCH": "1"})
+    s.check("intel over an optix binary with ALLOW_VENDOR_SWITCH=1: the intel plan",
+            rc == 0 and plan_lines(out) == GOLDEN_INTEL, "rc=%s stderr=%r" % (rc, err))
+    rc, out, err = plan(scripts, tmp, {"GPU_VENDOR": "intel", "PREFIX": optix_prefix, "ALLOW_VENDOR_SWITCH": "0"})
+    s.check("ALLOW_VENDOR_SWITCH=0 does not override", rc == 1 and "ALLOW_VENDOR_SWITCH" in err, "rc=%s" % rc)
+    rc, out, err = plan(scripts, tmp, {"GPU_VENDOR": "nvidia", "PREFIX": optix_prefix})
+    s.check("nvidia over an optix binary: the nvidia plan", rc == 0 and plan_lines(out) == GOLDEN_NVIDIA, err)
+    rc, out, err = plan(scripts, tmp, {"PREFIX": optix_prefix})
+    s.check("GPU_VENDOR unset over an optix binary: the nvidia plan", rc == 0 and plan_lines(out) == GOLDEN_NVIDIA, err)
+    rc, out, err = plan(scripts, tmp, {"GPU_VENDOR": "intel", "PREFIX": intel_only_prefix})
+    s.check("intel over an intel-only binary: the intel plan", rc == 0 and plan_lines(out) == GOLDEN_INTEL, err)
+    rc, out, err = plan(scripts, tmp, {"GPU_VENDOR": "intel", "PREFIX": broken_prefix})
+    s.check("intel over a binary that will not run: the intel plan", rc == 0 and plan_lines(out) == GOLDEN_INTEL, err)
+
+    # libvpl-dev: older bases lack it, and apt-get would fail minutes in.
+    apt_log = os.path.join(tmp, "apt-calls")
+    for mode in ("none", "unknown"):
+        for with_build in (True, False):
+            rc, out, err = plan(scripts, tmp, {"GPU_VENDOR": "intel", "STUB_APT_LIBVPL": mode}, with_build)
+            s.check("intel with libvpl-dev %s in apt: refused naming libvpl-dev%s"
+                    % (mode, "" if with_build else " (BUILD not given)"),
+                    rc == 1 and "libvpl-dev" in err and "plan:" not in out and untouched(tmp), "rc=%s stderr=%r" % (rc, err))
+    rc, out, err = plan(scripts, tmp, {"GPU_VENDOR": "intel", "STUB_APT_LIBVPL": "candidate"})
+    s.check("intel with a libvpl-dev candidate: the intel plan", rc == 0 and plan_lines(out) == GOLDEN_INTEL, err)
+    s.check("intel asked apt-cache about libvpl-dev", "libvpl-dev" in (read(apt_log) if os.path.exists(apt_log) else ""))
+    if os.path.exists(apt_log):
+        os.remove(apt_log)
+    for extra in ({}, {"GPU_VENDOR": "nvidia"}, {"STUB_APT_LIBVPL": "none"}):
+        rc, out, err = plan(scripts, tmp, extra)
+        s.check("nvidia plan ignores apt-cache %s" % (extra or "(default)"), rc == 0 and plan_lines(out) == GOLDEN_NVIDIA, err)
+    s.check("nvidia never called apt-cache", not os.path.exists(apt_log))
+
+    # Every refusal that precedes the plan, with BUILD unset, must leave TMPDIR empty (no mktemp -d leak).
+    for extra, message in [({"GPU_VENDOR": "amd"}, "GPU_VENDOR must be nvidia or intel")] + [
+            (dict(fsr2, GPU_VENDOR="intel", **e), m) for e, m in INTEL_REFUSALS[:3]] + [
+            ({"GPU_VENDOR": "intel", "WITH_FSR2": "1", "FSR2_SDK": os.path.join(tmp, "no-sdk"), "FSR2_LIB": fsr2["FSR2_LIB"]},
+             "FSR2_SDK=")]:
+        rc, out, err = plan(scripts, tmp, extra, with_build=False)
+        s.check("refusal %r with BUILD unset leaves no temp dir" % message,
+                rc == 1 and message in err and untouched(tmp), "rc=%s stderr=%r tmpdir=%r"
+                % (rc, err, os.listdir(os.path.join(tmp, "tmpdir"))))
+
 
 def suite_wiring(s, scripts):
     b = read(os.path.join(scripts, "build-ffmpeg.sh"))
@@ -219,8 +312,32 @@ def suite_wiring(s, scripts):
 
     # The real run must read the arrays the plan prints, or the plan is a story.
     for needle in ('"${APT_PKGS[@]}"', 'for p in "${VENDOR_PATCHES[@]}"', '"${HWACCEL_FLAGS[@]}"',
-                   '"${CUDA_LLVM_FLAGS[@]}"', 'if [[ "$NVCODEC" == "1" ]]; then'):
+                   '${CUDA_LLVM_FLAGS[@]+"${CUDA_LLVM_FLAGS[@]}"}', 'if [[ "$NVCODEC" == "1" ]]; then'):
         s.check("build-ffmpeg.sh uses %s" % needle, b.count(needle) >= 1)
+    # The array is empty on Intel; a bare "${arr[@]}" is an unbound variable under set -u on bash < 4.4.
+    # Not runnable here (no old bash), so this is a text check.
+    # The same holds for every other configure array that is empty on some build (OPTIX_FLAGS on Intel, ...).
+    s.check("no bare \"${..._FLAGS[@]}\" expansion of a possibly-empty configure array is left",
+            re.search(r'(?<!\+)"\$\{(CUDA_LLVM|OIDN|OPTIX|ORT|GAME|VSR)_FLAGS\[@\]\}"', b) is None)
+
+    # BUILD's mktemp -d and the trap that removes it come after the plan exit, before apt: a refusal or a
+    # kill in the preflight must have nothing to leak.
+    plan_exit = b.find("    exit 0\nfi\n", b.find('if [[ "$PLAN_ONLY" == "1" ]]; then'))
+    mk = b.find('BUILD="${BUILD:-$(mktemp -d)}"')
+    trap = b.find("trap cleanup EXIT")
+    apt = b.find("apt-get update")
+    s.check("BUILD is created once, after the plan exit", b.count("$(mktemp -d)") == 1 and plan_exit != -1 and mk > plan_exit,
+            "plan exit %d, mktemp %d" % (plan_exit, mk))
+    s.check("the cleanup trap follows BUILD and precedes apt-get", mk != -1 and mk < trap < apt,
+            "mktemp %d, trap %d, apt %d" % (mk, trap, apt))
+    s.check("the CCACHE_BASEDIR export is not read before BUILD is set", b.find('export CCACHE_BASEDIR="$BUILD"') > mk)
+
+    # One guard, defined once and called from both deploy paths.
+    s.check("ffmpeg-vendor.sh defines the vendor-switch guard", "ffmpeg_vendor_switch_guard ()" in v)
+    s.check("build-ffmpeg.sh calls the guard on its install target",
+            'ffmpeg_vendor_switch_guard "$GPU_VENDOR" "$PREFIX/ffmpeg"' in b)
+    s.check("proxmox-build.sh calls the guard before the .prev snapshot",
+            0 < p.find('ffmpeg_vendor_switch_guard "$GPU_VENDOR" "$PATCHED_FFMPEG"') < p.find('cp -a "$PATCHED_FFMPEG"'))
     s.check("--enable-ffnvcodec is spelled once (the array)", b.count("--enable-ffnvcodec ") == 1)
     s.check("no literal patch line for 0006-0014 is left outside the loop",
             re.search(r'patch -p1 < "\$HERE/ffmpeg/00(0[6-9]|1[0-4])', b) is None)
@@ -298,13 +415,20 @@ def suite_proxmox(s, scripts, tmp):
     env_out = os.path.join(tmp, "stub-env")
     url = "https://example.invalid/stub"
 
-    def case(name, extra, filters, want_rc, out_has=(), err_has=(), restored=None, prev_kept=None, env_has=(), env_lacks=()):
+    def case(name, extra, filters, want_rc, out_has=(), err_has=(), restored=None, prev_kept=None, env_has=(), env_lacks=(),
+             old_filters=None):
         os.makedirs(prefix, exist_ok=True)
         for leftover in (ffmpeg, ffmpeg + ".prev", env_out):
             if os.path.exists(leftover):
                 os.remove(leftover)
-        with open(ffmpeg, "w") as f:
-            f.write("OLD-BINARY")
+        # The binary already on the box: opaque text by default, or one that lists old_filters for -filters.
+        if old_filters is None:
+            old = "OLD-BINARY"
+            with open(ffmpeg, "w") as f:
+                f.write(old)
+        else:
+            fake_ffmpeg(prefix, old_filters)
+            old = read(ffmpeg)
         env = {"PATH": bindir + ":/usr/bin:/bin", "HOME": tmp, "STUB_REPO_URL": url, "STUB_ENV_OUT": env_out,
                "STUB_FILTERS": filters}
         env.update(extra)
@@ -318,7 +442,7 @@ def suite_proxmox(s, scripts, tmp):
             s.check("proxmox %s: stderr has %r" % (name, text), text in err, err)
         if restored is not None:
             s.check("proxmox %s: previous binary %s" % (name, "restored" if restored else "not restored"),
-                    (read(ffmpeg) == "OLD-BINARY") == restored)
+                    (read(ffmpeg) == old) == restored)
         if prev_kept is not None:
             s.check("proxmox %s: rollback copy %s" % (name, "kept" if prev_kept else "absent"),
                     os.path.exists(ffmpeg + ".prev") == prev_kept)
@@ -354,6 +478,21 @@ def suite_proxmox(s, scripts, tmp):
          env_has=["GPU_VENDOR=intel", "WITH_FSR2=1", "WITH_OPTIX=0", "WITH_DLSS=0"])
     case("unknown vendor", {"GPU_VENDOR": "amd"}, nv5, 1,
          err_has=["GPU_VENDOR must be nvidia or intel, not 'amd'"], restored=True, prev_kept=False)
+
+    # A mistyped GPU_VENDOR must not replace the NVIDIA binary: refused before the snapshot and the build.
+    nv_old = "oidn optix ort fsr2 dlss"
+    case("intel over an optix binary", {"GPU_VENDOR": "intel"}, "oidn ort", 1, err_has=["ALLOW_VENDOR_SWITCH"],
+         restored=True, prev_kept=False, old_filters=nv_old)
+    case("intel over an optix binary, ALLOW_VENDOR_SWITCH=1", {"GPU_VENDOR": "intel", "ALLOW_VENDOR_SWITCH": "1"},
+         "oidn ort", 42, prev_kept=True, env_has=["GPU_VENDOR=intel"], old_filters=nv_old)
+    case("nvidia over an optix binary", {"GPU_VENDOR": "nvidia"}, nv5, 42, prev_kept=True,
+         env_has=["GPU_VENDOR=nvidia"], old_filters=nv_old)
+    case("default vendor over an optix binary", {}, nv5, 42, prev_kept=True, env_has=["GPU_VENDOR=nvidia"],
+         old_filters=nv_old)
+    case("intel over an intel-only binary", {"GPU_VENDOR": "intel"}, "oidn ort", 42, prev_kept=True,
+         env_has=["GPU_VENDOR=intel"], old_filters="oidn ort")
+    case("intel over a binary that will not run", {"GPU_VENDOR": "intel"}, "oidn ort", 42, prev_kept=True,
+         env_has=["GPU_VENDOR=intel"])
 
     rc, out, err = run([BASH, os.path.join(scripts, "proxmox-build.sh"), "--help"], {"PATH": "/usr/bin:/bin"})
     s.check("proxmox --help documents GPU_VENDOR=intel and stops before set -e", rc == 0 and "GPU_VENDOR=intel" in out
@@ -419,6 +558,28 @@ MUTANTS = [
     ("proxmox-build.sh no longer restores on a missing filter", "proxmox-build.sh",
      '            mv "$PATCHED_FFMPEG.prev" "$PATCHED_FFMPEG"\n            echo "    restored the previous binary; nothing was deployed" >&2\n        else\n            echo "    no previous',
      '            echo "    restored the previous binary; nothing was deployed" >&2\n        else\n            echo "    no previous'),
+    ("proxmox-build.sh stops guarding the vendor switch", "proxmox-build.sh",
+     'ffmpeg_vendor_switch_guard "$GPU_VENDOR" "$PATCHED_FFMPEG" || exit 1',
+     'ffmpeg_vendor_switch_guard "$GPU_VENDOR" "$PATCHED_FFMPEG" || true'),
+    ("build-ffmpeg.sh stops guarding the vendor switch", "build-ffmpeg.sh",
+     'ffmpeg_vendor_switch_guard "$GPU_VENDOR" "$PREFIX/ffmpeg" || exit 1',
+     'ffmpeg_vendor_switch_guard "$GPU_VENDOR" "$PREFIX/ffmpeg" || true'),
+    ("the vendor-switch override is ignored", "ffmpeg-vendor.sh",
+     '"${ALLOW_VENDOR_SWITCH:-0}" = "1"', '"${ALLOW_VENDOR_SWITCH:-0}" = "never"'),
+    ("the vendor-switch guard looks for the wrong filter", "ffmpeg-vendor.sh",
+     "'^ *[TSC.]* *optix '", "'^ *[TSC.]* *oidn '"),
+    ("the vendor-switch guard also fires on nvidia", "ffmpeg-vendor.sh",
+     '[ "${1:-}" = "intel" ] || return 0', ':'),
+    ("the libvpl-dev preflight is removed", "build-ffmpeg.sh",
+     "if command -v apt-cache >/dev/null 2>&1; then", "if false; then"),
+    ("the libvpl-dev preflight accepts Candidate (none)", "build-ffmpeg.sh",
+     '"$vpl_candidate" != "(none)"', '"$vpl_candidate" != "(never)"'),
+    ("the libvpl-dev preflight accepts an empty answer", "build-ffmpeg.sh",
+     '[[ -n "$vpl_candidate" && ', '[[ '),
+    ("BUILD is created before the preflight again", "build-ffmpeg.sh",
+     'PLAN_ONLY="${PLAN_ONLY:-0}"\n', 'PLAN_ONLY="${PLAN_ONLY:-0}"\nBUILD="${BUILD:-$(mktemp -d)}"\n'),
+    ("the empty CUDA_LLVM_FLAGS expansion goes back to bare", "build-ffmpeg.sh",
+     '${CUDA_LLVM_FLAGS[@]+"${CUDA_LLVM_FLAGS[@]}"}', '"${CUDA_LLVM_FLAGS[@]}"'),
 ]
 
 

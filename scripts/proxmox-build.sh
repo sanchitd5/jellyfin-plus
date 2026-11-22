@@ -16,6 +16,7 @@
 #
 # GPU_VENDOR=intel with --with-ffmpeg builds the Intel Arc variant (scripts/build-ffmpeg.sh has the
 # details); the filters it must carry come from scripts/ffmpeg-vendor.sh, the one list both scripts read.
+# It refuses to replace a binary that carries optix (an NVIDIA build) unless ALLOW_VENDOR_SWITCH=1.
 #
 # Ordering is the whole point. Everything that can fail happens before anything the running
 # server can see, and the client script is published only after the server half is live, because
@@ -49,7 +50,7 @@ for arg in "$@"; do
         --with-shaders)     WITH_SHADERS=1 ;;
         --no-activate)      ACTIVATE=0 ;;
         --keep-transcodes)  KEEP_TRANSCODES=1 ;;
-        -h|--help)          sed -n '2,22p' "$0"; exit 0 ;;
+        -h|--help)          sed -n '2,23p' "$0"; exit 0 ;;
         *) echo "unknown option: $arg" >&2; exit 2 ;;
     esac
 done
@@ -114,6 +115,8 @@ if [ "$WITH_FFMPEG" = "1" ]; then
         echo "==> FAILED: GPU_VENDOR must be nvidia or intel, not '$GPU_VENDOR'" >&2
         exit 1
     fi
+    # Before the snapshot and the build: a mistyped GPU_VENDOR=intel must not replace an NVIDIA binary.
+    ffmpeg_vendor_switch_guard "$GPU_VENDOR" "$PATCHED_FFMPEG" || exit 1
     # The NVIDIA-only filters default on for nvidia and off for intel, where build-ffmpeg.sh refuses them.
     # fsr2 is off on intel too, but build-ffmpeg.sh allows it there (it needs the out-of-tree FSR2 SDK build).
     nv_default=1

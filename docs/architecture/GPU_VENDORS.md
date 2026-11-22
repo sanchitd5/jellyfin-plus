@@ -727,6 +727,16 @@ and `WITH_ORT=1` first. `proxmox-build.sh` does not turn the NVIDIA-only switche
 checks the built binary's `-filters` against the vendor's set and restores `<binary>.prev` on a miss,
 as before.
 
+**Switching vendors, and libvpl-dev.** Both scripts install over `<prefix>/ffmpeg`, so `GPU_VENDOR=intel`
+over a binary whose `-filters` lists `optix` (an NVIDIA build) is refused, naming `ALLOW_VENDOR_SWITCH`,
+before `proxmox-build.sh` takes its `.prev` snapshot and before `build-ffmpeg.sh` does any work.
+`ALLOW_VENDOR_SWITCH=1` is the explicit override; a missing or unrunnable binary, an `nvidia` build and
+an Intel binary are not affected. The check is `ffmpeg_vendor_switch_guard` in `scripts/ffmpeg-vendor.sh`.
+The Intel preflight also asks `apt-cache policy libvpl-dev` for a candidate and stops with a message
+naming the package when there is none (it is skipped where `apt-cache` is absent), instead of failing
+in `apt-get` after the preflight. `BUILD` (the `mktemp -d` build tree) is created only after the plan
+exit, with its cleanup trap, so a refusal or a kill in the preflight leaks nothing.
+
 **`PLAN_ONLY=1`.** `GPU_VENDOR=intel PLAN_ONLY=1 scripts/build-ffmpeg.sh` runs the preflight, skips the
 root and disk checks, prints `plan:` lines (vendor, apt list, nv-codec-headers, patches, hwaccel flags,
 CUDA-LLVM flags, required filters, bridge-test default, and a `plan: fsr2:` line naming patch 0016,
@@ -748,16 +758,21 @@ them.
 `PLAN_ONLY=1` for both vendors (goldens including intel with `WITH_FSR2=1`, each refusal, nothing
 written to disk, the unknown vendor), the real `proxmox-build.sh` against a stub repo and a fake
 `ffmpeg` (a missing required filter restores `.prev` for each vendor, `fsr2` is required on Intel only
-with `WITH_FSR2=1`, an unknown vendor is refused before anything is touched), and static wiring checks
+with `WITH_FSR2=1`, an unknown vendor is refused before anything is touched; the vendor-switch guard
+over a fake binary that lists `optix` in both scripts; the `libvpl-dev` preflight against a stub
+`apt-cache`; a refusal with `BUILD` unset leaves `TMPDIR` empty), and static wiring checks
 (`bash -n`, the arrays are the ones the real run reads, the NVIDIA filter list appears in no build
-script). It also mutates copies of the scripts and requires the test to fail for each of its mutants.
+script, the `${arr[@]+"${arr[@]}"}` expansion of the possibly-empty configure arrays). It also mutates copies of the scripts and requires the test to fail for each of its mutants.
 It needs no root, GPU, network or ffmpeg build.
 
 **Not verified.** No ffmpeg has been built with `GPU_VENDOR=intel`: that libvpl and VA-API configure
 and link, that `-hwaccels` lists `vaapi` and `-encoders` lists `h264_qsv`, `hevc_qsv` and `av1_qsv`
 (the Intel verify step checks it), that 0006..0014 as skipped leave a tree the rest still patches
 (patch stacking was not run), that 0016 applies without 0006 to 0014, and 0008 and 0009 on a VA-API
-chain are all open until a build on an Intel server.
+chain are all open until a build on an Intel server. A served segment on an Arc with 0008 and 0009
+applied is NOT VERIFIED; the revenant Arc end-to-end run settles it. The `libvpl-dev` check has run only
+against a stub `apt-cache`, and the `${arr[@]+...}` expansion only as a text check (no bash older than
+4.4 was available).
 
 ## 6. A380 measurements
 

@@ -108,11 +108,9 @@ set -euo pipefail
 FFMPEG_VER="${FFMPEG_VER:-8.1.2}"
 PREFIX="${PREFIX:-/usr/lib/jellyfin-ffmpeg-oidn}"
 PLAN_ONLY="${PLAN_ONLY:-0}"
-BUILD_GIVEN="${BUILD:-}"
-BUILD="${BUILD:-$(mktemp -d)}"
 
 # This script always extracts a fresh ffmpeg-8.1.2.tar.xz into a brand new mktemp -d, every
-# single run (see BUILD's default above and the tar xf below) - there is deliberately no
+# single run (see BUILD's default after the plan exit below and the tar xf below) - there is deliberately no
 # persistent build tree to reuse. Without CCACHE_BASEDIR, that alone defeats ccache almost
 # entirely: -I flags and -g3 debug info bake $BUILD's own random absolute path into every
 # compiler invocation's hash input, so byte-identical source compiled from two different
@@ -138,9 +136,7 @@ BUILD="${BUILD:-$(mktemp -d)}"
 # different-mktemp-root builds this script always produces. CCACHE_NOHASHDIR turns it off.
 # Retested with both set: 1 hit out of 2 on the same two-different-roots scenario - confirmed
 # fixed, not assumed. See livetestbox.md for the two failed attempts this was found through.
-export CCACHE_BASEDIR="$BUILD"
-export CCACHE_SLOPPINESS="include_file_mtime,include_file_ctime"
-export CCACHE_NOHASHDIR=1
+# The three exports sit after BUILD is created, below the plan exit.
 # nvidia (default) or intel; scripts/ffmpeg-vendor.sh holds the per-vendor required filters.
 source "$(dirname "${BASH_SOURCE[0]}")/ffmpeg-vendor.sh"
 GPU_VENDOR="${GPU_VENDOR:-nvidia}"
@@ -200,6 +196,14 @@ if [[ "$GPU_VENDOR" == "intel" ]]; then
     done
     [[ "${BRIDGE_TEST:-0}" != "1" ]] \
         || { echo "GPU_VENDOR=intel cannot run BRIDGE_TEST=1: the test crosses CUDA and Vulkan and an Intel build has no CUDA" >&2; exit 1; }
+    # This script installs over $PREFIX/ffmpeg: a mistyped GPU_VENDOR must not replace an NVIDIA binary.
+    ffmpeg_vendor_switch_guard "$GPU_VENDOR" "$PREFIX/ffmpeg" || exit 1
+    # libvpl-dev is missing on older bases; say so now rather than when apt-get fails further in.
+    if command -v apt-cache >/dev/null 2>&1; then
+        vpl_candidate="$(apt-cache policy libvpl-dev 2>/dev/null | sed -n 's/^ *Candidate: //p')"
+        [[ -n "$vpl_candidate" && "$vpl_candidate" != "(none)" ]] \
+            || { echo "GPU_VENDOR=intel needs libvpl-dev from apt (QSV), and apt-cache policy shows no candidate: enable the repository that ships it, or build on a newer base" >&2; exit 1; }
+    fi
 fi
 # RETIRED 2026-09-23: Maxine VFX `vsr` (vf_vsr.c, patch 0005). NvVFX_Load hangs and NVIDIA ships no
 # TensorRT models for it, so it never produced a frame; a stuck test process held the GPU for days.
@@ -505,9 +509,18 @@ if [[ "$PLAN_ONLY" == "1" ]]; then
     if [[ "$WITH_FSR2" == "1" && "$ORT_EP" == "openvino" ]]; then
         echo "plan: fsr2: no CUDA: patch ${FSR2_NOCUDA_PATCH%%-*}, cflag $FSR2_NOCUDA_CFLAG, marker $FSR2_NOCUDA_MARKER"
     fi
-    [[ -n "$BUILD_GIVEN" ]] || rmdir "$BUILD" 2>/dev/null || true
     exit 0
 fi
+
+# Created only now, so a refusal or a kill in the preflight above has no directory to leak; the trap
+# comes with it and covers everything below, apt included.
+BUILD="${BUILD:-$(mktemp -d)}"
+cleanup () { [[ "$KEEP_BUILD" == "1" ]] || rm -rf "$BUILD"; }
+trap cleanup EXIT
+# Why these three: the comment under the PLAN_ONLY default at the top of this file.
+export CCACHE_BASEDIR="$BUILD"
+export CCACHE_SLOPPINESS="include_file_mtime,include_file_ctime"
+export CCACHE_NOHASHDIR=1
 
 say "installing build dependencies"
 export DEBIAN_FRONTEND=noninteractive
@@ -517,9 +530,6 @@ apt-get install -y -qq --no-install-recommends "${APT_PKGS[@]}" >/dev/null
 # The distro shaderc, if some earlier run installed it, would still be found by pkg-config and
 # would win on include order. Remove it rather than hope /usr/local sorts first.
 apt-get remove -y -qq libshaderc-dev libshaderc1 >/dev/null 2>&1 || true
-
-cleanup () { [[ "$KEEP_BUILD" == "1" ]] || rm -rf "$BUILD"; }
-trap cleanup EXIT
 
 # mktemp -d already made its own directory; this is here for a caller-supplied BUILD.
 mkdir -p "$BUILD"
@@ -918,8 +928,9 @@ PKG_CONFIG_PATH="/usr/local/lib/x86_64-linux-gnu/pkgconfig:${PKG_CONFIG_PATH:-}"
     --enable-gpl --enable-version3 \
     --enable-vulkan --enable-libplacebo --enable-libshaderc --enable-libx264 \
     "${HWACCEL_FLAGS[@]}" \
-    "${CUDA_LLVM_FLAGS[@]}" \
-    "${OIDN_FLAGS[@]}" "${OPTIX_FLAGS[@]}" "${ORT_FLAGS[@]}" "${GAME_FLAGS[@]}" "${VSR_FLAGS[@]}" \
+    ${CUDA_LLVM_FLAGS[@]+"${CUDA_LLVM_FLAGS[@]}"} \
+    ${OIDN_FLAGS[@]+"${OIDN_FLAGS[@]}"} ${OPTIX_FLAGS[@]+"${OPTIX_FLAGS[@]}"} ${ORT_FLAGS[@]+"${ORT_FLAGS[@]}"} \
+    ${GAME_FLAGS[@]+"${GAME_FLAGS[@]}"} ${VSR_FLAGS[@]+"${VSR_FLAGS[@]}"} \
     --extra-libs="$EXTRA_LIBS"
 
 # By this point configure has already generated config.mak, config_components.h and
