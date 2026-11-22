@@ -97,6 +97,7 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
             NeuralRouting();
             AutoNeuralCache();
             IntelHardwareDecode();
+            AccessHardwareDecode();
             Fdinfo();
             IdleResidency();
             LoadRoute();
@@ -1517,6 +1518,33 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
             return UpscaleEngine.Decide(job);
         }
 
+        // AGENTS.md invariant 13 again, with IntelHardwareDecode on: its reasons name the render node ("the startup
+        // test-decode of h264 on /dev/dri/renderD128 ..."), so the non-elevated session route must not carry them
+        // (Record, the flat fields or the Summary); the elevated Status route keeps them whole.
+        private static void AccessHardwareDecode()
+        {
+            UpscaleEngine.EncoderListSource = () => Encoders(FullList);
+            UpscaleEngine.DrmVulkanProbeSource = n => true;
+            UpscaleEngine.Av1QsvProbeSource = _ => true;
+            UpscaleEngine.PatchedFfmpegSource = () => PatchedBinary;
+            UpscaleEngine.IntelHwDecodeProbeSource = node => null;
+            UpscaleEngine.Plan hwPlan = HwDecide(Machine("renderD128", "0x8086"), HwSettings(true), PlainHwJob("upscale", "1080"));
+            SessionRecord hwRecord = UpscaleEngine.Describe(null, hwPlan, hwPlan.Status, hwPlan.Reason);
+            hwRecord.PlaySessionId = "harness-access-hw-" + Guid.NewGuid().ToString("N");
+            Check("access (hardware decode) setup: the record's reason does name the render node", hwRecord.HardwareDecodeReason != null && hwRecord.HardwareDecodeReason.Contains("/dev/dri/renderD128"), hwRecord.HardwareDecodeReason);
+            UpscaleEngine.Record(hwRecord);
+            string body = PatcherHost.SessionJson(hwRecord.PlaySessionId);
+            Check("non-elevated recorded session, hardware decode on: no render node path anywhere in the body", !body.Contains("/dev/dri") && !body.Contains("renderD"), body);
+            Check("the elevated Status route keeps the hardware decode reason whole", PatcherHost.StatusJson().Contains("/dev/dri/renderD128"));
+            UpscaleEngine.IntelHwDecodeProbeSource = null;
+            UpscaleEngine.PatchedFfmpegSource = null;
+            UpscaleEngine.EncoderListSource = null;
+            UpscaleEngine.DrmVulkanProbeSource = null;
+            UpscaleEngine.Av1QsvProbeSource = null;
+            GpuDetector.UseEnvironment(null);
+            UpscaleEngine.Settings = new UpscaleSettings();
+        }
+
         private static void IntelHardwareDecode()
         {
             UpscaleEngine.EncoderListSource = () => Encoders(FullList);
@@ -1588,6 +1616,12 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
                 !UpscaleEngine.HardwareDecodeTestArgs("/dev/dri/renderD128", "/tmp/h264.mp4", testChain).Contains("testsrc")
                 && !UpscaleEngine.HardwareDecodeTestArgs("/dev/dri/renderD128", "/tmp/h264.mp4", testChain).Contains("hwupload")
                 && !UpscaleEngine.HardwareDecodeTestArgs("/dev/dri/renderD128", "/tmp/h264.mp4", testChain).Contains("-filter_hw_device va"));
+            // The test command is the production device arguments, QSV pin included: both come from the one DeviceInit.
+            string productionDevices = UpscaleEngine.HwaccelArgs(hw);
+            string testCommand = UpscaleEngine.HardwareDecodeTestCommand("/dev/dri/renderD128", "/tmp/h264.mp4", testChain);
+            Check("the start-up test command carries the QSV pin", testCommand.Contains(QsvPin), testCommand);
+            Equal("the start-up test command's device arguments are the session command's own",
+                "-hide_banner -loglevel error" + productionDevices + " -i \"/tmp/h264.mp4\" -vf \"" + testChain + "\" -frames:v 3 -f null -", testCommand);
             string h264Clip = UpscaleEngine.HardwareDecodeClipArgs("h264", "/tmp/h264.mp4");
             string hevcClip = UpscaleEngine.HardwareDecodeClipArgs("hevc", "/tmp/hevc.mp4");
             Check("the h264 clip is 8-bit 4:2:0 Main", h264Clip.Contains("-pix_fmt yuv420p") && h264Clip.Contains("-c:v libx264 -profile:v main") && h264Clip.EndsWith("-y \"/tmp/h264.mp4\""), h264Clip);

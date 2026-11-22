@@ -2184,9 +2184,17 @@ namespace Jellyfin.Plugin.Plus.Patcher
             + " -y \"" + path + "\"";
 
         /// <summary>The patched ffmpeg command that decodes that clip the way a session does, through the chain.</summary>
-        internal static string HardwareDecodeTestArgs(string node, string clip, string chain) =>
-            "-hide_banner -loglevel error" + HardwareDecodeDeviceArgs(node, string.Empty)
+        internal static string HardwareDecodeTestArgs(string node, string clip, string chain, string qsvArgs = "") =>
+            "-hide_banner -loglevel error" + HardwareDecodeDeviceArgs(node, qsvArgs)
             + " -i \"" + clip + "\" -vf \"" + chain + "\" -frames:v 3 -f null -";
+
+        /// <summary>
+        /// The command the start-up test runs: the device arguments are the production ones, QSV pin
+        /// included (the shared <see cref="DeviceInit.QsvArgs"/>), so a QSV device that cannot be opened
+        /// on the node fails the test and not the session.
+        /// </summary>
+        internal static string HardwareDecodeTestCommand(string node, string clip, string chain) =>
+            HardwareDecodeTestArgs(node, clip, chain, Devices().QsvArgs);
 
         /// <summary>
         /// Runs the test for each codec on the patched binary (0008 and 0009 exist only there; stock
@@ -2238,7 +2246,7 @@ namespace Jellyfin.Plugin.Plus.Patcher
                     return null;
                 }
 
-                return RunExeProbe(patched, HardwareDecodeTestArgs(node, clip, chain), 20000);
+                return RunExeProbe(patched, HardwareDecodeTestCommand(node, clip, chain), 20000);
             }
             catch (Exception)
             {
