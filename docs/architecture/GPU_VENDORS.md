@@ -645,36 +645,63 @@ condition failed (`HardwareDecodeReason`):
 
 1. the setting is on;
 2. an Intel GPU is detected (`Devices().Intel`, with a render node that has a usable path);
-3. the source is upright 8-bit SDR progressive h264 or hevc (anything Jellyfin would tone-map,
-   deinterlace or rotate adds a CPU-side node);
+3. the source is upright 8-bit SDR progressive 4:2:0 and one of h264 Main, h264 High or hevc Main
+   (`HardwareDecodableSource`: profile and `PixelFormat` are read as well as the codec, so Baseline,
+   Extended, High 10, High 4:2:2, High 4:4:4, hevc Main 10, Rext and Still Picture, and the 4:2:2, 4:4:4
+   and full-range `yuvj` formats stay in software; those decode to software frames or fail on the
+   VA-API surface and would die at the `hwmap`). Anything Jellyfin would tone-map, deinterlace or rotate
+   adds a CPU-side node;
 4. the plan has no CPU-side node: no CUDA neural, CPU deblock, CPU denoise (`atadenoise`), neural or game
    step, and a Vulkan denoise only if the patched binary can compile its shader;
-5. the start-up test passes: one synthetic frame uploaded to a VA surface, mapped to Vulkan and
-   downloaded on the patched binary (`HardwareDecodeProbeArgs`), once per render node and remembered
-   whatever the answer. **This is an approximation:** it exercises the VA-API to Vulkan map, not a
-   real decode, so a passing test does not prove the decoder works.
+5. the patched ffmpeg is installed, checked again for every plan (`ShaderLibrary.PatchedFfmpegPath`, the
+   one definition of the path): stock ffmpeg cannot map VA-API frames to Vulkan;
+6. the start-up test has passed for the source's codec. It runs the production chain
+   (`HardwareDecodeTestChain`, built by `BuildChain` with `HardwareDecode` set) with the production device
+   arguments (`HardwareDecodeDeviceArgs`) on a tiny generated h264 and hevc clip, so the download format
+   (`HardwareSurfaceFormat`) is exercised and not assumed. It runs on a thread-pool thread (`CachedProbe`, started at plugin
+   load by `PrimeHardwareDecode` and by the first plan that finds nothing): a plan only reads the answer,
+   so a session that arrives first decodes in software ("has not finished") and none waits. A pass is kept
+   for the life of the process; a fail or a test that could not run is asked again after 60 s while the
+   last answer stands, so one bad run at boot does not pin the server to software.
 
 When all hold the command is
-`-init_hw_device vaapi=va:<node> -init_hw_device vulkan=vk@va [QSV device] -hwaccel vaapi
+`-init_hw_device vaapi=va:<node> -init_hw_device vulkan=vk@va [QSV device] -hwaccel vaapi -hwaccel_device va
 -hwaccel_output_format vaapi -filter_hw_device vk` and the chain is
 `[setparams=range=tv,]hwmap=derive_device=vulkan,[Vulkan deblock/denoise,]libplacebo...,hwdownload,format=nv12`:
-no `format=yuv420p`, no `hwupload`. Nodes Jellyfin keeps (subtitle overlay and the like) are placed after
-the chain tail rather than before it.
+no `format=yuv420p`, no `hwupload`. Nodes Jellyfin keeps (`JoinChain`: the subtitle overlay and the like,
+all CPU nodes) run before the chain in software decode and after its `hwdownload` under hardware decode,
+so they follow the upscale on this path; the golden harness case pins both orders.
 
 Premises inferred from the source and not seen to work (P3 to P6): that `ffmpeg/0008` and `0009` make
 the VA-API to Vulkan `hwmap` negotiate; that `vk@va` derives a device the decoder's frames can be mapped
-into; that VA-API frames cannot enter a CPU node (hence the plan condition); and that the downloaded
-format is `nv12` (one constant, `HardwareDecodeFormat`).
+into; and that VA-API frames cannot enter a CPU node (hence the plan condition). The downloaded
+format is derived from the gated source pixel format (`HardwareSurfaceFormat`: `yuv420p` gives `nv12`,
+anything else has no hardware decode) and stored on the plan as `HardwareDecodeFormat`.
 
 The shim: stock jellyfin-ffmpeg failed `hwmap=derive_device=vulkan` from VA-API ("Conversion failed!"
 on the A380), and `0008`/`0009` exist only in the patched binary, so `pick_binary` routes a command
 carrying `vulkan=vk@va` and `derive_device=vulkan` to the patched binary
 (`scripts/test-shim-device.py`). That is a routing change beyond the setting itself.
 
-Byte-identical, by harness: with the setting off, or on without a detected Intel GPU (NVIDIA, no GPU,
-mixed auto), every command line, the probe JSON and the session JSON are what they were; the probe key
-`IntelHardwareDecode` and the record keys `HardwareDecode` and `HardwareDecodeReason` exist only
-while the setting is on.
+One source for the binary path: the plugin plans hardware decode only after seeing the patched binary
+(`ShaderLibrary.PatchedFfmpegPath`), the shim routes to its own `PATCHED_FFMPEG`, and
+`proxmox-build.sh` installs to `FFMPEG_PREFIX`; `scripts/test_shim_patched_path.py` fails when the three
+disagree. The shim cannot read the plugin's answer, so if the binary has gone between the plan and the
+launch it logs a warning naming the path and falls back to stock ffmpeg, which fails that session with
+"Conversion failed". Not written to `/etc/jellyfin-upscale.json`: that is a maintainer's call. Residual
+risk: a session with no PlaySessionId is decided afresh on every request.
+
+Identical, by harness: with the setting off, or on without a detected Intel GPU (NVIDIA, no GPU, mixed
+auto), every command line, the probe JSON and the session JSON equal those of the setting off, and
+`HardwareDecodeReason` is null. The probe key `IntelHardwareDecode` is served only while the setting is on
+and an Intel GPU is detected, and the record keys `HardwareDecode` and `HardwareDecodeReason` exist only
+then. (The decision itself still runs `Devices()`, which may run the DRM Vulkan test once; that is
+existing behaviour, not byte-identical in cost.)
+
+Still open and not changed by this: `DrmVulkanStarts` blocks the caller and caches a null for the life of
+the process, and `PrimeHardwareDecode` calls `Devices()` on its background task and so waits on it there.
+NOT VERIFIED on an Arc: that the test-decode passes, that the gate's profiles are the ones the driver
+decodes, that `-hwaccel_device va` is accepted with `vk@va`, and that `nv12` is the format a real Arc downloads (the map is derived from the gated 4:2:0 source, not measured).
 
 ### 5.7 PR 8: a `GPU_VENDOR=intel` build, and the five-filter invariant
 

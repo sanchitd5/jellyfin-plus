@@ -251,8 +251,9 @@ namespace Jellyfin.Plugin.Plus.Patcher
 
         /// <summary>
         /// Whether this session decoded on the Intel GPU (VA-API surfaces mapped to Vulkan) instead
-        /// of in software. Null unless the IntelHardwareDecode setting is on and the session was
-        /// enhanced, so every other server's session record is unchanged. GPU_VENDORS.md 5.6.
+        /// of in software. Null unless the IntelHardwareDecode setting is on, the GPU is a detected
+        /// Intel one and the session was enhanced, so every other server's session record is
+        /// unchanged. GPU_VENDORS.md 5.6.
         /// </summary>
         [System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
         public bool? HardwareDecode { get; set; }
@@ -490,7 +491,10 @@ namespace Jellyfin.Plugin.Plus.Patcher
             /// </summary>
             public bool HardwareDecode { get; set; }
 
-            /// <summary>Why HardwareDecode is what it is. Null when the setting is off, which keeps every other command and record as before.</summary>
+            /// <summary>The pixel format the chain downloads in after a hardware decode, derived from the source's pixel format by HardwareSurfaceFormat. Set together with HardwareDecode.</summary>
+            public string HardwareDecodeFormat { get; set; }
+
+            /// <summary>Why HardwareDecode is what it is. Null when the setting is off or there is no detected Intel GPU, which keeps every other command and record as before.</summary>
             public string HardwareDecodeReason { get; set; }
 
             public static Plan No(string status, string reason) =>
@@ -1786,21 +1790,24 @@ namespace Jellyfin.Plugin.Plus.Patcher
         }
 
         /// <summary>
-        /// The pixel format the chain downloads in after a hardware decode. One constant because it
-        /// is inferred, not measured (GPU_VENDORS.md 5.6): the Vulkan frames keep the decoder's own
-        /// sw format, which for 8-bit VA-API decode is nv12.
+        /// The VA-API surface format a decode of this source pixel format downloads in, or null when
+        /// there is no hardware decode for it. The Vulkan frames keep the decoder's own sw format; for
+        /// 8-bit 4:2:0 that is nv12.
         /// </summary>
-        internal const string HardwareDecodeFormat = "nv12";
+        internal static string HardwareSurfaceFormat(string pixelFormat) =>
+            pixelFormat == "yuv420p" ? "nv12" : null;
 
         /// <summary>
         /// IntelHardwareDecode (GPU_VENDORS.md 5.6): decides once whether this session decodes on the
-        /// Intel GPU and maps the VA-API surfaces to Vulkan. Does nothing while the setting is off,
-        /// which leaves HardwareDecodeReason null so no command, probe or record changes. Software
-        /// decode is the answer to every doubt, and the reason names the first condition that failed.
+        /// Intel GPU and maps the VA-API surfaces to Vulkan. Does nothing while the setting is off or
+        /// there is no detected Intel GPU, which leaves HardwareDecodeReason null so no command,
+        /// probe or record changes on any other server. Software decode is the answer to every
+        /// doubt, and the reason names the first condition that failed. Never waits on the
+        /// start-up test: it reads the answer the background probe has so far.
         /// </summary>
         private static void DecideHardwareDecode(Plan plan, UpscaleSettings cfg, object videoStream, bool onIntel)
         {
-            if (cfg == null || !cfg.IntelHardwareDecode)
+            if (cfg == null || !cfg.IntelHardwareDecode || !onIntel)
             {
                 return;
             }
@@ -1808,12 +1815,6 @@ namespace Jellyfin.Plugin.Plus.Patcher
             plan.HardwareDecode = false;
             try
             {
-                if (!onIntel)
-                {
-                    plan.HardwareDecodeReason = "software decode: needs a detected Intel GPU";
-                    return;
-                }
-
                 // VA-API frames cannot enter a CPU filter, so a plan with one keeps software decode.
                 var cpu = new List<string>();
                 if (plan.UsesCudaNeural)
@@ -1853,9 +1854,9 @@ namespace Jellyfin.Plugin.Plus.Patcher
                     return;
                 }
 
-                if (!HardwareDecodableSource(plan, videoStream))
+                if (!HardwareDecodableSource(plan, videoStream, out string codec, out string surfaceFormat))
                 {
-                    plan.HardwareDecodeReason = "software decode: the source is not upright 8-bit SDR progressive h264 or hevc";
+                    plan.HardwareDecodeReason = HardwareSourceReason;
                     return;
                 }
 
@@ -1866,21 +1867,37 @@ namespace Jellyfin.Plugin.Plus.Patcher
                     return;
                 }
 
-                bool? works = HardwareDecodeStarts(node);
+                // Looked up now, not cached, so a binary removed after start-up is noticed.
+                string patched = PatchedFfmpeg();
+                if (string.IsNullOrWhiteSpace(patched))
+                {
+                    plan.HardwareDecodeReason = "software decode: the patched ffmpeg is not installed, and stock ffmpeg cannot map VA-API frames to Vulkan";
+                    return;
+                }
+
+                string test = "software decode: the startup test-decode of " + codec + " on " + node;
+                HwDecodeAnswer answer = HardwareDecodeStarts(node);
+                if (answer == null)
+                {
+                    plan.HardwareDecodeReason = test + " has not finished";
+                    return;
+                }
+
+                bool? works = answer.For(codec);
                 if (works != true)
                 {
-                    plan.HardwareDecodeReason = works == false
-                        ? "software decode: the startup test-decode on " + node + " failed"
-                        : "software decode: the startup test-decode on " + node + " could not be run";
+                    plan.HardwareDecodeReason = works == false ? test + " failed" : test + " could not be run";
                     return;
                 }
 
                 plan.HardwareDecode = true;
+                plan.HardwareDecodeFormat = surfaceFormat;
                 plan.HardwareDecodeReason = "decoded on the Intel GPU (VA-API) and mapped to Vulkan";
             }
             catch (Exception ex)
             {
                 plan.HardwareDecode = false;
+                plan.HardwareDecodeFormat = null;
                 plan.HardwareDecodeReason = "software decode: error: " + ex.Message;
             }
         }
@@ -1897,20 +1914,42 @@ namespace Jellyfin.Plugin.Plus.Patcher
             }
         }
 
+        internal const string HardwareSourceReason =
+            "software decode: the source is not upright 8-bit SDR progressive 4:2:0 h264 (Main or High) or hevc (Main)";
+
         /// <summary>
-        /// 8-bit SDR progressive h264 or hevc, stored upright. Anything Jellyfin would tone-map,
-        /// deinterlace or rotate adds a node that has to see CPU frames, and a property that cannot
-        /// be read counts as "no".
+        /// Upright 8-bit SDR progressive 4:2:0 h264 Main or High, or hevc Main. Profile and chroma
+        /// format are gated because a decoder that cannot take 4:2:2, 4:4:4 or RExt hands back
+        /// software frames, hwmap into Vulkan then fails, and the stream dies instead of degrading.
+        /// Anything Jellyfin would tone-map, deinterlace or rotate adds a node that has to see CPU
+        /// frames, and a property that cannot be read counts as "no". The codec is the normalised
+        /// name (h264 or hevc), and the surface format the chain downloads in, when this returns true.
         /// </summary>
-        private static bool HardwareDecodableSource(Plan plan, object stream)
+        private static bool HardwareDecodableSource(Plan plan, object stream, out string codec, out string surfaceFormat)
         {
+            codec = null;
+            surfaceFormat = null;
             if (plan.SourceSideways)
             {
                 return false;
             }
 
-            string codec = (StreamValue(stream, "Codec") as string ?? string.Empty).Trim().ToLowerInvariant();
-            if (codec != "h264" && codec != "hevc")
+            string name = (StreamValue(stream, "Codec") as string ?? string.Empty).Trim().ToLowerInvariant();
+            if (name != "h264" && name != "hevc")
+            {
+                return false;
+            }
+
+            string profile = (StreamValue(stream, "Profile") as string ?? string.Empty).Trim().ToLowerInvariant();
+            bool profileOk = name == "h264" ? profile == "main" || profile == "high" : profile == "main";
+            if (!profileOk)
+            {
+                return false;
+            }
+
+            string pixelFormat = (StreamValue(stream, "PixelFormat") as string ?? string.Empty).Trim().ToLowerInvariant();
+            string format = HardwareSurfaceFormat(pixelFormat);
+            if (format == null)
             {
                 return false;
             }
@@ -1932,87 +1971,238 @@ namespace Jellyfin.Plugin.Plus.Patcher
             }
 
             string range = (StreamValue(stream, "VideoRangeType")?.ToString() ?? string.Empty).Trim();
-            return range.Length == 0 || string.Equals(range, "SDR", StringComparison.OrdinalIgnoreCase)
-                || string.Equals(range, "Unknown", StringComparison.OrdinalIgnoreCase);
+            if (range.Length != 0 && !string.Equals(range, "SDR", StringComparison.OrdinalIgnoreCase)
+                && !string.Equals(range, "Unknown", StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            codec = name;
+            surfaceFormat = format;
+            return true;
         }
 
         /// <summary>Replaces the startup test-decode (true, false, null for inconclusive). The tests set it; nothing in production does.</summary>
         internal static Func<string, bool?> IntelHwDecodeProbeSource { get; set; }
 
-        private static readonly Dictionary<string, bool?> _hwDecode = new Dictionary<string, bool?>();
-        private static readonly object _hwDecodeLock = new object();
+        /// <summary>Replaces the lookup of the patched ffmpeg (null for not installed). The tests set it; nothing in production does.</summary>
+        internal static Func<string> PatchedFfmpegSource { get; set; }
+
+        /// <summary>The patched ffmpeg, or null when it is not installed. The one definition of its path is ShaderLibrary.PatchedFfmpegPath.</summary>
+        private static string PatchedFfmpeg() => PatchedFfmpegSource != null ? PatchedFfmpegSource() : ShaderLibrary.PatchedFfmpegPath();
 
         /// <summary>
-        /// Whether one frame survives VA-API surface to Vulkan on this render node, tested once per
-        /// node and remembered whatever the answer. Run on the patched binary, because 0008 and 0009
-        /// exist only there (stock failed this chain with "Conversion failed!"). It is an
-        /// approximation of a decode: a synthetic frame is uploaded to a VA surface instead.
+        /// What the start-up test-decode found per codec: true passed, false failed, null could not
+        /// be run (no binary, no encoder for the clip, timeout). A codec the gate admits is only
+        /// decoded on the GPU when its own entry is true.
         /// </summary>
-        private static bool? HardwareDecodeStarts(string node)
+        internal sealed class HwDecodeAnswer
         {
-            if (IntelHwDecodeProbeSource != null)
+            public HwDecodeAnswer(bool? h264, bool? hevc)
             {
-                return IntelHwDecodeProbeSource(node);
+                H264 = h264;
+                Hevc = hevc;
             }
 
+            public bool? H264 { get; }
+
+            public bool? Hevc { get; }
+
+            /// <summary>Final only when every codec passed; anything else is asked again after the retry delay.</summary>
+            public bool Conclusive => H264 == true && Hevc == true;
+
+            public bool? For(string codec) => codec == "h264" ? H264 : codec == "hevc" ? Hevc : (bool?)false;
+        }
+
+        /// <summary>How long a failed or unrunnable test stands before the next one is scheduled; the same delay as GpuDetector's.</summary>
+        internal static readonly TimeSpan HardwareDecodeRetryAfter = TimeSpan.FromSeconds(60);
+
+        /// <summary>Replaces how a node's probe is built (a fake clock and a synchronous or queued scheduler). The tests set it; nothing in production does.</summary>
+        internal static Func<string, CachedProbe<HwDecodeAnswer>> HardwareDecodeProbeFactory { get; set; }
+
+        private static readonly Dictionary<string, CachedProbe<HwDecodeAnswer>> _hwDecode = new Dictionary<string, CachedProbe<HwDecodeAnswer>>();
+        private static readonly object _hwDecodeLock = new object();
+
+        /// <summary>Forgets every node's probe, so the next read builds a fresh one. For the tests.</summary>
+        internal static void ResetHardwareDecodeProbes()
+        {
             lock (_hwDecodeLock)
             {
-                if (_hwDecode.TryGetValue(node, out bool? known))
-                {
-                    return known;
-                }
-
-                bool? result = null;
-                try
-                {
-                    string exe = ShaderLibrary.PatchedFfmpegPath();
-                    if (!string.IsNullOrWhiteSpace(exe) && File.Exists(exe))
-                    {
-                        var psi = new System.Diagnostics.ProcessStartInfo(exe, HardwareDecodeProbeArgs(node))
-                        {
-                            RedirectStandardOutput = true,
-                            RedirectStandardError = true,
-                            UseShellExecute = false,
-                        };
-
-                        using (var proc = System.Diagnostics.Process.Start(psi))
-                        {
-                            var stdoutRead = proc.StandardOutput.ReadToEndAsync();
-                            var stderrRead = proc.StandardError.ReadToEndAsync();
-                            if (!proc.WaitForExit(20000))
-                            {
-                                try
-                                {
-                                    proc.Kill();
-                                }
-                                catch (Exception)
-                                {
-                                    // already gone
-                                }
-                            }
-                            else
-                            {
-                                System.Threading.Tasks.Task.WaitAll(new System.Threading.Tasks.Task[] { stdoutRead, stderrRead }, 5000);
-                                result = proc.ExitCode == 0;
-                            }
-                        }
-                    }
-                }
-                catch (Exception)
-                {
-                    result = null;
-                }
-
-                _hwDecode[node] = result;
-                return result;
+                _hwDecode.Clear();
             }
         }
 
-        /// <summary>The test command: a VA-API device, a Vulkan device derived from it, and one frame uploaded, mapped and downloaded.</summary>
-        internal static string HardwareDecodeProbeArgs(string node) =>
-            "-hide_banner -loglevel error -init_hw_device vaapi=va:" + node + " -init_hw_device vulkan=vk@va "
-            + "-filter_hw_device va -f lavfi -i testsrc=size=64x64:rate=1 -frames:v 1 "
-            + "-vf format=nv12,hwupload,hwmap=derive_device=vulkan,hwdownload,format=" + HardwareDecodeFormat + " -f null -";
+        private static CachedProbe<HwDecodeAnswer> HardwareDecodeProbe(string node)
+        {
+            lock (_hwDecodeLock)
+            {
+                if (!_hwDecode.TryGetValue(node, out CachedProbe<HwDecodeAnswer> probe))
+                {
+                    probe = (HardwareDecodeProbeFactory ?? NewHardwareDecodeProbe)(node);
+                    _hwDecode[node] = probe;
+                }
+
+                return probe;
+            }
+        }
+
+        private static CachedProbe<HwDecodeAnswer> NewHardwareDecodeProbe(string node)
+        {
+            HwDecodeAnswer last = null;
+            return new CachedProbe<HwDecodeAnswer>(
+                () =>
+                {
+                    HwDecodeAnswer fresh = RunHardwareDecodeTests(node);
+
+                    // A codec this run could not test keeps what an earlier run found.
+                    last = new HwDecodeAnswer(fresh.H264 ?? last?.H264, fresh.Hevc ?? last?.Hevc);
+                    return last;
+                },
+                answer => answer.Conclusive,
+                HardwareDecodeRetryAfter);
+        }
+
+        /// <summary>
+        /// What the start-up test has found on this render node, or null while there is no answer
+        /// yet. Never runs ffmpeg on the calling thread: the first read starts the probe on the
+        /// thread pool and a failed answer is retried in the background (CachedProbe), so a
+        /// session's plan never waits on it and one bad run is not remembered for the process.
+        /// </summary>
+        private static HwDecodeAnswer HardwareDecodeStarts(string node)
+        {
+            if (IntelHwDecodeProbeSource != null)
+            {
+                bool? all = IntelHwDecodeProbeSource(node);
+                return new HwDecodeAnswer(all, all);
+            }
+
+            return HardwareDecodeProbe(node).Peek();
+        }
+
+        /// <summary>
+        /// Starts the start-up test on a thread-pool thread when the setting is on and an Intel
+        /// render node is found, so the first session finds an answer instead of starting the test.
+        /// Never blocks and never throws; a server without the setting does nothing.
+        /// </summary>
+        internal static void PrimeHardwareDecode()
+        {
+            try
+            {
+                if (Settings?.IntelHardwareDecode != true)
+                {
+                    return;
+                }
+
+                DeviceInit devices = Devices();
+                if (devices.Intel && !string.IsNullOrEmpty(devices.RenderNode))
+                {
+                    HardwareDecodeProbe(devices.RenderNode).Start();
+                }
+            }
+            catch (Exception)
+            {
+                // the first session starts the probe instead
+            }
+        }
+
+        /// <summary>
+        /// The VA-API device, the Vulkan device derived from it, and the decode that leaves VA-API
+        /// surfaces, with a leading space. The command a session runs (HwaccelArgs) and the start-up
+        /// test are both built from this, so the test cannot drift from production. The decoder is
+        /// bound by name (-hwaccel_device va) rather than by whichever device was created last.
+        /// </summary>
+        internal static string HardwareDecodeDeviceArgs(string node, string qsvArgs) =>
+            " -init_hw_device vaapi=va:" + node + " -init_hw_device vulkan=vk@va" + qsvArgs
+            + " -hwaccel vaapi -hwaccel_device va -hwaccel_output_format vaapi -filter_hw_device vk";
+
+        private const int HardwareDecodeClipWidth = 256;
+
+        private const int HardwareDecodeClipHeight = 144;
+
+        /// <summary>
+        /// The chain the start-up test decodes through: the production hardware-decode chain for a
+        /// plain 2x upscale, so the hwmap into Vulkan, libplacebo on the imported surfaces and the
+        /// download to the surface format are all exercised.
+        /// </summary>
+        internal static string HardwareDecodeTestChain() =>
+            BuildChain(new Plan
+            {
+                Width = HardwareDecodeClipWidth * 2,
+                Height = HardwareDecodeClipHeight * 2,
+                UpscaleApplied = true,
+                HardwareDecode = true,
+                HardwareDecodeFormat = HardwareSurfaceFormat("yuv420p"),
+            });
+
+        /// <summary>The stock ffmpeg command that writes a tiny 8-bit 4:2:0 clip of this codec (h264 Main or hevc Main), the source the gate admits.</summary>
+        internal static string HardwareDecodeClipArgs(string codec, string path) =>
+            "-hide_banner -loglevel error -f lavfi -i testsrc=size=" + HardwareDecodeClipWidth + "x" + HardwareDecodeClipHeight + ":rate=5 "
+            + "-frames:v 5 -pix_fmt yuv420p "
+            + (codec == "hevc" ? "-c:v libx265 -profile:v main -x265-params log-level=error" : "-c:v libx264 -profile:v main")
+            + " -y \"" + path + "\"";
+
+        /// <summary>The patched ffmpeg command that decodes that clip the way a session does, through the chain.</summary>
+        internal static string HardwareDecodeTestArgs(string node, string clip, string chain) =>
+            "-hide_banner -loglevel error" + HardwareDecodeDeviceArgs(node, string.Empty)
+            + " -i \"" + clip + "\" -vf \"" + chain + "\" -frames:v 3 -f null -";
+
+        /// <summary>
+        /// Runs the test for each codec on the patched binary (0008 and 0009 exist only there; stock
+        /// ends this chain in "Conversion failed!"). Slow, so only a probe thread calls it. A clip
+        /// that cannot be made, or no patched binary, is "could not be run" for that codec.
+        /// </summary>
+        private static HwDecodeAnswer RunHardwareDecodeTests(string node)
+        {
+            string patched = PatchedFfmpeg();
+            string stock = StockFfmpeg();
+            if (string.IsNullOrWhiteSpace(patched) || stock == null)
+            {
+                return new HwDecodeAnswer(null, null);
+            }
+
+            string dir = Path.Combine(Path.GetTempPath(), "jfplus-hwdecode-" + Guid.NewGuid().ToString("N"));
+            try
+            {
+                Directory.CreateDirectory(dir);
+                string chain = HardwareDecodeTestChain();
+                return new HwDecodeAnswer(
+                    RunHardwareDecodeTest(patched, stock, node, dir, "h264", chain),
+                    RunHardwareDecodeTest(patched, stock, node, dir, "hevc", chain));
+            }
+            catch (Exception)
+            {
+                return new HwDecodeAnswer(null, null);
+            }
+            finally
+            {
+                try
+                {
+                    Directory.Delete(dir, true);
+                }
+                catch (Exception)
+                {
+                    // a temp directory left behind is cleaned by the OS
+                }
+            }
+        }
+
+        private static bool? RunHardwareDecodeTest(string patched, string stock, string node, string dir, string codec, string chain)
+        {
+            try
+            {
+                string clip = Path.Combine(dir, codec + ".mp4");
+                if (RunExeProbe(stock, HardwareDecodeClipArgs(codec, clip), 20000) != true)
+                {
+                    return null;
+                }
+
+                return RunExeProbe(patched, HardwareDecodeTestArgs(node, clip, chain), 20000);
+            }
+            catch (Exception)
+            {
+                return null;
+            }
+        }
 
         /// <summary>
         /// The size of the picture as it is displayed. A phone video is often stored sideways with a
@@ -2626,7 +2816,11 @@ namespace Jellyfin.Plugin.Plus.Patcher
             /// <summary>Null off Intel.</summary>
             public string QsvText { get; set; }
 
-            /// <summary>The Intel render node when it has a usable path, else null (hardware decode needs it).</summary>
+            /// <summary>
+            /// The Intel render node whenever its path is usable, else null (hardware decode needs
+            /// it). Set even when the Vulkan-from-DRM test failed: hardware decode derives its own
+            /// Vulkan device from VA-API and does not depend on that test.
+            /// </summary>
             public string RenderNode { get; set; }
         }
 
@@ -2635,7 +2829,8 @@ namespace Jellyfin.Plugin.Plus.Patcher
         /// node the Vulkan device is derived from the node (drm=dr:NODE, vulkan=vk@dr) after a one-time
         /// test that it starts, and falls back to vk:0 if the test fails; the QSV device is added only
         /// where the encoder's own search cannot find the node (above renderD135). Everything else is
-        /// the default above. Never throws.
+        /// the default above. RenderNode is set whenever the path is usable, also when that test
+        /// failed and the software-decode Vulkan device is vk:0. Never throws.
         /// </summary>
         internal static DeviceInit Devices()
         {
@@ -2739,16 +2934,7 @@ namespace Jellyfin.Plugin.Plus.Patcher
         /// </summary>
         private static bool? RunFfmpegProbe(string args, int timeoutMs)
         {
-            var candidates = new List<string>();
-            if (!string.IsNullOrWhiteSpace(_ffmpegPath))
-            {
-                candidates.Add(_ffmpegPath);
-            }
-
-            candidates.Add("/usr/lib/jellyfin-ffmpeg/ffmpeg");
-            candidates.Add("/usr/bin/ffmpeg");
-
-            foreach (string exe in candidates)
+            foreach (string exe in StockFfmpegCandidates())
             {
                 try
                 {
@@ -2757,34 +2943,7 @@ namespace Jellyfin.Plugin.Plus.Patcher
                         continue;
                     }
 
-                    var psi = new System.Diagnostics.ProcessStartInfo(exe, args)
-                    {
-                        RedirectStandardOutput = true,
-                        RedirectStandardError = true,
-                        UseShellExecute = false,
-                    };
-
-                    using (var proc = System.Diagnostics.Process.Start(psi))
-                    {
-                        var stdoutRead = proc.StandardOutput.ReadToEndAsync();
-                        var stderrRead = proc.StandardError.ReadToEndAsync();
-                        if (!proc.WaitForExit(timeoutMs))
-                        {
-                            try
-                            {
-                                proc.Kill();
-                            }
-                            catch (Exception)
-                            {
-                                // already gone
-                            }
-
-                            return null;
-                        }
-
-                        System.Threading.Tasks.Task.WaitAll(new System.Threading.Tasks.Task[] { stdoutRead, stderrRead }, 5000);
-                        return proc.ExitCode == 0;
-                    }
+                    return RunExeProbe(exe, args, timeoutMs);
                 }
                 catch (Exception)
                 {
@@ -2793,6 +2952,64 @@ namespace Jellyfin.Plugin.Plus.Patcher
             }
 
             return null;
+        }
+
+        private static IEnumerable<string> StockFfmpegCandidates()
+        {
+            if (!string.IsNullOrWhiteSpace(_ffmpegPath))
+            {
+                yield return _ffmpegPath;
+            }
+
+            yield return "/usr/lib/jellyfin-ffmpeg/ffmpeg";
+            yield return "/usr/bin/ffmpeg";
+        }
+
+        /// <summary>The first stock ffmpeg that exists, or null.</summary>
+        private static string StockFfmpeg()
+        {
+            foreach (string exe in StockFfmpegCandidates())
+            {
+                if (File.Exists(exe))
+                {
+                    return exe;
+                }
+            }
+
+            return null;
+        }
+
+        /// <summary>Runs one executable: true on exit 0, false on any other exit, null on a timeout. Throws when it cannot be started.</summary>
+        private static bool? RunExeProbe(string exe, string args, int timeoutMs)
+        {
+            var psi = new System.Diagnostics.ProcessStartInfo(exe, args)
+            {
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+            };
+
+            using (var proc = System.Diagnostics.Process.Start(psi))
+            {
+                var stdoutRead = proc.StandardOutput.ReadToEndAsync();
+                var stderrRead = proc.StandardError.ReadToEndAsync();
+                if (!proc.WaitForExit(timeoutMs))
+                {
+                    try
+                    {
+                        proc.Kill();
+                    }
+                    catch (Exception)
+                    {
+                        // already gone
+                    }
+
+                    return null;
+                }
+
+                System.Threading.Tasks.Task.WaitAll(new System.Threading.Tasks.Task[] { stdoutRead, stderrRead }, 5000);
+                return proc.ExitCode == 0;
+            }
         }
 
         private static readonly string[] IntelCodecs = { "h264", "hevc", "av1" };
@@ -3718,8 +3935,7 @@ namespace Jellyfin.Plugin.Plus.Patcher
             {
                 // IntelHardwareDecode: the Vulkan device is derived from the VA-API one the decoder
                 // uses, so the surfaces can be mapped without a copy (GPU_VENDORS.md 5.6).
-                return " -init_hw_device vaapi=va:" + devices.RenderNode + " -init_hw_device vulkan=vk@va"
-                    + devices.QsvArgs + " -hwaccel vaapi -hwaccel_output_format vaapi -filter_hw_device vk";
+                return HardwareDecodeDeviceArgs(devices.RenderNode, devices.QsvArgs);
             }
 
             bool cuda = plan != null && plan.UsesCudaNeural && !devices.Intel;
@@ -3820,7 +4036,7 @@ namespace Jellyfin.Plugin.Plus.Patcher
                 }
 
                 AppendLibplaceboSegment(hw, plan, cfg);
-                hw.Append(",hwdownload,format=").Append(HardwareDecodeFormat);
+                hw.Append(",hwdownload,format=").Append(plan.HardwareDecodeFormat ?? throw new InvalidOperationException("hardware decode without a surface format"));
                 return hw.ToString();
             }
 
@@ -4063,6 +4279,27 @@ namespace Jellyfin.Plugin.Plus.Patcher
             }
 
             return nodes.Where(n => !string.IsNullOrWhiteSpace(n)).ToList();
+        }
+
+        /// <summary>
+        /// The filter list Jellyfin's kept nodes and our chain make together. Software decode: kept
+        /// nodes first, on the frames Jellyfin decoded. Hardware decode: our chain first, because the
+        /// decoded frames are VA-API surfaces no kept node can read, so the kept nodes run after the
+        /// download on the nv12 frame. They are CPU nodes either way: the gate excludes the sources
+        /// that make Jellyfin add a hardware-side tone-map, deinterlace or rotate node. The hwaccel
+        /// arguments come from a separate patch that has already run, so this cannot fall back to
+        /// software decode when a kept node turns out not to suit nv12.
+        /// </summary>
+        internal static string JoinChain(Plan plan, string chain, List<string> kept)
+        {
+            if (kept == null || kept.Count == 0)
+            {
+                return chain;
+            }
+
+            return plan.HardwareDecode
+                ? chain + "," + string.Join(",", kept)
+                : string.Join(",", kept) + "," + chain;
         }
 
         private static readonly string[] _replacedNodes = { "scale", "hwupload", "hwdownload", "hwmap", "format", "libplacebo" };

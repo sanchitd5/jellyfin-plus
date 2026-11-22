@@ -23,6 +23,10 @@ namespace Jellyfin.Plugin.Plus.Patcher
         {
             Configure(settingsJson);
             UpscalePatches.Apply(logger as ILogger);
+
+            // Off the start-up thread: the render-node lookup can run a test, and the hardware-decode
+            // test spawns ffmpeg. A session that arrives first finds no answer and decodes in software.
+            Task.Run(UpscaleEngine.PrimeHardwareDecode);
             return UpscalePatches.Status;
         }
 
@@ -224,8 +228,9 @@ namespace Jellyfin.Plugin.Plus.Patcher
                 levels["NeuralMaxSourceHeight"] = cfg.NeuralMaxSourceHeight;
             }
 
-            // Present only while the operator has hardware decode on, for the same reason.
-            if (cfg != null && cfg.IntelHardwareDecode)
+            // Present only while the operator has hardware decode on and an Intel GPU was found, so an
+            // NVIDIA or CPU-only server serves the probe it always did with the setting on too.
+            if (cfg != null && cfg.IntelHardwareDecode && UpscaleEngine.IsIntelPath())
             {
                 levels["IntelHardwareDecode"] = true;
             }
@@ -386,8 +391,8 @@ namespace Jellyfin.Plugin.Plus.Patcher
                 ["Summary"] = record.Summary,
             };
 
-            // Present only while IntelHardwareDecode is on, so every other server's session JSON is
-            // exactly what it was.
+            // Present only while IntelHardwareDecode is on and the server's GPU is a detected Intel
+            // one, so every other server's session JSON is exactly what it was.
             if (record.HardwareDecodeReason != null)
             {
                 session["HardwareDecode"] = record.HardwareDecode;

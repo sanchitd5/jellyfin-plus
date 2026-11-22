@@ -255,9 +255,13 @@ def pick_binary(cfg, args):
     """The ffmpeg to run for this command, and the argument list to run it with."""
     wanted = wants_patched(args)
     if not wanted:
-        if wants_va_vulkan_bridge(args) and os.access(PATCHED_FFMPEG, os.X_OK):
-            log(cfg, "routing to the patched ffmpeg build for this session (VA-API to Vulkan hwmap)")
-            return PATCHED_FFMPEG, substitute_missing_encoders(cfg, args)
+        if wants_va_vulkan_bridge(args):
+            if os.access(PATCHED_FFMPEG, os.X_OK):
+                log(cfg, "routing to the patched ffmpeg build for this session (VA-API to Vulkan hwmap)")
+                return PATCHED_FFMPEG, substitute_missing_encoders(cfg, args)
+            # The plugin planned hardware decode on seeing this binary; stock fails this chain.
+            log(cfg, "WARNING: VA-API to Vulkan hwmap needs %s, which is not executable; stock ffmpeg "
+                "will fail this session with Conversion failed" % PATCHED_FFMPEG)
         return REAL_FFMPEG, args
     if os.access(PATCHED_FFMPEG, os.X_OK):
         missing = [f for f in wanted if f not in patched_has(wanted)]
