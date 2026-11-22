@@ -81,6 +81,8 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
             Decision();
             SysfsReader();
             ReportOnly();
+            Access();
+            CachedProbes();
 
             Console.WriteLine();
             Console.WriteLine(_passed + " passed, " + _failed + " failed");
@@ -312,16 +314,17 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
                 using (JsonDocument doc = JsonDocument.Parse(PatcherHost.SessionJson("harness-no-such-session")))
                 {
                     JsonElement gpu = doc.RootElement.GetProperty("Levels").GetProperty("Gpu");
-                    Equal("probe: Levels.Gpu.Setting follows the setting", "none", gpu.GetProperty("Setting").GetString());
                     Equal("probe: Levels.Gpu.Vendor", "none", gpu.GetProperty("Vendor").GetString());
-                    Check("probe: Levels.Gpu has every capability field",
-                        new[] { "Vendor", "Setting", "Detected", "RenderNode", "EncoderFamily", "DecodeType", "CudaOnlyLevelsAvailable", "OpenVinoAvailable", "Reason", "Devices" }
-                            .All(f => gpu.TryGetProperty(f, out _)));
+                    Check("probe: Levels.Gpu has the summary fields",
+                        SummaryFields.All(f => gpu.TryGetProperty(f, out _)));
                 }
 
                 using (JsonDocument doc = JsonDocument.Parse(PatcherHost.StatusJson()))
                 {
-                    Check("status: carries Gpu", doc.RootElement.TryGetProperty("Gpu", out _));
+                    JsonElement gpu = doc.RootElement.GetProperty("Gpu");
+                    Equal("status: Gpu.Setting follows the setting", "none", gpu.GetProperty("Setting").GetString());
+                    Check("status: Gpu keeps the full record (elevated route)",
+                        SummaryFields.Concat(PrivateFields).Concat(new[] { "DecodeType" }).All(f => gpu.TryGetProperty(f, out _)));
                 }
             }
             catch (Exception ex)
@@ -329,8 +332,129 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
                 Check("probe and status carry the capability record", false, ex.GetType().Name + ": " + ex.Message);
             }
 
-            string json = JsonSerializer.Serialize(new SessionRecord { Gpu = new GpuCapability { Vendor = "nvidia" } });
+            string json = JsonSerializer.Serialize(new SessionRecord { Gpu = new GpuSummary("nvidia", true, "nvenc", true, false) });
             Check("SessionRecord serialises its Gpu field", json.Contains("\"Gpu\":{") && json.Contains("\"Vendor\":\"nvidia\""), json);
+        }
+
+        private static readonly string[] SummaryFields = { "Vendor", "Detected", "EncoderFamily", "CudaOnlyLevelsAvailable", "OpenVinoAvailable" };
+
+        private static readonly string[] PrivateFields = { "Devices", "RenderNode", "Reason", "Setting" };
+
+        // AGENTS.md invariant 13. GET JellyfinPlus/Session/{id} is any authenticated user, so
+        // neither of its two answers (the probe, a recorded session) may carry what the GPU record
+        // knows about the host. The full record stays on the elevated status route only.
+        private static void Access()
+        {
+            var full = GpuDetector.Resolve("auto", Models, Machine("renderD128", "0x10de", "renderD129", "0x8086"));
+            Check("access setup: the full record does hold the private fields",
+                full.Devices.Count == 2 && full.RenderNode != null && full.Reason.Length > 0 && full.Setting == "auto");
+
+            string json = JsonSerializer.Serialize(full.ToSummary());
+            using (JsonDocument doc = JsonDocument.Parse(json))
+            {
+                Check("summary has exactly the five non-sensitive fields",
+                    doc.RootElement.EnumerateObject().Select(p => p.Name).OrderBy(n => n).SequenceEqual(SummaryFields.OrderBy(n => n)), json);
+            }
+
+            string sid = "harness-access-" + Guid.NewGuid().ToString("N");
+            UpscaleEngine.Record(new SessionRecord { PlaySessionId = sid, Gpu = full.ToSummary() });
+            PatcherHost.Configure("{\"GpuVendor\":\"auto\"}");
+            foreach (string route in new[] { sid, "harness-no-such-session" })
+            {
+                string tag = route == sid ? "recorded session" : "probe";
+                string body = PatcherHost.SessionJson(route);
+                using (JsonDocument doc = JsonDocument.Parse(body))
+                {
+                    JsonElement root = doc.RootElement;
+                    JsonElement gpu = route == sid ? root.GetProperty("Gpu") : root.GetProperty("Levels").GetProperty("Gpu");
+                    Check("non-elevated " + tag + ": Gpu has the summary fields", SummaryFields.All(f => gpu.TryGetProperty(f, out _)));
+                    Check("non-elevated " + tag + ": Gpu omits Devices, RenderNode, Reason and Setting",
+                        PrivateFields.All(f => !gpu.TryGetProperty(f, out _)));
+                    if (route == sid)
+                    {
+                        JsonElement rec = root.GetProperty("Record").GetProperty("Gpu");
+                        Check("non-elevated recorded session: Record.Gpu omits the private fields", PrivateFields.All(f => !rec.TryGetProperty(f, out _)));
+                    }
+                }
+
+                Check("non-elevated " + tag + ": no render node path or PCI id anywhere in the body",
+                    !body.Contains("/dev/dri") && !body.Contains("0x10de") && !body.Contains("0x8086"));
+            }
+
+            string history = JsonSerializer.Serialize(UpscaleEngine.ForSession(sid));
+            Check("the history entry (served by Status) carries no device list or render node",
+                !history.Contains("\"Devices\"") && !history.Contains("\"RenderNode\"") && !history.Contains("/dev/dri"), history);
+        }
+
+        // Review items 2 and 3: a negative or failed probe is not kept for the life of the process,
+        // and the hot path never runs the probe. Driven with a fake clock and a queue standing in for
+        // the thread pool, so it is deterministic.
+        private static void CachedProbes()
+        {
+            DateTime now = new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+            var queue = new Queue<Action>();
+            int calls = 0;
+            string next = null;
+            bool throwNext = false;
+            var probe = new CachedProbe<string>(
+                () =>
+                {
+                    calls++;
+                    if (throwNext)
+                    {
+                        throw new InvalidOperationException("driver still loading");
+                    }
+
+                    return next;
+                },
+                v => v == "gpu",
+                TimeSpan.FromSeconds(60),
+                () => now,
+                queue.Enqueue);
+
+            Check("peek before any probe returns null", probe.Peek() == null);
+            Check("peek schedules the probe and does not run it on the caller", calls == 0 && queue.Count == 1);
+            Check("a second peek while one is scheduled does not queue another", probe.Peek() == null && queue.Count == 1);
+
+            next = "none";
+            queue.Dequeue()();
+            Check("the first probe ran once, off the caller", calls == 1);
+            Equal("an inconclusive answer is returned", "none", probe.Peek());
+            Check("an inconclusive answer inside the retry window does not reprobe", queue.Count == 0 && calls == 1);
+
+            now += TimeSpan.FromSeconds(61);
+            Equal("after the window the stale answer is still returned", "none", probe.Peek());
+            Check("after the window a reprobe is scheduled", queue.Count == 1);
+            next = "gpu";
+            queue.Dequeue()();
+            Equal("the reprobe's conclusive answer replaces the negative one", "gpu", probe.Peek());
+
+            now += TimeSpan.FromDays(1);
+            probe.Peek();
+            Check("a conclusive answer is never reprobed", queue.Count == 0 && calls == 2);
+
+            probe.Reset();
+            Check("after Reset the answer is gone and a probe is scheduled", probe.Peek() == null && queue.Count == 1);
+            throwNext = true;
+            queue.Dequeue()();
+            Check("a throwing probe is no answer and does not escape", probe.Peek() == null && queue.Count == 0);
+            now += TimeSpan.FromSeconds(61);
+            probe.Peek();
+            Check("a failed probe is retried after the window", queue.Count == 1);
+
+            // A probe that lands after Reset must not stand.
+            throwNext = false;
+            next = "gpu";
+            Action inFlight = queue.Dequeue();
+            probe.Reset();
+            inFlight();
+            Check("a probe in flight across Reset is discarded", probe.Peek() == null);
+
+            var overridden = GpuDetector.Resolve("none", Models, Machine("renderD128", "0x10de"));
+            Check("GpuVendor=none with an NVIDIA card: the reason says the setting overrode detection",
+                overridden.Vendor == "none" && overridden.Reason.Contains("overrides detection") && overridden.Reason.Contains("NVIDIA"), overridden.Reason);
+            Check("GpuVendor=none with no card: the reason does not claim an override",
+                !GpuDetector.Resolve("none", Models, Machine()).Reason.Contains("overrides"));
         }
     }
 }

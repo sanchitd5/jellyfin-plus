@@ -182,13 +182,13 @@ namespace Jellyfin.Plugin.Plus.Patcher
         public string EncoderReason { get; set; }
 
         /// <summary>
-        /// The GPU capability record as the plugin saw it when this session's command was built:
-        /// vendor, render node, encoder family, decode type, whether the CUDA-only levels and
-        /// OpenVINO are available. REPORT ONLY: nothing read it to build the command, so it
-        /// describes the server, not a choice made for this session. Null only when the session
-        /// was recorded by a build that predates the field.
+        /// The non-sensitive GPU summary as the plugin saw it when this session's command was
+        /// built: vendor, encoder family, whether it was detected, whether the CUDA-only levels and
+        /// OpenVINO are available. Never the render node, PCI ids, setting or reason: this record
+        /// is served by a route any authenticated user can reach. REPORT ONLY: nothing read it to
+        /// build the command. Null only when the session was recorded by a build that predates the field.
         /// </summary>
-        public GpuCapability Gpu { get; set; }
+        public GpuSummary Gpu { get; set; }
 
         /// <summary>applied | not-requested | off-by-client | concurrency-cap | subtitle-burn-in | stream-copy | disabled | ineligible.</summary>
         public string Status { get; set; }
@@ -588,10 +588,10 @@ namespace Jellyfin.Plugin.Plus.Patcher
                 Status = status,
                 Reason = reason,
 
-                // Report only: this is read for the record and for no decision. Current never
-                // throws and asks the machine once per process, so after the first session it costs
-                // the transcode path one small allocation (plus a file-exists check on Intel).
-                Gpu = GpuDetector.Current(Settings?.GpuVendor, Settings?.NeuralModelDirectory),
+                // Report only: read for the record and for no decision. The summary, not the full
+                // record: GET Session/{id} is not elevation-gated. It never throws, never probes
+                // and is one shared instance, so this costs the transcode path a cached read.
+                Gpu = GpuDetector.CurrentSummary(Settings?.GpuVendor, Settings?.NeuralModelDirectory),
             };
 
             // GetVideoEncoder and GetVideoProcessingFilterParam are separate call sites and
