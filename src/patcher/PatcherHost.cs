@@ -23,6 +23,10 @@ namespace Jellyfin.Plugin.Plus.Patcher
         {
             Configure(settingsJson);
             UpscalePatches.Apply(logger as ILogger);
+
+            // Off this thread: the encoder list and the AV1 test encode are ffmpeg runs, and the
+            // capability record and the transcode path only read what they leave behind.
+            UpscaleEngine.WarmProbes();
             return UpscalePatches.Status;
         }
 

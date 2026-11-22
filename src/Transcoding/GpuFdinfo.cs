@@ -75,6 +75,13 @@ namespace Jellyfin.Plugin.Plus
         public const string VideoEnhance = "video-enhance";
         public const string ComputeEngine = "compute";
 
+        /// <summary>
+        /// The raw busy percent above which an i915 class with no capacity line is left out. A
+        /// little over 100 is jitter on a one-engine class and is clamped; well over it is a
+        /// multi-engine class whose figure is not a percentage of anything.
+        /// </summary>
+        private const double UnnormalisedCeiling = 110.0;
+
         /// <summary>Maps an i915 or xe engine class name to the canonical one, or null for one not tracked.</summary>
         public static string CanonicalClass(string name)
         {
@@ -259,6 +266,10 @@ namespace Jellyfin.Plugin.Plus
         /// divides a class's summed busy nanoseconds by the window times the engines in the class;
         /// xe divides its summed busy cycles by the cycles that elapsed. Devices are kept apart,
         /// and the figure reported is the busiest class on the busiest device, clamped to 0-100.
+        /// An i915 class with no capacity line whose raw figure is over 110% is left out (see
+        /// <see cref="UnnormalisedCeiling"/>), and so is an xe class with no elapsed cycles; when
+        /// any class is left out the headline BusyPercent is null, because that class may be the
+        /// busiest one. The classes that could be measured stay in BusyByClass.
         /// </summary>
         public static DrmLoadResult Compute(Dictionary<string, DrmClient> previous, Dictionary<string, DrmClient> current, double elapsedSeconds)
         {
@@ -318,24 +329,39 @@ namespace Jellyfin.Plugin.Plus
                 }
             }
 
+            // A class left out as unmeasurable may be the busiest one, so the headline is then unknown.
+            bool anyUnmeasured = false;
             foreach (KeyValuePair<string, double> kv in busy)
             {
                 // i915 is measured against wall time; xe against the cycles that elapsed. An xe
                 // class with no elapsed cycles cannot be measured and is left out, not read as 0.
                 double denominator;
+                bool unnormalised = false;
                 if (inCycles.Contains(kv.Key))
                 {
                     if (!cycles.TryGetValue(kv.Key, out denominator) || denominator <= 0)
                     {
+                        anyUnmeasured = true;
                         continue;
                     }
                 }
                 else
                 {
-                    denominator = elapsedNs * (capacity.TryGetValue(kv.Key, out int cap) ? cap : 1);
+                    unnormalised = !capacity.TryGetValue(kv.Key, out int cap);
+                    denominator = elapsedNs * (unnormalised ? 1 : cap);
                 }
 
-                double pct = Math.Max(0, Math.Min(100, kv.Value / denominator * 100.0));
+                double raw = kv.Value / denominator * 100.0;
+                if (unnormalised && raw > UnnormalisedCeiling)
+                {
+                    // i915 prints a capacity line only for a class with more than one engine, so a
+                    // figure this far over 100% with no line is a multi-engine class that cannot be
+                    // normalised. Clamping it would report a busy GPU that may be half idle.
+                    anyUnmeasured = true;
+                    continue;
+                }
+
+                double pct = Math.Max(0, Math.Min(100, raw));
                 string cls = kv.Key.Substring(kv.Key.IndexOf('|') + 1);
                 if (!result.BusyByClass.TryGetValue(cls, out double prior) || pct > prior)
                 {
@@ -344,7 +370,7 @@ namespace Jellyfin.Plugin.Plus
             }
 
             result.VideoClients = videoClients.Count;
-            result.BusyPercent = result.BusyByClass.Count == 0 ? (double?)null : result.BusyByClass.Values.Max();
+            result.BusyPercent = anyUnmeasured || result.BusyByClass.Count == 0 ? (double?)null : result.BusyByClass.Values.Max();
             return result;
         }
     }

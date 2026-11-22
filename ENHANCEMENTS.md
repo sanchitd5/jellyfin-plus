@@ -166,9 +166,18 @@ keeps the code path that existed before the setting did:
   lists no `*_qsv` encoder the choice is `libx264` / `libx265` / `libsvtav1`, and the record's
   `EncoderFamily` reads `software`. When Jellyfin already chose a QSV or software encoder (its own
   hardware acceleration is QSV) and the setting is auto or NVENC, Jellyfin's choice is kept; one that
-  cannot take the chain (`*_vaapi`, `*_nvenc`) is replaced. `GuardAv1` test-encodes one frame with
-  `av1_qsv` (once, remembered) and swaps to `hevc_qsv`, or `h264_qsv` when the client cannot take
-  HEVC, if it fails.
+  cannot take the chain (`*_vaapi`, `*_nvenc`) is replaced. With neither a `*_qsv` nor a software
+  encoder listed the engine picks nothing and Jellyfin's own encoder stands (the reason says so).
+  `GuardAv1` reads the result of a one-frame `av1_qsv` test encode that runs in the background
+  (started at plugin start-up, on the detected render node, never on the transcode path); a failure
+  swaps to `hevc_qsv`, or `h264_qsv` when the client cannot take HEVC. The answer is cached for 1 h
+  when usable, 5 min when it failed and 1 min when inconclusive. Until the first answer exists the
+  guard swaps as if the test had failed (the reason says it has not finished), so an Arc-less GPU never
+  gets an `av1_qsv` it cannot open; an inconclusive answer leaves `av1_qsv` alone. The encoder list is
+  read at start-up too, so the capability record and `Gpu/Load` never
+  spawn ffmpeg, and report the unresolved `qsv` family until it is read. An optional
+  `TranscodeManager.StartFfMpeg` prefix removes VA-API-only options (`-init_hw_device vaapi`,
+  `-filter_hw_device`, `-hwaccel vaapi`, `-rc_mode`, `-sei`) from a swapped session's command line.
 - **The end of the chain.** The GPU-resident encode (`hwmap=derive_device=cuda`) is a Vulkan-to-CUDA
   map and exists only for NVENC, so on Intel `BuildChain` always ends in `hwdownload,format=yuv420p`
   whatever `GpuResidentEncode` says (the encoder's `nv12` is reached by the conversion ffmpeg
@@ -1604,7 +1613,7 @@ All under the Jellyfin API root. "Administrator" is the `RequiresElevation` poli
 | Method and path | Auth | Purpose |
 |---|---|---|
 | `GET /JellyfinPlus/Status` | Administrator | Patch status (`PatchActive`, `PatchStatus`), the GPU capability record (`Gpu`), shim sync result and recent sessions. Used by the dashboard page. |
-| `GET /JellyfinPlus/Gpu/Load` | Any authenticated user, API key included | A cheap load snapshot so background encoders can back off: `activeTranscodes`, `activeVideoTranscodes`, `enhancedSessions` (null), `nvencSessions` (NVENC sessions from `nvidia-smi`; null when there is no NVIDIA GPU or no `nvidia-smi`), and, additive: `vendor` (`nvidia`, `intel`, `none`), `encoderSessions` (NVIDIA: the NVENC count; Intel: clients whose video-engine time moved in the window, which is encode on this plugin's chain and would also count a client decoding in hardware), `gpuBusyPercent` (Intel: the busiest engine class, 0-100, from DRM fdinfo of this server's own processes only; null on NVIDIA and when unreadable), `gpuIdlePercent` (Intel: the least-idle GT's share of the window asleep, from sysfs RC6/GT-idle residency, which covers every process; "idle" is not the inverse of busy), `loadSource`. Cached 5 s and single-flight; never needs `intel_gpu_top` or perf. GPU_VENDORS.md 5.2 |
+| `GET /JellyfinPlus/Gpu/Load` | Any authenticated user, API key included | A cheap load snapshot so background encoders can back off: `activeTranscodes`, `activeVideoTranscodes`, `enhancedSessions` (null), `nvencSessions` (NVENC sessions from `nvidia-smi`; null when there is no NVIDIA GPU or no `nvidia-smi`), and, additive: `vendor` (`nvidia`, `intel`, `none`), `encoderSessions` (NVIDIA: the NVENC count; Intel: clients whose video-engine time moved in the window, which is encode on this plugin's chain and would also count a client decoding in hardware), `gpuBusyPercent` (Intel: the busiest engine class, 0-100, from DRM fdinfo of this server's own processes only; null on NVIDIA, when unreadable, and when any class could not be measured, since that class may be the busiest), `gpuIdlePercent` (Intel: the least-idle GT's share of the window asleep, from sysfs RC6/GT-idle residency, which covers every process; "idle" is not the inverse of busy), `loadSource`. Cached 5 s and single-flight; never needs `intel_gpu_top` or perf. GPU_VENDORS.md 5.2 |
 | `GET /JellyfinPlus/Session/{playSessionId}` | Any authenticated user | What the server actually did for one play session. The id `probe` returns the capability lists with no session (used by the client probe; the lists include `Levels.Gpu`, the GPU capability record); `dashboard` is used by the config page. A session recorded for a different user is reported as unknown. If either side has no user id (for example an API key), it answers as before the check existed. |
 | `GET /JellyfinPlus/FilterCache/Status` | Administrator | Per-library, per-kind cache state: built time, key counts, dirty flag, run state, last error, and outcome counters. |
 | `POST /JellyfinPlus/FilterCache/Rebuild?force=true` | Administrator | Starts a background rebuild and returns 202 with the status JSON. `force` (default true) rebuilds every library, not only stale ones. 409 when a rebuild is running or the cache is not ready. |
