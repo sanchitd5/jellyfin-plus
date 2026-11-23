@@ -274,13 +274,18 @@ chain feeds `libx264` / `libx265` / `libsvtav1` (the same system-memory frames),
 Recent sessions. VA-API encode belongs with PR 7, which has to solve the shared-device problem for
 decode in the first place.
 
-**Chain tail.** The tail on Intel is the non-resident NVIDIA one, `hwdownload,format=yuv420p`. It
-cannot be `hwdownload,format=nv12`: `hwdownload` yields the sw_format of the Vulkan frames, and
-libplacebo's output format defaults to its input's (`vf_libplacebo.c`, `config_output`), which our
-own `format=yuv420p,hwupload` fixed as yuv420p. QSV wants `nv12`; ffmpeg's output stage appends a
+**Chain tail.** The tail on Intel is not the NVIDIA one: ANV returns green frames for libplacebo's
+multi-planar YUV output (UAVG/VAVG 0 on an Arc A380, XPSNR y 5 dB), so libplacebo ends in
+`:format=rgba` and the chain is `hwdownload,format=rgba,scale=out_color_matrix=bt709:out_range=tv,format=yuv420p`
+(the plugin's `BuildChain` and the shim, which reads the render node's sysfs vendor id to choose it).
+Measured on the A380 with the plain `hwdownload,format=rgba,format=yuv420p` form: YAVG/UAVG/VAVG
+93.88/116.2/150.4 against 93.9/116.2/150.5 on the master, XPSNR 35.11 dB against 32.06 dB for bicubic.
+The explicit `scale=...bt709:tv` form is the one shipped and was not itself run on the A380. The
+shim cannot see the source's tags, so both use bt709/tv. NVIDIA keeps `hwdownload,format=yuv420p`.
+The tail cannot be `hwdownload,format=nv12`: QSV wants `nv12`, and ffmpeg's output stage appends a
 `format=` filter listing the encoder's pixel formats (`ffmpeg_filter.c`) and the graph inserts a
 `scale` for the difference (`avfiltergraph.c`, auto-inserted conversion). The cost is one CPU
-yuv420p to nv12 pass per frame, which is not measured. `GpuResidentEncode` is ignored on Intel, the
+RGBA to yuv420p pass and one yuv420p to nv12 pass per frame, which is not measured. `GpuResidentEncode` is ignored on Intel, the
 session record says `GpuResidentEncode` is n/a, and `Pipeline` reads plain `Vulkan`.
 
 **`ChooseEncoder`.** On Intel the negotiated codec maps to `h264_qsv` / `hevc_qsv` / `av1_qsv`
@@ -448,8 +453,11 @@ operator choose between two Intel GPUs: the first Intel node wins, as it does in
 the device a session will use. A plan resolves that device once (`Plan.Devices`, set in `Decide`) and
 `HwaccelArgs(plan)`, `Describe` and both probe builders take it, so a render-node answer that changes
 between two reads cannot make the session record and its command disagree. The shim fallback reads
-an optional `render_node` from its JSON (unset keeps `vulkan=vk:0`); it has no vendor detection and
-no probe, so it is for an operator who knows the node. It is set by hand in
+an optional `render_node` from its JSON (unset keeps `vulkan=vk:0`); it has no GPU detection and no
+probe, so it is for an operator who knows the node. The one thing it reads from the node is its sysfs
+PCI vendor id (`/sys/class/drm/<node>/device/vendor`), only to pick the Intel RGBA chain tail above;
+an unset, invalid, unreadable or non-Intel node keeps the NVIDIA chain string byte for byte
+(`scripts/test_shim_chain.py`). It is set by hand in
 `/etc/jellyfin-upscale.json`, is never test-started, and `ShimBridge.Sync` (which merges into the
 existing keys) keeps it across a sync but never writes it.
 

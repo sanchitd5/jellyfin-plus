@@ -714,9 +714,14 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
                 OnIntel("auto", "hevc_nvenc", FullList);
                 UpscaleEngine.Settings.GpuResidentEncode = resident;
                 string tag = " [GpuResidentEncode=" + resident + "]";
-                Equal("Intel BuildChain ends in a download, never the CUDA hand-off" + tag,
-                    "format=yuv420p,hwupload,libplacebo=w=1920:h=1080:upscaler=ewa_lanczos,hwdownload,format=yuv420p",
+                // libplacebo outputs RGBA and the CPU converts to yuv420p: ANV's multi-planar YUV output
+                // from libplacebo comes back green (UAVG/VAVG 0, measured on an Arc A380).
+                Equal("Intel BuildChain ends in an RGBA download and a CPU conversion, never the CUDA hand-off" + tag,
+                    "format=yuv420p,hwupload,libplacebo=w=1920:h=1080:upscaler=ewa_lanczos:format=rgba,hwdownload,format=rgba,scale=out_color_matrix=bt709:out_range=tv,format=yuv420p",
                     UpscaleEngine.BuildChain(new UpscaleEngine.Plan { Width = 1920, Height = 1080, UpscaleApplied = true }));
+                Equal("Intel BuildChain with deband: format=rgba follows the deband options" + tag,
+                    "format=yuv420p,hwupload,libplacebo=w=1920:h=1080:upscaler=ewa_lanczos:deband=1:deband_threshold=3:deband_grain=0:format=rgba,hwdownload,format=rgba,scale=out_color_matrix=bt709:out_range=tv,format=yuv420p",
+                    UpscaleEngine.BuildChain(new UpscaleEngine.Plan { Width = 1920, Height = 1080, UpscaleApplied = true, DebandApplied = true }));
                 Equal("Intel HwaccelArgs starts the Vulkan device from the render node, never vk:0, and pins QSV to it" + tag,
                     " -init_hw_device drm=dr:/dev/dri/renderD128 -init_hw_device vulkan=vk@dr -init_hw_device qsv=qs:hw_any,child_device=/dev/dri/renderD128 -filter_hw_device vk",
                     UpscaleEngine.HwaccelArgs(null));

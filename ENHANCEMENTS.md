@@ -184,9 +184,11 @@ keeps the code path that existed before the setting did:
   `TranscodeManager.StartFfMpeg` prefix removes VA-API-only options (`-init_hw_device vaapi`,
   `-filter_hw_device`, `-hwaccel vaapi`, `-rc_mode`, `-sei`) from a swapped session's command line.
 - **The end of the chain.** The GPU-resident encode (`hwmap=derive_device=cuda`) is a Vulkan-to-CUDA
-  map and exists only for NVENC, so on Intel `BuildChain` always ends in `hwdownload,format=yuv420p`
-  whatever `GpuResidentEncode` says (the encoder's `nv12` is reached by the conversion ffmpeg
-  inserts at the graph output; its CPU cost is not measured). `SessionRecord.GpuResidentEncode`
+  map and exists only for NVENC, so on Intel `BuildChain` always ends in a download whatever
+  `GpuResidentEncode` says: libplacebo outputs RGBA (`:format=rgba`) and the tail is
+  `hwdownload,format=rgba,scale=out_color_matrix=bt709:out_range=tv,format=yuv420p`, because ANV's
+  multi-planar YUV output from libplacebo comes back green (the encoder's `nv12` is reached by the
+  conversion ffmpeg inserts at the graph output; the CPU cost is not measured). `SessionRecord.GpuResidentEncode`
   (flat `GpuResidentEncode` on the session route) is `on`, `off`, or `n/a` on Intel, and null for a
   CUDA-native session or one that was not enhanced; `Pipeline` reads plain `Vulkan` on Intel.
 
