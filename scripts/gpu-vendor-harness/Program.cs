@@ -1617,8 +1617,8 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
 
             Equal("the decided plan carries the derived format", "nv12", hw.HardwareDecodeFormat);
             Check("a software plan carries no format", HwDecide(Machine("renderD128", "0x8086"), HwSettings(false), PlainHwJob("upscale", "1080")).HardwareDecodeFormat == null);
-            Equal("the software chain with the same literal plan is the one it always was",
-                "format=yuv420p,hwupload,libplacebo=w=1920:h=1080:upscaler=ewa_lanczos,hwdownload,format=yuv420p",
+            Equal("the software chain with the same literal plan on an Intel host ends in RGBA (ANV's YUV output is broken)",
+                "format=yuv420p,hwupload,libplacebo=w=1920:h=1080:upscaler=ewa_lanczos:format=rgba,hwdownload,format=rgba,scale=out_color_matrix=bt709:out_range=tv,format=yuv420p",
                 UpscaleEngine.BuildChain(new UpscaleEngine.Plan { Width = 1920, Height = 1080, UpscaleApplied = true }));
 
             // The start-up test is the production command: same device arguments (decoder bound by name),
@@ -1751,7 +1751,7 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
             UpscaleEngine.Plan off = HwDecide(Machine("renderD128", "0x8086"), HwSettings(false), PlainHwJob("upscale", "1080"));
             Check("off, Intel: no hardware decode, no reason", off.Act && !off.HardwareDecode && off.HardwareDecodeReason == null);
             Equal("off, Intel: the device arguments", SoftwareIntelArgs, UpscaleEngine.HwaccelArgs(off));
-            Check("off, Intel: the chain is the software chain", UpscaleEngine.BuildChain(off).StartsWith("format=yuv420p,hwupload,libplacebo=w=1920:h=1080:upscaler=") && UpscaleEngine.BuildChain(off).EndsWith(",hwdownload,format=yuv420p"), UpscaleEngine.BuildChain(off));
+            Check("off, Intel: the chain is the software chain", UpscaleEngine.BuildChain(off).StartsWith("format=yuv420p,hwupload,libplacebo=w=1920:h=1080:upscaler=") && UpscaleEngine.BuildChain(off).EndsWith(":format=rgba,hwdownload,format=rgba,scale=out_color_matrix=bt709:out_range=tv,format=yuv420p"), UpscaleEngine.BuildChain(off));
             Check("off, Intel: the test never ran", calls == 0);
             SessionRecord offRecord = UpscaleEngine.Describe(null, off, off.Status, off.Reason);
             string offJson = JsonSerializer.Serialize(offRecord);
