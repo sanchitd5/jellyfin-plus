@@ -31,6 +31,7 @@ setting, a control in the page, or "remove the plugin or script".
 | GPU enhancement of transcodes (14 axes) | Both | Enhance panel in the player; transcodes are upscaled, sharpened, denoised on the GPU | Master switch `Enabled` (default true). With `RequireClientOptIn` false (the default) every eligible transcode is enhanced using the dashboard defaults; the viewer can pick Off in the panel |
 | Live apply and A/B swap | Both | Changing a setting mid-playback switches streams without a gap | On. If the swap patch cannot install, live apply falls back to tear-down-and-restart |
 | Direct-play override | Server patch | Eligible direct-play sessions become GPU transcodes on every client | Off. Setting `ForceTranscodeForDirectPlay` |
+| GPU vendor detection, and the Intel encoder | Both | The dashboard status line, the player probe (`Levels.Gpu`) and each Recent session say which GPU vendor the server has and what that vendor's chain can use. With an Intel GPU found, transcodes encode with QSV (`hevc_qsv`, `h264_qsv`, `av1_qsv`) instead of NVENC, the Vulkan device is started from the GPU's render node instead of `vk:0`, the levels that need NVIDIA (`optix`, `dlpp-*`, `vsr-rtcuda`, `fsr2`, `dlss`, `dlaa`) and the ONNX levels (`realesr-*`, not measured on Intel) are not offered and each says why, and the load route reports Intel encoder sessions and busy percent. An NVIDIA server is byte-identical | On; setting `GpuVendor` (`auto` default, `nvidia`, `intel`, `none`). `auto` picks NVIDIA first when it is present; an Intel path needs an Intel GPU that was actually seen, so a vendor chosen and not found changes nothing |
 | Tag search | Server patch | Search also matches item tags (substring) | On, no switch |
 | Wildcard search (`*` and `?`) | Server patch | `red*car` finds names and tags with "red" followed later by "car"; `?` is exactly one character | On, no switch; a term without `*` or `?` is searched as before |
 | Search index (FTS5 trigram) | Server patch + plugin services | Name and tag search answered from an index: provider step about 36 ms to 3 ms on an 80k-item library | On; falls back to the plain query whenever the index is missing, stale or unsupported; see section 7.6 |
@@ -140,15 +141,117 @@ leaves direct play alone), and a chosen stage (client sets `EnableDirectPlay=fal
 `web/src/controller/network.js` `forceTranscodeBody`). Clients without the script are not enhanced
 unless `ForceTranscodeForDirectPlay` is on (section 7.1).
 
+**GPU vendor, the Intel encoder and the Intel device.** `src/patcher/Transcoding/GpuVendor.cs` finds the GPU and builds a
+capability record: `Vendor` (`nvidia`, `intel`, `none`), `Setting`, `Detected`, `RenderNode`,
+`EncoderFamily` (`nvenc`, `qsv`, `software`), `DecodeType` (`cuda`, `vaapi`, `none`),
+`CudaOnlyLevelsAvailable`, `OpenVinoAvailable`, `Reason`, `Devices`. Detection reads
+`/sys/class/drm/renderD*/device/vendor` (`0x10de` NVIDIA, `0x8086` Intel) for every render node that
+has a `/dev/dri` entry; `/proc/driver/nvidia`, then `nvidia-smi -L` (only if nothing else answered),
+find an NVIDIA GPU that has no render node. The machine is asked by a background probe started when
+the patches are applied (`CachedProbe<T>`, `src/patcher/CachedProbe.cs`: the transcode path only reads
+the cached answer and never spawns `nvidia-smi`); an answer that found no supported GPU is retried
+every 60 s, one that found one is kept. `GpuVendor`
+`auto` picks NVIDIA first when it is present, so an existing install is unchanged; `nvidia`, `intel`
+and `none` override detection, and a vendor chosen but not found reports `Detected` false and no
+capability. The full record is on `Gpu` of `GET /JellyfinPlus/Status` (administrator only; the
+dashboard's status line). Every other route, which any authenticated user reaches, carries only the
+summary (`Vendor`, `Detected`, `EncoderFamily`, `CudaOnlyLevelsAvailable`, `OpenVinoAvailable`):
+`Levels.Gpu` on the probe, and `Gpu` on each `SessionRecord` (so `Record.Gpu`, and flat `Gpu`, on
+`GET /JellyfinPlus/Session/{id}`), with no render-node path, PCI id, setting or reason.
+
+Four things read it to decide, and only when `Vendor` is `intel` **and** `Detected` is true
+(`UpscaleEngine.IsIntelPath`), so every other server, an Intel setting with no Intel GPU included,
+keeps the code path that existed before the setting did:
+
+- **The encoder.** `UpscaleEngine.ChooseEncoder` maps the negotiated codec to `h264_qsv`, `hevc_qsv`
+  or `av1_qsv`. A configured `*_nvenc` encoder (the default `hevc_nvenc` included) is treated as auto,
+  and the `EncoderReason` in Recent sessions says so. A configured `*_vaapi` encoder is refused with
+  a reason: the chain hands the encoder system-memory frames, QSV encoders accept them and VA-API
+  encoders do not (the reasoning, from the jellyfin-ffmpeg source, is GPU_VENDORS.md 5.1). When ffmpeg
+  lists no `*_qsv` encoder the choice is `libx264` / `libx265` / `libsvtav1`, and the record's
+  `EncoderFamily` reads `software`. When Jellyfin already chose a QSV or software encoder (its own
+  hardware acceleration is QSV) and the setting is auto or NVENC, Jellyfin's choice is kept; one that
+  cannot take the chain (`*_vaapi`, `*_nvenc`) is replaced. With neither a `*_qsv` nor a software
+  encoder listed the engine picks nothing and Jellyfin's own encoder stands (the reason says so).
+  `GuardAv1` reads the result of a one-frame `av1_qsv` test encode that runs in the background
+  (started at plugin start-up, on the detected render node, never on the transcode path); a failure
+  swaps to `hevc_qsv`, or `h264_qsv` when the client cannot take HEVC. The answer is cached for 1 h
+  when usable, 5 min when it failed and 1 min when inconclusive. Until the first answer exists the
+  guard swaps as if the test had failed (the reason says it has not finished), so an Arc-less GPU never
+  gets an `av1_qsv` it cannot open; an inconclusive answer leaves `av1_qsv` alone. The encoder list is
+  read at start-up too, so the capability record and `Gpu/Load` never
+  spawn ffmpeg, and report the unresolved `qsv` family until it is read. An optional
+  `TranscodeManager.StartFfMpeg` prefix removes VA-API-only options (`-init_hw_device vaapi`,
+  `-filter_hw_device`, `-hwaccel vaapi`, `-rc_mode`, `-sei`) from a swapped session's command line.
+- **The end of the chain.** The GPU-resident encode (`hwmap=derive_device=cuda`) is a Vulkan-to-CUDA
+  map and exists only for NVENC, so on Intel `BuildChain` always ends in a download whatever
+  `GpuResidentEncode` says: libplacebo outputs RGBA (`:format=rgba`) and the tail is
+  `hwdownload,format=rgba,scale=out_color_matrix=bt709:out_range=tv,format=yuv420p`, because ANV's
+  multi-planar YUV output from libplacebo comes back green (the encoder's `nv12` is reached by the
+  conversion ffmpeg inserts at the graph output; the CPU cost is not measured). `SessionRecord.GpuResidentEncode`
+  (flat `GpuResidentEncode` on the session route) is `on`, `off`, or `n/a` on Intel, and null for a
+  CUDA-native session or one that was not enhanced; `Pipeline` reads plain `Vulkan` on Intel.
+
+- **The Vulkan device (and, rarely, the QSV one).** On every other server the command is still
+  `-init_hw_device vulkan=vk:0 -filter_hw_device vk`. On Intel, `UpscaleEngine.HwaccelArgs` starts the
+  device from the GPU's render node: `-init_hw_device drm=dr:/dev/dri/renderD129 -init_hw_device
+  vulkan=vk@dr -filter_hw_device vk` (the form Jellyfin's own Vulkan path builds, and the one the
+  jellyfin-ffmpeg source supports, GPU_VENDORS.md 5.3). The stock ffmpeg is run once per node with that
+  initialisation and one frame through `hwupload,hwdownload`, **in the background**: the plugin starts
+  it at load (`UpscaleEngine.WarmDevices`, from `PatcherHost.Apply`), only one test runs per node, and
+  a session never waits for it. Until the answer is known the node is used and the record says
+  `(test pending)`. A pass is kept for the life of the process; a failure, or a test that could not be
+  run at all (no ffmpeg found, a timeout), is re-tested after about 5 minutes while the last answer is
+  served. A failed test means `vk:0` as before (so this cannot turn a working Intel server into a dead
+  one) and the record says so; an inconclusive one trusts the node and the record says it was not
+  tested. The Vulkan device is chosen by the node's **PCI device id**, not by the node, so two
+  different GPUs are told apart and two identical cards are not. The two engine probes that start a
+  device (the Vulkan-denoise test and the AV1 QSV test encode) use the same device arguments as a
+  session, and one session resolves them once (`Plan.Devices`), so its record and its command cannot
+  disagree. When ffmpeg lists a QSV encoder the command always pins the encoder to the detected node:
+  `-init_hw_device qsv=qs:hw_any,child_device=<node>` (the implicit search would take the first Intel
+  node, which a mixed AMD and Intel box does not guarantee); with no QSV encoder there is none. The
+  device a session used is reported as `VulkanDevice` and `QsvDevice` on the session record (null when
+  not enhanced, `QsvDevice` null off Intel). It is chosen by vendor, not by index: of two Intel GPUs
+  the first node wins, and a box with both vendors on `auto` is NVIDIA's, with `vk:0`, as before (set
+  `GpuVendor` to `intel` to choose the Intel card).
+- **The NVIDIA-only levels.** `optix`, `optix-temporal` (and the unlisted `optix-hdr`), `dlpp-1` to
+  `dlpp-4`, `vsr-rtcuda`, `fsr2`, `dlss` and `dlaa` are removed from `Levels.Denoise`, `Levels.Neural`,
+  `Levels.Game`, `Levels.GameOptionLevels` and the neural and game label maps, so the player panel does
+  not offer them. A session or a dashboard default that still names one gets `off` for that axis, and
+  `SessionRecord.GpuWithheld` (for example `denoise optix, game dlss`), the Recent sessions summary
+  ("... NOT run: needs an NVIDIA GPU and this server's is Intel") and, for a session left with nothing,
+  the status reason say so; `NeuralRequested` still names what was asked. The ONNX neural levels
+  (`realesr-*`) are withheld on Intel too, with their own reason, "not measured on Intel": without CUDA
+  they would run on ONNX Runtime's CPU provider, which nobody has measured for this chain, so the Intel
+  `Neural` list is `off` until GPU_VENDORS.md 5.4 (PR 5) gives them a GPU provider. There is no setting
+  to opt in; withholding is the smaller change and goes away with that PR. `Levels.Withheld` and
+  `Withheld` on `GET /JellyfinPlus/Status` list axis, level and the level's own reason, **only on a
+  detected Intel server**, so the NVIDIA probe and status have exactly the keys they had, and the
+  dashboard's GPU line prints each as `Axis level (reason)`.
+
+Not done by this: choosing between two Intel GPUs, OpenVINO, hardware decode. The plan for the rest is
+[GPU_VENDORS.md](docs/architecture/GPU_VENDORS.md). Tests: `scripts/test-gpu-vendor.sh <jfbin>`
+(compiles the real patcher sources, the DRM fdinfo reader and the load controller, and runs
+`scripts/test-shim-device.py` when python3 is present; not run in CI, needs the server's DLLs).
+
+**Sizing on a small Intel GPU.** The one measurement (an Arc A380, one session, 1080p to 2160p with
+FSRCNNX: 38 to 40 fps) leaves little over real time for a single 4K session and says nothing about two.
+For 4K output on a small Intel GPU set `MaxConcurrent` to 1. The default (4) is not changed.
+
 **Fallback.** `shim/jellyfin-ffmpeg-upscale` is a Python wrapper that rewrites the command without
 Harmony. The plugin tells it to stand down while the patches are active, by writing
 `plugin_patch_active` and the main settings into `/etc/jellyfin-upscale.json` if that file exists
-(`src/Transcoding/ShimBridge.cs`).
+(`src/Transcoding/ShimBridge.cs`). It has no GPU detection: its Vulkan device is `vk:0` unless
+`/etc/jellyfin-upscale.json` carries `render_node` (for example `/dev/dri/renderD129`, a plain
+`/dev/dri/renderD<digits>` path only), which derives the device from that node, never test-started; set
+`encoder` to one that GPU can run (`hevc_qsv` on Intel) yourself. `render_node` is hand-set only:
+`ShimBridge.Sync` merges into the existing file, so it keeps the value, and never writes it.
 
 **Defaults to know.** From `src/Configuration/PluginConfiguration.cs`: `Enabled` true, `TargetHeight`
 1080, `MaxTargetHeight` 2160, `SrLevel` `fsrcnnx`, `MaxConcurrent` 4, `MaxConcurrentSwaps` 4,
 `RequireClientOptIn` false, `ForceTranscode` false, `ForceTranscodeForDirectPlay` false, `Encoder`
-`hevc_nvenc`, `MinScaleFactor` 1.15, `SrMinScaleFactor` 1.60, `MaxSourceHeight` 1440. Deblur, denoise,
+`hevc_nvenc`, `GpuVendor` `auto`, `MinScaleFactor` 1.15, `SrMinScaleFactor` 1.60, `MaxSourceHeight` 1440. Deblur, denoise,
 deblock, neural, game, refine and chroma defaults are all `off`. The README configuration table lists
 `MaxConcurrent` 2 and `RequireClientOptIn` true; the code says 4 and false.
 
@@ -1146,7 +1249,7 @@ rolled back (`UnpatchAll`).
 | `EncodingHelper.GetInputVideoHwaccelArgs` | postfix | Swaps CUDA device setup for Vulkan (or CUDA for a CUDA-native neural level) | Same |
 | `EncodingHelper.GetHwaccelType` | postfix | Empties the decode `-hwaccel`, except on the CUDA-native branch | Same |
 | `EncodingHelper.GetHardwareVideoDecoder` | postfix | Returns null (drops `*_cuvid`), except on the CUDA-native branch | Same |
-| `EncodingHelper.GetVideoEncoder` | postfix | Turns a stream `copy` into a real encoder when the session explicitly asked for enhancement or `ForceTranscode` is on; on an ordinary transcode being enhanced, applies the configured `Encoder` only if ffmpeg has it and the client declared it playable (otherwise Jellyfin's choice stays); swaps AV1 where the GPU cannot encode it | The encoder is not already `copy` (configured-encoder path), or is `copy` and the session asked |
+| `EncodingHelper.GetVideoEncoder` | postfix | Turns a stream `copy` into a real encoder when the session explicitly asked for enhancement or `ForceTranscode` is on; on an ordinary transcode being enhanced, applies the configured `Encoder` only if ffmpeg has it and the client declared it playable (otherwise Jellyfin's choice stays); swaps AV1 where the GPU cannot encode it (`av1_nvenc` on compute below 8.9; `av1_qsv` when a one-frame test encode fails, on an Intel GPU). On an Intel GPU an auto or NVENC setting keeps Jellyfin's QSV or software choice and replaces a VA-API or NVENC one | The encoder is not already `copy` (configured-encoder path), or is `copy` and the session asked |
 
 One verdict per session (`VerdictFor`, memoised by play session id, table cleared at 256 entries)
 drives all four command-shaping patches so they cannot disagree. The verdict does not act when: the
@@ -1560,8 +1663,9 @@ All under the Jellyfin API root. "Administrator" is the `RequiresElevation` poli
 
 | Method and path | Auth | Purpose |
 |---|---|---|
-| `GET /JellyfinPlus/Status` | Administrator | Patch status (`PatchActive`, `PatchStatus`), shim sync result and recent sessions. Used by the dashboard page. |
-| `GET /JellyfinPlus/Session/{playSessionId}` | Any authenticated user | What the server actually did for one play session. The id `probe` returns the capability lists with no session (used by the client probe); `dashboard` is used by the config page. A session recorded for a different user is reported as unknown. If either side has no user id (for example an API key), it answers as before the check existed. |
+| `GET /JellyfinPlus/Status` | Administrator | Patch status (`PatchActive`, `PatchStatus`), the full GPU capability record (`Gpu`, with devices and reason; the Intel encoder family resolved against ffmpeg), shim sync result and recent sessions. Used by the dashboard page. |
+| `GET /JellyfinPlus/Gpu/Load` | Any authenticated user, API key included | A cheap load snapshot so background encoders can back off: `activeTranscodes`, `activeVideoTranscodes`, `enhancedSessions` (null), `nvencSessions` (NVENC sessions from `nvidia-smi`; null when there is no NVIDIA GPU or no `nvidia-smi`), and, additive: `vendor` (`nvidia`, `intel`, `none`), `encoderSessions` (NVIDIA: the NVENC count; Intel: clients whose video-engine time moved in the window, which is encode on this plugin's chain and would also count a client decoding in hardware), `gpuBusyPercent` (Intel: the busiest engine class, 0-100, from DRM fdinfo of this server's own processes only; null on NVIDIA, when unreadable, and when any class could not be measured, since that class may be the busiest), `gpuIdlePercent` (Intel: the least-idle GT's share of the window asleep, from sysfs RC6/GT-idle residency, which covers every process; "idle" is not the inverse of busy), `loadSource`. Cached 5 s and single-flight; never needs `intel_gpu_top` or perf. GPU_VENDORS.md 5.2 |
+| `GET /JellyfinPlus/Session/{playSessionId}` | Any authenticated user | What the server actually did for one play session. The id `probe` returns the capability lists with no session (used by the client probe; the lists include `Levels.Gpu`, the non-sensitive GPU summary, and on a detected Intel GPU `Levels.Withheld`, the NVIDIA-only levels left out of the lists); `dashboard` is used by the config page. A session recorded for a different user is reported as unknown. If either side has no user id (for example an API key), it answers as before the check existed. |
 | `GET /JellyfinPlus/FilterCache/Status` | Administrator | Per-library, per-kind cache state: built time, key counts, dirty flag, run state, last error, and outcome counters. |
 | `POST /JellyfinPlus/FilterCache/Rebuild?force=true` | Administrator | Starts a background rebuild and returns 202 with the status JSON. `force` (default true) rebuilds every library, not only stale ones. 409 when a rebuild is running or the cache is not ready. |
 | `GET /JellyfinPlus/Tags/Categories[?parentId=..&userId=..]` | Any authenticated user (another user's `userId`: administrators only) | Smart tag categories over the user's visible items (section 3): `[{id, label, kind, prefix?, primary, coverage, tags: [{name, label, count}]}]`. 404 for a parent the user cannot see. Cached per user, access digest and parent; kept warm in the background (section 3). |

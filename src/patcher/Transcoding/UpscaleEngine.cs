@@ -181,6 +181,54 @@ namespace Jellyfin.Plugin.Plus.Patcher
         /// <summary>Why that encoder, in particular whether a configured encoder was refused.</summary>
         public string EncoderReason { get; set; }
 
+        /// <summary>
+        /// The non-sensitive GPU summary as the plugin saw it when this session's command was
+        /// built: vendor, encoder family, whether it was detected, whether the CUDA-only levels and
+        /// OpenVINO are available. Never the render node, PCI ids, setting or reason: this record
+        /// is served by a route any authenticated user can reach. On Intel the vendor and Detected
+        /// decided the encoder and the end of the chain (docs/architecture/GPU_VENDORS.md, PR 2);
+        /// the other fields are descriptive. Null only when the session was recorded by a build
+        /// that predates the field.
+        /// </summary>
+        public GpuSummary Gpu { get; set; }
+
+        /// <summary>
+        /// Whether the encoder was fed straight from the GPU (the frame mapped from Vulkan to CUDA
+        /// without a download): "on", "off" (the GpuResidentEncode setting is off), or "n/a" on an
+        /// Intel GPU, where that hand-off exists only for NVENC and the frame is always downloaded.
+        /// Null when the session ran no Vulkan chain (not enhanced, or a CUDA-native level, which
+        /// never leaves GPU memory). Never "on" on a server where the hand-off did not happen.
+        /// </summary>
+        public string GpuResidentEncode { get; set; }
+
+        /// <summary>
+        /// The Vulkan device this session's command initialised: "vk:0" (the first Vulkan device,
+        /// every server but a detected Intel one), or the Intel render node it was derived from, with
+        /// the reason when the render node was not used (its test device start failed) or could not
+        /// be tested. Null when the session was not enhanced. GPU_VENDORS.md 5.3. Names the render node,
+        /// so it is served on the administrator-only Status route only (PatcherHost.PublicRecord drops it).
+        /// </summary>
+        public string VulkanDevice { get; set; }
+
+        /// <summary>
+        /// Which device the QSV encoder opens, on an Intel GPU only: the render node the command
+        /// pins it to, or why there is none. Null off Intel and when not enhanced. Status route only, like VulkanDevice.
+        /// </summary>
+        public string QsvDevice { get; set; }
+
+        /// <summary>
+        /// The levels this session asked for (or the dashboard defaulted to) and did not get because
+        /// they need an NVIDIA GPU and this server's is Intel, for example "denoise optix, game
+        /// dlss". Null when nothing was withheld, which is every server but an Intel one.
+        /// </summary>
+        public string GpuWithheld { get; set; }
+
+        /// <summary>
+        /// The levels asked for and not run because their speed is not measured on Intel (the ONNX
+        /// neural levels), for example "neural realesr-anime-x2". Null when none, and off Intel.
+        /// </summary>
+        public string GpuWithheldUnmeasured { get; set; }
+
         /// <summary>applied | not-requested | off-by-client | concurrency-cap | subtitle-burn-in | stream-copy | disabled | ineligible.</summary>
         public string Status { get; set; }
 
@@ -222,6 +270,10 @@ namespace Jellyfin.Plugin.Plus.Patcher
 
         private static readonly ConcurrentDictionary<string, Tuple<string, string>> _encoderBySession =
             new ConcurrentDictionary<string, Tuple<string, string>>(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>The (encoder, reason) parked for a session, or null. For the tests.</summary>
+        internal static Tuple<string, string> NotedEncoder(string playSessionId)
+            => !string.IsNullOrEmpty(playSessionId) && _encoderBySession.TryGetValue(playSessionId, out var noted) ? noted : null;
 
         /// <summary>Parks the encoder this plugin chose for a session, and backfills any record already made.</summary>
         public static void NoteEncoder(string playSessionId, string encoder, string reason)
@@ -385,6 +437,21 @@ namespace Jellyfin.Plugin.Plus.Patcher
 
             public string Reason { get; set; } = string.Empty;
 
+            /// <summary>
+            /// Levels asked for and dropped because they need NVIDIA and this server's GPU is Intel,
+            /// as "axis level" pairs joined by ", ". Null when none.
+            /// </summary>
+            public string GpuWithheld { get; set; }
+
+            /// <summary>The same, for levels dropped because their speed is not measured on Intel.</summary>
+            public string GpuWithheldUnmeasured { get; set; }
+
+            /// <summary>
+            /// The device arguments this plan was decided with, so the command and the record read one
+            /// answer even if the render-node test finishes in between. Null until the plan acts.
+            /// </summary>
+            internal DeviceInit Devices { get; set; }
+
             public static Plan No(string status, string reason) =>
                 new Plan { Act = false, Status = status, Reason = reason };
         }
@@ -521,6 +588,7 @@ namespace Jellyfin.Plugin.Plus.Patcher
 
         public static SessionRecord Describe(EncodingJobInfo state, Plan plan, string status, string reason)
         {
+            DeviceInit devices = plan.Act ? plan.Devices ?? Devices() : null;
             var record = new SessionRecord
             {
                 Timestamp = DateTime.UtcNow.ToString("u", CultureInfo.InvariantCulture),
@@ -575,9 +643,22 @@ namespace Jellyfin.Plugin.Plus.Patcher
                                 || plan.ChromaApplied || plan.DebandApplied)
                             ? "CUDA+Vulkan (RTX bridge)"
                             : "CUDA (RTX)")
-                        : (Settings?.GpuResidentEncode == true ? "Vulkan (GPU-resident)" : "Vulkan"),
+                        : (GpuResidentEncodeOn() ? "Vulkan (GPU-resident)" : "Vulkan"),
+                GpuResidentEncode = !plan.Act || plan.UsesCudaNeural
+                    ? null
+                    : IsIntelPath() ? "n/a" : (Settings?.GpuResidentEncode == true ? "on" : "off"),
+                VulkanDevice = devices?.VulkanText,
+                QsvDevice = devices?.QsvText,
+                GpuWithheld = plan.Act ? plan.GpuWithheld : null,
+                GpuWithheldUnmeasured = plan.Act ? plan.GpuWithheldUnmeasured : null,
                 Status = status,
                 Reason = reason,
+
+                // The summary, not the full record: GET Session/{id} is not elevation-gated. It
+                // never throws and never probes or spawns, so after the first session it costs the
+                // transcode path a cached read (plus a file-exists check on Intel); the encode
+                // family is resolved against ffmpeg's cached list.
+                Gpu = CapabilitySummary(),
             };
 
             // GetVideoEncoder and GetVideoProcessingFilterParam are separate call sites and
@@ -643,8 +724,13 @@ namespace Jellyfin.Plugin.Plus.Patcher
                 return "none";
             }
 
+            // On an Intel GPU there is no CUDA execution provider, and vf_ort warns and runs on ONNX
+            // Runtime's CPU provider instead (ffmpeg/vf_ort.c). Naming CUDA there would be wrong.
             return System.IO.Path.GetFileName(path)
-                + ", Real-ESRGAN compact (SRVGGNetCompact), ONNX Runtime CUDA";
+                + ", Real-ESRGAN compact (SRVGGNetCompact), "
+                + (IsIntelPath()
+                    ? "ONNX Runtime; this server's GPU is Intel, so no CUDA and the CPU provider, not measured for this chain"
+                    : "ONNX Runtime CUDA");
         }
 
         /// <summary>
@@ -849,6 +935,17 @@ namespace Jellyfin.Plugin.Plus.Patcher
                 parts.Add("denoise " + r.DenoiseDroppedForPatchedBinary
                     + " NOT run: it needs the stock ffmpeg's shader compiler, and this session also"
                     + " uses a filter only the patched binary carries");
+            }
+
+            // Same rule, and the reason is a property of the server's GPU, not of the viewer's choice.
+            if (!string.IsNullOrEmpty(r.GpuWithheld))
+            {
+                parts.Add(r.GpuWithheld + " NOT run: needs an NVIDIA GPU and this server's is Intel");
+            }
+
+            if (!string.IsNullOrEmpty(r.GpuWithheldUnmeasured))
+            {
+                parts.Add(r.GpuWithheldUnmeasured + " NOT run: " + NotMeasuredOnIntel + ", so withheld on this server's Intel GPU");
             }
 
             if (r.UpscaleApplied)
@@ -1291,6 +1388,11 @@ namespace Jellyfin.Plugin.Plus.Patcher
                     denoiseLevel = ShaderLibrary.IsDenoiseLevel(denoiseDefault) ? denoiseDefault : "off";
                 }
 
+                // The OptiX levels need CUDA frames. On a detected Intel GPU they are not offered
+                // and not run, and the session says so (GPU_VENDORS.md 5.3); nothing else stands in.
+                bool onIntel = IsIntelPath();
+                denoiseLevel = Withhold(plan, onIntel, "denoise", denoiseLevel, IntelWithholdReason("Denoise", denoiseLevel));
+
                 // ---- deblocking and deringing ---------------------------------------------
                 // Same carrier and the same fallback rule as denoise, because it is the closest
                 // existing shape: a pre-SR restoration pass that could in principle land either
@@ -1338,6 +1440,11 @@ namespace Jellyfin.Plugin.Plus.Patcher
                 plan.NeuralRequested = ShaderLibrary.IsNeuralLevel(neuralLevel)
                     ? neuralLevel.Trim().ToLowerInvariant()
                     : "off";
+
+                // dlpp-1..4 and vsr-rtcuda are NVIDIA libraries over CUDA, and the ONNX levels are not
+                // measured on Intel. NeuralRequested above keeps what was asked for, so the record
+                // reads "asked for, did not run".
+                neuralLevel = Withhold(plan, onIntel, "neural", neuralLevel, IntelWithholdReason("Neural", neuralLevel));
 
                 plan.UsesCudaNeural = ShaderLibrary.IsCudaNeuralLevel(neuralLevel);
 
@@ -1418,6 +1525,10 @@ namespace Jellyfin.Plugin.Plus.Patcher
                     gameLevel = ShaderLibrary.IsGameLevel(gameDefault) ? gameDefault : "off";
                 }
 
+                // dlss and dlaa are NVIDIA's and fsr2 takes NVOFA motion vectors through CUDA, so none
+                // of the three runs on an Intel GPU (GPU_VENDORS.md 5.3, and 5.5 for the way back).
+                gameLevel = Withhold(plan, onIntel, "game", gameLevel, IntelWithholdReason("Game", gameLevel));
+
                 // fsr2/dlss/dlaa are Vulkan (vf_dlss.c's own header, "through NGX's Vulkan path");
                 // this session's CUDA-native branch has no Vulkan device at all, so a game level
                 // asked for alongside dlpp-*/vsr-rtcuda cannot run either. Same forced-off,
@@ -1472,8 +1583,11 @@ namespace Jellyfin.Plugin.Plus.Patcher
                 // what the broken build did. An older binary still degrades to one lost pass.
                 bool needsPatchedBinary = plan.NeuralApplied || plan.GameApplied
                     || (plan.DenoiseApplied && ShaderLibrary.IsPatchedOnlyFilter(plan.DenoiseFilter));
+
+                // One answer for the whole plan: the probe, the command and the record all read it.
+                DeviceInit planDevices = Devices();
                 if (plan.DenoiseApplied && plan.DenoiseWantsHwFrames && needsPatchedBinary
-                    && !VulkanDenoiseRunsOnPatchedBinary())
+                    && !VulkanDenoiseRunsOnPatchedBinary(planDevices))
                 {
                     plan.DenoiseDroppedForPatchedBinary = plan.DenoiseLevel;
                     plan.DenoiseFilter = null;
@@ -1500,7 +1614,7 @@ namespace Jellyfin.Plugin.Plus.Patcher
                 {
                     return clientSaidOff
                         ? Plan.No("off-by-client", "the viewer selected Off")
-                        : Plan.No("not-requested", upscaleReason ?? "nothing requested");
+                        : Plan.No("not-requested", (upscaleReason ?? "nothing requested") + WithheldNote(plan));
                 }
 
                 // ---- deband and the scaling kernel, both session-overridable ---------------
@@ -1566,9 +1680,10 @@ namespace Jellyfin.Plugin.Plus.Patcher
                     && !plan.NeuralApplied && !plan.GameApplied)
                 {
                     // Sharpening was asked for but its shader is missing: nothing left to do.
-                    return Plan.No("not-requested", "requested shaders unavailable");
+                    return Plan.No("not-requested", "requested shaders unavailable" + WithheldNote(plan));
                 }
 
+                plan.Devices = planDevices;
                 plan.Act = true;
                 plan.Status = "applied";
                 return plan;
@@ -1899,6 +2014,718 @@ namespace Jellyfin.Plugin.Plus.Patcher
         /// <summary>Public read of a session's own option, for callers outside this class (BuildVerdict's swapfrom marker).</summary>
         public static string OptionValue(EncodingJobInfo state, string name) => RawOption(state, name);
 
+        /* ----------------------------------------------------------------------- GPU vendor */
+
+        /// <summary>
+        /// The full GPU capability record with the Intel encode family resolved against this
+        /// ffmpeg, for the administrator-only status route and the plugin side. The detector alone
+        /// cannot say whether ffmpeg has a QSV encoder; this can, so a server without one reports
+        /// software rather than a family the encoder choice will not use. A copy when it changes
+        /// anything: the detector's record is shared and cached, and must not be written to.
+        /// </summary>
+        public static GpuCapability Capability()
+        {
+            GpuCapability cap = GpuDetector.Current(Settings?.GpuVendor, Settings?.NeuralModelDirectory);
+            return LacksQsvEncoder(cap) ? WithSoftwareFamily(cap) : cap;
+        }
+
+        /// <summary>
+        /// The non-sensitive subset of <see cref="Capability"/> (no render node, PCI ids, setting
+        /// or reason), for the probe route and the session records, which any authenticated user
+        /// can read. The detector's shared instance unless the family had to be downgraded.
+        /// </summary>
+        public static GpuSummary CapabilitySummary()
+        {
+            GpuCapability cap = GpuDetector.Current(Settings?.GpuVendor, Settings?.NeuralModelDirectory);
+            return LacksQsvEncoder(cap)
+                ? WithSoftwareFamily(cap).ToSummary()
+                : GpuDetector.CurrentSummary(Settings?.GpuVendor, Settings?.NeuralModelDirectory);
+        }
+
+        private static bool LacksQsvEncoder(GpuCapability cap)
+            => cap.Vendor == GpuVendors.Intel && cap.Detected && !IntelHasQsvEncoder();
+
+        private static GpuCapability WithSoftwareFamily(GpuCapability cap)
+            => new GpuCapability
+            {
+                Vendor = cap.Vendor,
+                Setting = cap.Setting,
+                Detected = cap.Detected,
+                RenderNode = cap.RenderNode,
+                EncoderFamily = "software",
+                DecodeType = cap.DecodeType,
+                CudaOnlyLevelsAvailable = cap.CudaOnlyLevelsAvailable,
+                OpenVinoAvailable = cap.OpenVinoAvailable,
+                Reason = cap.Reason + "; ffmpeg lists no QSV encoder, so the encode is software (a VA-API encoder cannot take this chain's system-memory frames)",
+                Devices = cap.Devices,
+            };
+
+        /// <summary>
+        /// True when this server's GPU is an Intel one that was actually seen. Every Intel
+        /// decision in the engine is gated on this and on nothing else, so a server with no
+        /// vendor, an NVIDIA GPU, or an Intel setting with no Intel GPU behind it takes the code
+        /// path that existed before the vendor setting did, byte for byte. Never throws.
+        /// </summary>
+        internal static bool IsIntelPath()
+        {
+            try
+            {
+                GpuCapability cap = GpuDetector.Current(Settings?.GpuVendor, Settings?.NeuralModelDirectory);
+                return cap.Vendor == GpuVendors.Intel && cap.Detected;
+            }
+            catch (Exception)
+            {
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Whether the chain hands the encoder a frame straight from the GPU: the GpuResidentEncode
+        /// setting, and only where the hand-off exists. It is a Vulkan-to-CUDA map (ffmpeg/0006),
+        /// so it is NVENC-only; on Intel it is always off, whatever the setting says.
+        /// </summary>
+        private static bool GpuResidentEncodeOn() => Settings?.GpuResidentEncode == true && !IsIntelPath();
+
+        /* ------------------------------------------------------------- NVIDIA-only levels */
+
+        /// <summary>The reason a withheld level gives, as the probe and the status route serve it.</summary>
+        internal const string NeedsNvidia = "needs NVIDIA";
+
+        /// <summary>The reason the ONNX neural levels give on Intel: they run, but nobody has timed them there.</summary>
+        internal const string NotMeasuredOnIntel = "not measured on Intel";
+
+        /// <summary>Whether a level of this axis (Denoise, Neural or Game) needs an NVIDIA GPU. A property of the level alone.</summary>
+        internal static bool NvidiaOnly(string axis, string level)
+        {
+            switch (axis)
+            {
+                case "Denoise":
+                    return ShaderLibrary.IsNvidiaOnlyDenoise(level);
+                case "Neural":
+                    return ShaderLibrary.IsNvidiaOnlyNeural(level);
+                case "Game":
+                    return ShaderLibrary.IsNvidiaOnlyGame(level);
+                default:
+                    return false;
+            }
+        }
+
+        /// <summary>
+        /// The levels of one axis this server's GPU can run: the list unchanged on every server but a
+        /// detected Intel one, and without the NVIDIA-only levels there. The probe is built from it,
+        /// so the client never offers a level the engine will not run.
+        /// </summary>
+        internal static List<string> OfferedOnThisGpu(string axis, List<string> levels)
+        {
+            if (levels == null || !IsIntelPath())
+            {
+                return levels;
+            }
+
+            return levels.Where(l => IntelWithholdReason(axis, l) == null).ToList();
+        }
+
+        /// <summary>The reason a level is not run on a detected Intel GPU ("needs NVIDIA", "not measured on Intel"), or null when it is.</summary>
+        internal static string IntelWithholdReason(string axis, string level)
+        {
+            if (NvidiaOnly(axis, level))
+            {
+                return NeedsNvidia;
+            }
+
+            return axis == "Neural" && ShaderLibrary.IsOnnxNeural(level) ? NotMeasuredOnIntel : null;
+        }
+
+        /// <summary>
+        /// The levels the server would otherwise offer and withholds because this GPU is Intel,
+        /// axis to level to reason. Empty on every other server, so the probe and the status route
+        /// carry no new key there.
+        /// </summary>
+        internal static Dictionary<string, Dictionary<string, string>> WithheldLevels(UpscaleSettings cfg)
+        {
+            var map = new Dictionary<string, Dictionary<string, string>>();
+            if (!IsIntelPath())
+            {
+                return map;
+            }
+
+            AddWithheld(map, "Denoise", ShaderLibrary.AvailableDenoiseLevels());
+            AddWithheld(map, "Neural", cfg?.NeuralAllowed == false ? null : ShaderLibrary.AvailableNeuralLevels(cfg));
+            AddWithheld(map, "Game", cfg?.GameAllowed == false ? null : ShaderLibrary.AvailableGameLevels(cfg));
+            return map;
+        }
+
+        private static void AddWithheld(Dictionary<string, Dictionary<string, string>> map, string axis, List<string> levels)
+        {
+            if (levels == null)
+            {
+                return;
+            }
+
+            foreach (string level in levels)
+            {
+                string reason = IntelWithholdReason(axis, level);
+                if (reason == null)
+                {
+                    continue;
+                }
+
+                if (!map.TryGetValue(axis, out var byLevel))
+                {
+                    map[axis] = byLevel = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                }
+
+                byLevel[level] = reason;
+            }
+        }
+
+        /// <summary>
+        /// "off" for a level that cannot run on this GPU (reason is the one IntelWithholdReason
+        /// gave, null when it can), with the note recorded on the plan under that reason so the
+        /// session record and its summary say so; the level as it was otherwise.
+        /// </summary>
+        private static string Withhold(Plan plan, bool onIntel, string axis, string level, string reason)
+        {
+            if (!onIntel || reason == null)
+            {
+                return level;
+            }
+
+            string note = axis + " " + level.Trim().ToLowerInvariant();
+            if (reason == NotMeasuredOnIntel)
+            {
+                plan.GpuWithheldUnmeasured = string.IsNullOrEmpty(plan.GpuWithheldUnmeasured) ? note : plan.GpuWithheldUnmeasured + ", " + note;
+            }
+            else
+            {
+                plan.GpuWithheld = string.IsNullOrEmpty(plan.GpuWithheld) ? note : plan.GpuWithheld + ", " + note;
+            }
+
+            return "off";
+        }
+
+        /// <summary>The sentence that says what an Intel GPU withheld, for a session that is left with nothing to run. Empty when nothing was.</summary>
+        private static string WithheldNote(Plan plan) =>
+            (string.IsNullOrEmpty(plan.GpuWithheld)
+                ? string.Empty
+                : "; " + plan.GpuWithheld + " not run: needs an NVIDIA GPU and this server's is Intel")
+            + (string.IsNullOrEmpty(plan.GpuWithheldUnmeasured)
+                ? string.Empty
+                : "; " + plan.GpuWithheldUnmeasured + " not run: " + NotMeasuredOnIntel + ", so withheld on this server's Intel GPU");
+
+        /* ------------------------------------------------------------------ device selection */
+
+        private static readonly System.Text.RegularExpressions.Regex RenderNodePath =
+            new System.Text.RegularExpressions.Regex("^/dev/dri/renderD([0-9]{1,4})$", System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+
+        /// <summary>
+        /// The device initialisation a session's command carries, and the words the record uses for
+        /// it. The default is the one every server had before the vendor setting: the first Vulkan
+        /// device and no QSV device, so only a detected Intel GPU ever differs (GPU_VENDORS.md 5.3).
+        /// </summary>
+        internal sealed class DeviceInit
+        {
+            public bool Intel { get; set; }
+
+            /// <summary>The -init_hw_device argument that makes the Vulkan device "vk", with its leading space.</summary>
+            public string VulkanArgs { get; set; } = " -init_hw_device vulkan=vk:0";
+
+            public string VulkanText { get; set; } = "vk:0";
+
+            /// <summary>A QSV device argument, with its leading space, or empty.</summary>
+            public string QsvArgs { get; set; } = string.Empty;
+
+            /// <summary>Null off Intel.</summary>
+            public string QsvText { get; set; }
+        }
+
+        /// <summary>
+        /// Resolves the device arguments for this server. On a detected Intel GPU with a usable render
+        /// node the Vulkan device is derived from the node (drm=dr:NODE, vulkan=vk@dr) unless a test
+        /// start of it has failed, which gives vk:0; the QSV device is always pinned to the same node
+        /// when ffmpeg lists a QSV encoder. The test runs in the background and this never waits for
+        /// it (DrmVulkanStarts). Everything else is the default above. Never throws.
+        /// </summary>
+        internal static DeviceInit Devices()
+        {
+            var d = new DeviceInit();
+            try
+            {
+                if (!IsIntelPath())
+                {
+                    return d;
+                }
+
+                d.Intel = true;
+                d.QsvText = "implicit";
+                GpuCapability cap = GpuDetector.Current(Settings?.GpuVendor, Settings?.NeuralModelDirectory);
+                string node = cap.RenderNode;
+                var match = RenderNodePath.Match(node ?? string.Empty);
+                if (!match.Success)
+                {
+                    d.VulkanText = "vk:0 (the Intel render node has no usable path)";
+                    return d;
+                }
+
+                bool? starts = DrmVulkanStarts(node, out bool pending);
+                if (starts == false)
+                {
+                    d.VulkanText = "vk:0 (a test start from " + node + " failed, so the first Vulkan device)";
+                }
+                else
+                {
+                    d.VulkanArgs = " -init_hw_device drm=dr:" + node + " -init_hw_device vulkan=vk@dr";
+                    d.VulkanText = "render node " + node
+                        + (starts == true ? string.Empty : pending ? " (test pending)" : " (not tested: ffmpeg could not be run)");
+                }
+
+                if (!IntelHasQsvEncoder())
+                {
+                    d.QsvText = "none (ffmpeg lists no QSV encoder)";
+                }
+                else
+                {
+                    // Pinned whatever the node's number: the encoder's own search (renderD128 to
+                    // renderD135) is not trusted to pick the detector's node on a mixed box.
+                    d.QsvArgs = " -init_hw_device qsv=qs:hw_any,child_device=" + node;
+                    d.QsvText = node;
+                }
+            }
+            catch (Exception)
+            {
+                // a failure here is the default arguments, which is today's command
+            }
+
+            return d;
+        }
+
+        /// <summary>
+        /// Starts the render-node test now, off the session path, so the first Intel session finds an
+        /// answer instead of an unknown. Called once at plugin start-up; does nothing off Intel and
+        /// never throws or waits (Devices lists ffmpeg's encoders the first time, so that runs on a
+        /// pool thread too).
+        /// </summary>
+        internal static void WarmDevices()
+        {
+            try
+            {
+                if (DrmVulkanInline)
+                {
+                    Devices();
+                }
+                else
+                {
+                    ThreadPool.QueueUserWorkItem(_ => Devices());
+                }
+            }
+            catch (Exception)
+            {
+                // warming is an optimisation; the first session asks again
+            }
+        }
+
+        /// <summary>Replaces the ffmpeg run of the test that a Vulkan device can be started from a render node (true, false, null for inconclusive). The tests set it, which also empties the cache; nothing in production does.</summary>
+        internal static Func<string, bool?> DrmVulkanProbeSource
+        {
+            get => _drmVulkanSource;
+            set
+            {
+                _drmVulkanSource = value;
+                ResetDrmVulkanCache();
+            }
+        }
+
+        private static Func<string, bool?> _drmVulkanSource;
+
+        /// <summary>The tests run the probe on the calling thread, so a result is there on the next line.</summary>
+        internal static bool DrmVulkanInline { get; set; }
+
+        /// <summary>The tests move the clock to cross the retry window.</summary>
+        internal static Func<DateTime> DrmVulkanClock { get; set; }
+
+        /// <summary>How long a false or inconclusive result stands before it is tested again. True is kept for the life of the process.</summary>
+        internal static readonly TimeSpan DrmVulkanRetry = TimeSpan.FromMinutes(5);
+
+        private sealed class DrmVulkanEntry
+        {
+            public bool Known;
+
+            public bool? Result;
+
+            public DateTime At;
+
+            public bool Running;
+        }
+
+        private static readonly Dictionary<string, DrmVulkanEntry> _drmVulkan = new Dictionary<string, DrmVulkanEntry>();
+        private static readonly object _drmVulkanLock = new object();
+
+        /// <summary>Forgets every render-node result, so the next call tests again. For the tests.</summary>
+        internal static void ResetDrmVulkanCache()
+        {
+            lock (_drmVulkanLock)
+            {
+                _drmVulkan.Clear();
+            }
+        }
+
+        private static DateTime DrmVulkanNow() => (DrmVulkanClock ?? (() => DateTime.UtcNow))();
+
+        /// <summary>
+        /// Whether ffmpeg can start a Vulkan device derived from this render node: true, false (a
+        /// definite failure) or null (could not tell). NEVER WAITS FOR THE TEST. It runs in the
+        /// background, one at a time per node, and this returns the last answer, or null with
+        /// pending set when there is none yet, so a session builds its command at once and a first
+        /// Intel session cannot sit behind a 20 s ffmpeg start under a global lock.
+        ///
+        /// True stays for the life of the process. False and null are tested again after
+        /// DrmVulkanRetry, and the stale one is served meanwhile, so a transient failure at start-up
+        /// does not pin a working server to vk:0 for good.
+        /// </summary>
+        private static bool? DrmVulkanStarts(string node, out bool pending)
+        {
+            bool start = DrmVulkanTake(node, out bool? result, out pending);
+            if (start)
+            {
+                if (DrmVulkanInline)
+                {
+                    RunDrmVulkanProbe(node);
+                    DrmVulkanTake(node, out result, out pending);
+                }
+                else
+                {
+                    ThreadPool.QueueUserWorkItem(_ => RunDrmVulkanProbe(node));
+                }
+            }
+
+            return result;
+        }
+
+        /// <summary>Reads the node's entry and claims the single flight when a test is due. True when the caller must start it.</summary>
+        private static bool DrmVulkanTake(string node, out bool? result, out bool pending)
+        {
+            lock (_drmVulkanLock)
+            {
+                if (!_drmVulkan.TryGetValue(node, out DrmVulkanEntry entry))
+                {
+                    entry = new DrmVulkanEntry();
+                    _drmVulkan[node] = entry;
+                }
+
+                result = entry.Known ? entry.Result : null;
+                pending = !entry.Known;
+                bool due = !entry.Known || (entry.Result != true && DrmVulkanNow() - entry.At >= DrmVulkanRetry);
+                if (!due || entry.Running)
+                {
+                    return false;
+                }
+
+                entry.Running = true;
+                return true;
+            }
+        }
+
+        private static void RunDrmVulkanProbe(string node)
+        {
+            bool? result = null;
+            try
+            {
+                Func<string, bool?> source = DrmVulkanProbeSource;
+                result = source != null ? source(node) : RunFfmpegProbe(DrmVulkanProbeArgs(node), 20000);
+            }
+            catch (Exception)
+            {
+                // could not tell: the same as an ffmpeg that cannot be run
+            }
+
+            lock (_drmVulkanLock)
+            {
+                if (_drmVulkan.TryGetValue(node, out DrmVulkanEntry entry))
+                {
+                    entry.Result = result;
+                    entry.Known = true;
+                    entry.At = DrmVulkanNow();
+                    entry.Running = false;
+                }
+            }
+        }
+
+        /// <summary>The test command: the session's own device initialisation and one frame through hwupload and hwdownload.</summary>
+        internal static string DrmVulkanProbeArgs(string node) =>
+            "-hide_banner -loglevel error -init_hw_device drm=dr:" + node + " -init_hw_device vulkan=vk@dr "
+            + "-filter_hw_device vk -f lavfi -i testsrc=size=64x64:rate=1 -frames:v 1 "
+            + "-vf format=yuv420p,hwupload,hwdownload,format=yuv420p -f null -";
+
+        /// <summary>
+        /// Runs the first ffmpeg that exists with these arguments: true on exit 0, false on any other
+        /// exit, null when none could be run or it timed out. Both pipes are drained before the wait,
+        /// as in the other probes here.
+        /// </summary>
+        private static bool? RunFfmpegProbe(string args, int timeoutMs)
+        {
+            var candidates = new List<string>();
+            if (!string.IsNullOrWhiteSpace(_ffmpegPath))
+            {
+                candidates.Add(_ffmpegPath);
+            }
+
+            candidates.Add("/usr/lib/jellyfin-ffmpeg/ffmpeg");
+            candidates.Add("/usr/bin/ffmpeg");
+
+            foreach (string exe in candidates)
+            {
+                try
+                {
+                    if (!File.Exists(exe))
+                    {
+                        continue;
+                    }
+
+                    var psi = new System.Diagnostics.ProcessStartInfo(exe, args)
+                    {
+                        RedirectStandardOutput = true,
+                        RedirectStandardError = true,
+                        UseShellExecute = false,
+                    };
+
+                    using (var proc = System.Diagnostics.Process.Start(psi))
+                    {
+                        var stdoutRead = proc.StandardOutput.ReadToEndAsync();
+                        var stderrRead = proc.StandardError.ReadToEndAsync();
+                        if (!proc.WaitForExit(timeoutMs))
+                        {
+                            try
+                            {
+                                proc.Kill();
+                            }
+                            catch (Exception)
+                            {
+                                // already gone
+                            }
+
+                            return null;
+                        }
+
+                        System.Threading.Tasks.Task.WaitAll(new System.Threading.Tasks.Task[] { stdoutRead, stderrRead }, 5000);
+                        return proc.ExitCode == 0;
+                    }
+                }
+                catch (Exception)
+                {
+                    // try the next candidate
+                }
+            }
+
+            return null;
+        }
+
+        private static readonly string[] IntelCodecs = { "h264", "hevc", "av1" };
+
+        /// <summary>
+        /// True when ffmpeg can be shown to lack a QSV encoder. An unreadable or not-yet-read list
+        /// is not "lacks": the safe response to not knowing is the usual QSV choice, as with every
+        /// other probe here. Reads the cache only, so the capability record (a dashboard poll, the
+        /// load route) never spawns ffmpeg; <see cref="WarmProbes"/> fills it at start-up.
+        /// </summary>
+        private static bool IntelHasQsvEncoder()
+        {
+            HashSet<string> available = KnownEncoders();
+            return available == null || IntelCodecs.Any(c => available.Contains(c + "_qsv"));
+        }
+
+        /// <summary>
+        /// The encoder an Intel server uses for a codec, with a note when it is not the plain QSV
+        /// one. QSV, because the chain's frames are in system memory (GPU_VENDORS.md, 5.1). With
+        /// no QSV encoder listed it is the software encoder for the codec, if ffmpeg has one. With
+        /// neither listed it is null, so Jellyfin's own choice stands rather than a QSV encoder
+        /// that would fail to open.
+        /// </summary>
+        private static string IntelEncoderFor(string codec, out string note)
+        {
+            note = null;
+            if (codec == null)
+            {
+                return null;
+            }
+
+            string qsv = codec + "_qsv";
+            HashSet<string> available = AvailableEncoders();
+            if (available == null || available.Contains(qsv))
+            {
+                return qsv;
+            }
+
+            string software = codec == "h264" ? "libx264" : codec == "hevc" ? "libx265" : "libsvtav1";
+            if (available.Contains(software))
+            {
+                note = "ffmpeg has no " + qsv + ", so " + software + " (software)";
+                return software;
+            }
+
+            note = "ffmpeg lists neither " + qsv + " nor " + software + "; kept Jellyfin's encoder";
+            return null;
+        }
+
+        /// <summary>
+        /// Whether an encoder can take the frames the Intel chain ends in (system memory): a QSV
+        /// encoder or a software one. A VA-API encoder needs VA-API frames and an NVENC one is for
+        /// the wrong GPU; either would be a dead stream, so neither is kept when Jellyfin chose it.
+        /// </summary>
+        internal static bool EncoderFitsIntelChain(string encoder)
+        {
+            if (string.IsNullOrWhiteSpace(encoder))
+            {
+                return false;
+            }
+
+            string e = encoder.Trim();
+            return e.EndsWith("_qsv", StringComparison.OrdinalIgnoreCase)
+                || SoftwareEncoders.Contains(e);
+        }
+
+        // The software encoders IntelEncoderFor can pick. A bare "lib" prefix would also admit
+        // libvpx-vp9 and libaom-av1, which the chain's codec choice never produces.
+        private static readonly HashSet<string> SoftwareEncoders = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "libx264", "libx265", "libsvtav1",
+        };
+
+        /// <summary>
+        /// Removes the VA-API-only options from an ffmpeg command line whose encoder was swapped to
+        /// QSV or software: a VA-API device (<c>-vaapi_device</c>, <c>-init_hw_device vaapi=...</c>
+        /// and the <c>-filter_hw_device</c> and <c>-hwaccel_device</c> that name it), <c>-hwaccel vaapi</c>,
+        /// <c>-hwaccel_output_format vaapi</c>, and the VA-API encoder's <c>-rc_mode</c> and
+        /// <c>-sei</c>. ffmpeg exits on an option the chosen encoder does not have. Everything
+        /// else, QSV-compatible options included, is kept, and a line with nothing to strip is
+        /// returned as the same string. A line that still names a VA-API encoder, or that opens a
+        /// QSV device itself, is left whole: it is a coherent line and removing its device would
+        /// break it.
+        /// </summary>
+        internal static string StripVaapiOnlyArguments(string commandLine)
+        {
+            if (string.IsNullOrEmpty(commandLine))
+            {
+                return commandLine;
+            }
+
+            var tokens = new List<(int Start, int End)>();
+            int i = 0;
+            while (i < commandLine.Length)
+            {
+                while (i < commandLine.Length && char.IsWhiteSpace(commandLine[i]))
+                {
+                    i++;
+                }
+
+                if (i >= commandLine.Length)
+                {
+                    break;
+                }
+
+                int start = i;
+                bool quoted = false;
+                while (i < commandLine.Length && (quoted || !char.IsWhiteSpace(commandLine[i])))
+                {
+                    char c = commandLine[i];
+                    if (c == '\\' && i + 1 < commandLine.Length)
+                    {
+                        i += 2;
+                        continue;
+                    }
+
+                    if (c == '"')
+                    {
+                        quoted = !quoted;
+                    }
+
+                    i++;
+                }
+
+                tokens.Add((start, i));
+            }
+
+            string[] text = tokens.Select(t => commandLine.Substring(t.Start, t.End - t.Start)).ToArray();
+            for (int k = 0; k + 1 < text.Length; k++)
+            {
+                if ((text[k].StartsWith("-c:v", StringComparison.Ordinal) || text[k].StartsWith("-codec:v", StringComparison.Ordinal) || text[k] == "-vcodec")
+                    && text[k + 1].EndsWith("_vaapi", StringComparison.OrdinalIgnoreCase))
+                {
+                    return commandLine;
+                }
+            }
+
+            // A QSV device on Linux is derived from the VA-API one (qsv=qs@va), so a line that
+            // opens one is a QSV line already and its VA-API device is not a leftover.
+            for (int k = 0; k + 1 < text.Length; k++)
+            {
+                if (text[k] == "-init_hw_device" && text[k + 1].StartsWith("qsv", StringComparison.OrdinalIgnoreCase))
+                {
+                    return commandLine;
+                }
+            }
+
+            var vaapiDevices = new HashSet<string>(StringComparer.Ordinal);
+            for (int k = 0; k + 1 < text.Length; k++)
+            {
+                if (text[k] == "-init_hw_device" && text[k + 1].StartsWith("vaapi", StringComparison.OrdinalIgnoreCase))
+                {
+                    int eq = text[k + 1].IndexOf('=');
+                    if (eq > 0)
+                    {
+                        string rest = text[k + 1].Substring(eq + 1);
+                        int end = rest.IndexOfAny(new[] { ':', ',' });
+                        vaapiDevices.Add(end < 0 ? rest : rest.Substring(0, end));
+                    }
+                }
+            }
+
+            var removed = new bool[text.Length];
+            bool any = false;
+            for (int k = 0; k + 1 < text.Length; k++)
+            {
+                string option = text[k];
+                string value = text[k + 1];
+                bool drop = option == "-vaapi_device"
+                    || option == "-rc_mode"
+                    || option == "-sei"
+                    || (option == "-init_hw_device" && value.StartsWith("vaapi", StringComparison.OrdinalIgnoreCase))
+                    || ((option == "-filter_hw_device" || option == "-hwaccel_device") && vaapiDevices.Contains(value))
+                    || ((option == "-hwaccel" || option == "-hwaccel_output_format") && string.Equals(value, "vaapi", StringComparison.OrdinalIgnoreCase));
+                if (drop)
+                {
+                    removed[k] = true;
+                    removed[k + 1] = true;
+                    any = true;
+                    k++;
+                }
+            }
+
+            if (!any)
+            {
+                return commandLine;
+            }
+
+            var sb = new System.Text.StringBuilder(commandLine.Length);
+            int previousEnd = 0;
+            for (int k = 0; k < text.Length; k++)
+            {
+                if (!removed[k])
+                {
+                    sb.Append(commandLine, previousEnd, tokens[k].Start - previousEnd);
+                    sb.Append(text[k]);
+                }
+
+                previousEnd = tokens[k].End;
+            }
+
+            sb.Append(commandLine, previousEnd, commandLine.Length - previousEnd);
+            return sb.ToString();
+        }
+
+        /// <summary>True when the encoder name is an NVENC one (<c>hevc_nvenc</c>).</summary>
+        internal static bool IsNvencEncoder(string encoder)
+            => !string.IsNullOrWhiteSpace(encoder) && encoder.Trim().EndsWith("_nvenc", StringComparison.OrdinalIgnoreCase);
+
         /* ------------------------------------------------------------------- encoder selection */
 
         /// <summary>The ffmpeg binary Jellyfin is using, captured from EncodingOptions when seen.</summary>
@@ -1912,8 +2739,75 @@ namespace Jellyfin.Plugin.Plus.Patcher
         /// three ffmpeg processes on the transcode path for every session on a server where the
         /// probe cannot work at all.
         /// </summary>
-        private static bool _encodersProbed;
+        private static volatile bool _encodersProbed;
         private static readonly object _encodersLock = new object();
+
+        /// <summary>How many times the encoder list was actually read from ffmpeg. The tests assert it does not move on a request path.</summary>
+        internal static int EncoderProbeRuns;
+
+        /// <summary>Forgets the encoder list and that it was ever read, so a test starts from a cold cache. For the tests.</summary>
+        internal static void ResetEncoderProbe()
+        {
+            lock (_encodersLock)
+            {
+                _encoders = null;
+                _encodersProbed = false;
+                EncoderProbeRuns = 0;
+            }
+        }
+
+        /// <summary>
+        /// The encoder list as far as it is already known, never spawning ffmpeg: null until the
+        /// start-up warm-up (or the first transcode) has read it, and null when it could not be
+        /// read. For callers on a request thread (the capability record).
+        /// </summary>
+        private static HashSet<string> KnownEncoders()
+        {
+            if (EncoderListSource != null)
+            {
+                return EncoderListSource();
+            }
+
+            return _encodersProbed ? _encoders : null;
+        }
+
+        /// <summary>
+        /// On an Intel server only, reads what the request paths only look up, off the calling
+        /// thread: the ffmpeg encoder list and, when it lists av1_qsv, the one-frame AV1 test
+        /// encode. Started once at plugin start-up; nothing here throws.
+        /// </summary>
+        public static System.Threading.Tasks.Task WarmProbes()
+        {
+            return System.Threading.Tasks.Task.Run(() =>
+            {
+                try
+                {
+                    // Off Intel nothing here is read on a request path, so an NVIDIA or
+                    // unknown-GPU server keeps its lazy, first-session probe exactly as before.
+                    if (!IsIntelPath())
+                    {
+                        return;
+                    }
+
+                    AvailableEncoders(rememberFailure: false);
+                    HashSet<string> known = KnownEncoders();
+                    if (known == null || known.Contains("av1_qsv"))
+                    {
+                        StartAv1Probe();
+                    }
+                }
+                catch (Exception)
+                {
+                    // a warm-up that fails leaves the lookups at "unknown", which they already handle
+                }
+            });
+        }
+
+        /// <summary>
+        /// Replaces the ffmpeg encoder list (null result = unreadable). The tests set it so the
+        /// encoder choice does not depend on the machine's ffmpeg; nothing in production does.
+        /// </summary>
+        internal static Func<HashSet<string>> EncoderListSource { get; set; }
 
         public static void NoteFfmpegPath(string path)
         {
@@ -1929,8 +2823,13 @@ namespace Jellyfin.Plugin.Plus.Patcher
         /// "the encoder is missing", because the safe response to not knowing is to leave the
         /// client-negotiated codec alone.
         /// </summary>
-        private static HashSet<string> AvailableEncoders()
+        private static HashSet<string> AvailableEncoders(bool rememberFailure = true)
         {
+            if (EncoderListSource != null)
+            {
+                return EncoderListSource();
+            }
+
             if (_encodersProbed)
             {
                 return _encoders;
@@ -1943,6 +2842,7 @@ namespace Jellyfin.Plugin.Plus.Patcher
                     return _encoders;
                 }
 
+                EncoderProbeRuns++;
                 var candidates = new List<string>();
                 if (!string.IsNullOrWhiteSpace(_ffmpegPath))
                 {
@@ -2034,8 +2934,14 @@ namespace Jellyfin.Plugin.Plus.Patcher
                 }
 
                 // Every candidate failed. Remember that, so the next session does not spawn the
-                // same three processes again; null still means "unknown", not "missing".
-                _encodersProbed = true;
+                // same three processes again; null still means "unknown", not "missing". The
+                // start-up warm-up does not remember it: Jellyfin's ffmpeg path is only learned from
+                // the first session, and a custom path would otherwise never be tried.
+                if (rememberFailure)
+                {
+                    _encodersProbed = true;
+                }
+
                 return null;
             }
         }
@@ -2068,6 +2974,15 @@ namespace Jellyfin.Plugin.Plus.Patcher
             return filters != null && filters.Contains(name.Trim());
         }
 
+        /// <summary>
+        /// The command the Vulkan-denoise probe runs: one 64x64 frame through nlmeans_vulkan, on the
+        /// same Vulkan device a session will get (vk:0 everywhere but a detected Intel GPU), so the
+        /// probe tests the device that will be used.
+        /// </summary>
+        internal static string VulkanDenoiseProbeArgs(DeviceInit devices = null) =>
+            "-hide_banner -loglevel error" + (devices ?? Devices()).VulkanArgs + " -filter_hw_device vk -f lavfi -i testsrc=size=64x64:rate=1 -frames:v 1 "
+            + "-vf \"format=yuv420p,hwupload,nlmeans_vulkan,hwdownload,format=yuv420p\" -f null -";
+
         private static readonly object _vulkanDenoiseLock = new object();
         private static bool _vulkanDenoiseProbed;
         private static bool _vulkanDenoiseWorks;
@@ -2085,7 +3000,7 @@ namespace Jellyfin.Plugin.Plus.Patcher
         /// and for the same reason: the cost of being wrong in that direction is one dropped pass,
         /// and the cost of being wrong in the other is the viewer's stream.
         /// </summary>
-        public static bool VulkanDenoiseRunsOnPatchedBinary()
+        public static bool VulkanDenoiseRunsOnPatchedBinary(DeviceInit devices = null)
         {
             if (_vulkanDenoiseProbed)
             {
@@ -2112,9 +3027,7 @@ namespace Jellyfin.Plugin.Plus.Patcher
 
                     // One 64x64 frame of synthetic input: enough to force the shader to compile,
                     // small enough that a server under load does not notice it happening.
-                    const string args = "-hide_banner -loglevel error -init_hw_device vulkan=vk:0 "
-                        + "-filter_hw_device vk -f lavfi -i testsrc=size=64x64:rate=1 -frames:v 1 "
-                        + "-vf \"format=yuv420p,hwupload,nlmeans_vulkan,hwdownload,format=yuv420p\" -f null -";
+                    string args = VulkanDenoiseProbeArgs(devices);
 
                     var psi = new System.Diagnostics.ProcessStartInfo(exe, args)
                     {
@@ -2405,10 +3318,10 @@ namespace Jellyfin.Plugin.Plus.Patcher
         ///
         /// Blank or "auto" means "follow the client", which is the old behaviour on request.
         /// </summary>
-        public static string EncoderFor(EncodingJobInfo state, out string reason)
+        public static string EncoderFor(EncodingJobInfo state, out string reason, DeviceInit devices = null)
         {
             string chosen = ChooseEncoder(state, out reason);
-            string guarded = GuardAv1(state, chosen, out string guardReason);
+            string guarded = GuardAv1(state, chosen, out string guardReason, devices);
             if (guardReason != null)
             {
                 reason = guardReason + "; " + reason;
@@ -2421,11 +3334,17 @@ namespace Jellyfin.Plugin.Plus.Patcher
         /// Swaps av1_nvenc for hevc_nvenc (h264_nvenc when the session cannot take HEVC) on a GPU
         /// without an AV1 encoder. ffmpeg lists av1_nvenc whenever it is compiled in, so the
         /// encoder list cannot catch this; the encoder only fails at open, killing the transcode.
-        /// reason is null when nothing was swapped.
+        /// reason is null when nothing was swapped. devices is the plan's resolved DeviceInit (null
+        /// only where no plan exists).
         /// </summary>
-        public static string GuardAv1(EncodingJobInfo state, string encoder, out string reason)
+        public static string GuardAv1(EncodingJobInfo state, string encoder, out string reason, DeviceInit devices = null)
         {
             reason = null;
+            if (IsIntelPath())
+            {
+                return GuardAv1Intel(state, encoder, out reason, devices);
+            }
+
             if (!string.Equals(encoder, "av1_nvenc", StringComparison.OrdinalIgnoreCase) || Av1NvencUsable() != false)
             {
                 return encoder;
@@ -2435,6 +3354,229 @@ namespace Jellyfin.Plugin.Plus.Patcher
             string swap = supported.Count == 0 || supported.Contains("hevc") ? "hevc_nvenc" : "h264_nvenc";
             reason = "GPU has no AV1 encoder (needs compute capability 8.9+), used " + swap + " instead of av1_nvenc";
             return swap;
+        }
+
+        /// <summary>
+        /// The Intel counterpart: av1_qsv is listed by any build that compiles it, but only an Arc
+        /// or newer GPU can open it, and it fails at open, which kills the transcode. So one frame
+        /// is test-encoded in the background (the answer is cached with a time-to-live) and a
+        /// failure swaps to hevc_qsv, or h264_qsv when the session cannot take HEVC. While the very
+        /// first test encode has not finished the swap is made too (an av1_qsv that cannot open is
+        /// a dead stream, and HEVC plays); an inconclusive probe leaves the choice alone.
+        /// </summary>
+        private static string GuardAv1Intel(EncodingJobInfo state, string encoder, out string reason, DeviceInit devices)
+        {
+            reason = null;
+            if (!string.Equals(encoder, "av1_qsv", StringComparison.OrdinalIgnoreCase))
+            {
+                return encoder;
+            }
+
+            bool? usable = Av1QsvUsable(out bool pending, devices);
+            if (usable != false && !pending)
+            {
+                return encoder;
+            }
+
+            var supported = SupportedCodecs(state);
+            string swap = supported.Count == 0 || supported.Contains("hevc") ? "hevc_qsv" : "h264_qsv";
+            reason = pending
+                ? "the av1_qsv test encode has not finished yet, used " + swap + " instead of av1_qsv"
+                : "a test encode with av1_qsv failed on this GPU, used " + swap + " instead of av1_qsv";
+            return swap;
+        }
+
+        /// <summary>The test encode, on the same QSV device a session will use (the detected node).</summary>
+        internal static string Av1QsvProbeArgs(DeviceInit devices = null) =>
+            "-hide_banner -loglevel error" + (devices ?? Devices()).QsvArgs
+            + " -f lavfi -i color=c=black:s=640x360:r=1 -frames:v 1 -vf format=nv12 -c:v av1_qsv -f null -";
+
+        private static bool? _av1Qsv;
+        private static bool _av1QsvKnown;
+        private static DateTime _av1QsvAtUtc;
+        private static int _av1QsvRunning;
+        private static System.Threading.Tasks.Task _av1QsvTask = System.Threading.Tasks.Task.CompletedTask;
+        private static readonly object _av1QsvLock = new object();
+
+        // A usable answer is kept long; a failure and an inconclusive try are asked again soon, so
+        // a GPU that was busy or a timeout does not pin the swap for the life of the process.
+        internal static readonly TimeSpan Av1QsvUsableTtl = TimeSpan.FromHours(1);
+        internal static readonly TimeSpan Av1QsvFailedTtl = TimeSpan.FromMinutes(5);
+        internal static readonly TimeSpan Av1QsvUnknownTtl = TimeSpan.FromMinutes(1);
+
+        /// <summary>Replaces the one-frame AV1 test encode with a ready answer (null = inconclusive); receives the device the caller passed. For the tests.</summary>
+        internal static Func<DeviceInit, bool?> Av1QsvProbeSource { get; set; }
+
+        /// <summary>Replaces the ffmpeg run that the background probe makes, given the render node. For the tests.</summary>
+        internal static Func<string, bool?> Av1QsvRunner { get; set; }
+
+        /// <summary>The clock the probe cache ages by. For the tests.</summary>
+        internal static Func<DateTime> Clock { get; set; }
+
+        /// <summary>The probe in flight, or the last one. The tests await it; nothing else reads it.</summary>
+        internal static System.Threading.Tasks.Task Av1QsvProbeTask => _av1QsvTask;
+
+        private static DateTime NowUtc() => Clock != null ? Clock() : DateTime.UtcNow;
+
+        /// <summary>Forgets what the AV1 probe learned. For the tests.</summary>
+        internal static void ResetAv1QsvProbe()
+        {
+            lock (_av1QsvLock)
+            {
+                _av1Qsv = null;
+                _av1QsvKnown = false;
+                _av1QsvAtUtc = DateTime.MinValue;
+            }
+        }
+
+        /// <summary>
+        /// Whether av1_qsv can open on this GPU, from the last one-frame test encode. This never
+        /// runs ffmpeg: it sits on the transcode path, so it answers from the cache and, when the
+        /// answer is missing or past its time-to-live, starts ONE background probe. Null (nothing
+        /// known yet, or the probe was inconclusive) leaves the encoder choice alone. pending is
+        /// true only until the first probe has produced any answer at all, when the caller guards
+        /// as it did when the probe ran inline.
+        /// </summary>
+        private static bool? Av1QsvUsable(out bool pending, DeviceInit devices = null)
+        {
+            pending = false;
+            if (Av1QsvProbeSource != null)
+            {
+                return Av1QsvProbeSource(devices);
+            }
+
+            bool? value;
+            bool known;
+            DateTime at;
+            lock (_av1QsvLock)
+            {
+                value = _av1Qsv;
+                known = _av1QsvKnown;
+                at = _av1QsvAtUtc;
+            }
+
+            TimeSpan ttl = value == true ? Av1QsvUsableTtl : value == false ? Av1QsvFailedTtl : Av1QsvUnknownTtl;
+            if (!known || NowUtc() - at >= ttl)
+            {
+                StartAv1Probe(devices);
+            }
+
+            pending = !known;
+            return known ? value : null;
+        }
+
+        /// <summary>
+        /// Starts the AV1 test encode in the background unless one is already running, on the QSV
+        /// device the caller's session uses (or, with none given, the one a session would resolve).
+        /// </summary>
+        internal static void StartAv1Probe(DeviceInit devices = null)
+        {
+            if (System.Threading.Interlocked.CompareExchange(ref _av1QsvRunning, 1, 0) != 0)
+            {
+                return;
+            }
+
+            string node = ProbeRenderNode();
+            _av1QsvTask = System.Threading.Tasks.Task.Run(() =>
+            {
+                try
+                {
+                    bool? result = null;
+                    try
+                    {
+                        result = Av1QsvRunner != null ? Av1QsvRunner(node) : RunAv1QsvProbe(devices ?? Devices());
+                    }
+                    catch (Exception)
+                    {
+                        // inconclusive
+                    }
+
+                    lock (_av1QsvLock)
+                    {
+                        _av1Qsv = result;
+                        _av1QsvKnown = true;
+                        _av1QsvAtUtc = NowUtc();
+                    }
+                }
+                finally
+                {
+                    System.Threading.Interlocked.Exchange(ref _av1QsvRunning, 0);
+                }
+            });
+        }
+
+        // The render node the detector found, when it looks like one; the test runner is told which node
+        // the probe is for. (The command line itself is built from the session's DeviceInit, which
+        // validates the node the same way.)
+        private static string ProbeRenderNode()
+        {
+            try
+            {
+                string node = GpuDetector.Current(Settings?.GpuVendor, Settings?.NeuralModelDirectory).RenderNode;
+                return node != null && System.Text.RegularExpressions.Regex.IsMatch(node, "^/dev/dri/renderD[0-9]+$") ? node : null;
+            }
+            catch (Exception)
+            {
+                return null;
+            }
+        }
+
+        private static bool? RunAv1QsvProbe(DeviceInit devices)
+        {
+            var candidates = new List<string>();
+            if (!string.IsNullOrWhiteSpace(_ffmpegPath))
+            {
+                candidates.Add(_ffmpegPath);
+            }
+
+            candidates.Add("/usr/lib/jellyfin-ffmpeg/ffmpeg");
+            candidates.Add("/usr/bin/ffmpeg");
+
+            foreach (string exe in candidates)
+            {
+                try
+                {
+                    if (!File.Exists(exe))
+                    {
+                        continue;
+                    }
+
+                    var psi = new System.Diagnostics.ProcessStartInfo(exe, Av1QsvProbeArgs(devices))
+                    {
+                        RedirectStandardOutput = true,
+                        RedirectStandardError = true,
+                        UseShellExecute = false,
+                    };
+
+                    using (var proc = System.Diagnostics.Process.Start(psi))
+                    {
+                        // Both pipes drained before the wait, as in the other probes here.
+                        var stdoutRead = proc.StandardOutput.ReadToEndAsync();
+                        var stderrRead = proc.StandardError.ReadToEndAsync();
+                        if (!proc.WaitForExit(10000))
+                        {
+                            try
+                            {
+                                proc.Kill();
+                            }
+                            catch (Exception)
+                            {
+                                // already gone
+                            }
+
+                            return null;
+                        }
+
+                        return proc.ExitCode == 0;
+                    }
+                }
+                catch (Exception)
+                {
+                    // try the next candidate
+                }
+            }
+
+            return null;
         }
 
         private static bool? _av1Nvenc;
@@ -2499,16 +3641,54 @@ namespace Jellyfin.Plugin.Plus.Patcher
 
         private static string ChooseEncoder(EncodingJobInfo state, out string reason)
         {
+            // On an Intel server the encoder setting's NVENC default cannot run, so it is treated
+            // as auto, and the reason says so. The NVIDIA path below is the code that existed
+            // before the vendor setting did, and is reached unchanged by every other server.
+            bool intel = IsIntelPath();
+            string configured = Settings?.Encoder;
+            string foreign = null;
+            if (intel && IsNvencEncoder(configured))
+            {
+                foreign = "configured '" + configured.Trim() + "' is an NVIDIA encoder and this server's GPU is Intel; treated as auto: ";
+                configured = "auto";
+            }
+
+            string chosen = ChooseEncoderFor(state, intel, configured, out reason);
+            if (foreign != null)
+            {
+                reason = foreign + reason;
+            }
+
+            return chosen;
+        }
+
+        private static string ChooseEncoderFor(EncodingJobInfo state, bool intel, string configured, out string reason)
+        {
             string clientCodec = ClientCodec(state);
-            string clientEncoder = clientCodec == "h264" ? "h264_nvenc"
+            string pickNote = null;
+            string clientEncoder = intel
+                ? IntelEncoderFor(clientCodec, out pickNote)
+                : clientCodec == "h264" ? "h264_nvenc"
                 : clientCodec == "hevc" ? "hevc_nvenc"
                 : clientCodec == "av1" ? "av1_nvenc"
                 : null;
 
-            string configured = Settings?.Encoder;
-
             if (string.IsNullOrWhiteSpace(configured) || string.Equals(configured.Trim(), "auto", StringComparison.OrdinalIgnoreCase))
             {
+                if (intel)
+                {
+                    // A named codec with no usable encoder is not a reason to hand the client a
+                    // different codec: null leaves Jellyfin's own choice standing.
+                    string picked = clientEncoder == null && clientCodec == null ? IntelEncoderFor("hevc", out pickNote) : clientEncoder;
+                    reason = (clientEncoder != null
+                        ? "Encoder set to auto; following the client-negotiated " + clientCodec + " (" + clientEncoder + ")"
+                        : clientCodec != null
+                            ? "Encoder set to auto and no encoder for the client-negotiated " + clientCodec + " is available"
+                            : "Encoder set to auto and the client named no codec; using " + (picked ?? "Jellyfin's encoder"))
+                        + (pickNote == null ? string.Empty : "; " + pickNote);
+                    return picked;
+                }
+
                 reason = clientEncoder != null
                     ? "Encoder set to auto; following the client-negotiated " + clientCodec
                     : "Encoder set to auto and the client named no codec; using hevc_nvenc";
@@ -2516,25 +3696,34 @@ namespace Jellyfin.Plugin.Plus.Patcher
             }
 
             configured = configured.Trim();
-            string fallback = clientEncoder ?? configured;
+            // On Intel the fallback is only ever an encoder the engine picked from ffmpeg's list;
+            // none means null, and Jellyfin's own choice stands.
+            string fallback = intel ? clientEncoder : clientEncoder ?? configured;
+            string fallbackName = fallback ?? "Jellyfin's encoder";
 
             var available = AvailableEncoders();
             if (available == null)
             {
-                reason = "could not read the ffmpeg encoder list; refused configured '" + configured + "' and used " + fallback;
+                reason = "could not read the ffmpeg encoder list; refused configured '" + configured + "' and used " + fallbackName;
                 return fallback;
             }
 
             if (!available.Contains(configured))
             {
-                reason = "ffmpeg has no encoder '" + configured + "'; used " + fallback;
+                reason = "ffmpeg has no encoder '" + configured + "'; used " + fallbackName;
+                return fallback;
+            }
+
+            if (intel && !EncoderFitsIntelChain(configured))
+            {
+                reason = "configured '" + configured + "' cannot take the system-memory frames this chain ends in (a VA-API encoder needs VA-API frames); used " + fallbackName;
                 return fallback;
             }
 
             string configuredCodec = CodecOf(configured);
             if (configuredCodec == null)
             {
-                reason = "cannot tell what codec '" + configured + "' produces, so cannot check the client supports it; used " + fallback;
+                reason = "cannot tell what codec '" + configured + "' produces, so cannot check the client supports it; used " + fallbackName;
                 return fallback;
             }
 
@@ -2543,7 +3732,7 @@ namespace Jellyfin.Plugin.Plus.Patcher
             {
                 reason = "session supports [" + string.Join(",", supported.OrderBy(x => x))
                     + "] and not " + configuredCodec + "; refused configured '" + configured
-                    + "' and used " + fallback;
+                    + "' and used " + fallbackName;
                 return fallback;
             }
 
@@ -2574,11 +3763,19 @@ namespace Jellyfin.Plugin.Plus.Patcher
         /// sufficient on its own). Retested with both devices present and no libplacebo in the
         /// chain (plain dlpp-alone): unaffected, still EXIT 0, no added cost - declaring a device
         /// the graph never references costs nothing at run time. See livetestbox.md.
+        ///
+        /// The Vulkan device is "vk:0" on every server but a detected Intel one, where it is derived
+        /// from that GPU's render node and a QSV device is pinned to the same node (see Devices),
+        /// read from the plan's own DeviceInit so the command and the record agree. An Intel server
+        /// never gets the CUDA form: Decide has already dropped the levels that use it.
         /// </summary>
-        public static string HwaccelArgs(Plan plan) =>
-            plan != null && plan.UsesCudaNeural
-                ? " -init_hw_device vulkan=vk:0 -filter_hw_device vk -hwaccel cuda -hwaccel_output_format cuda"
-                : " -init_hw_device vulkan=vk:0 -filter_hw_device vk";
+        public static string HwaccelArgs(Plan plan)
+        {
+            DeviceInit devices = plan?.Devices ?? Devices();
+            bool cuda = plan != null && plan.UsesCudaNeural && !devices.Intel;
+            return devices.VulkanArgs + devices.QsvArgs + " -filter_hw_device vk"
+                + (cuda ? " -hwaccel cuda -hwaccel_output_format cuda" : string.Empty);
+        }
 
         /// <summary>
         /// The libplacebo chain for this plan.
@@ -2722,11 +3919,22 @@ namespace Jellyfin.Plugin.Plus.Patcher
 
             AppendLibplaceboSegment(sb, plan, cfg);
 
+            // On an Intel GPU there is no CUDA hand-off (it is a Vulkan-to-CUDA map), so the tail
+            // is always a download, whatever GpuResidentEncode says. ANV's multi-planar YUV output
+            // from libplacebo comes back green (UAVG/VAVG 0, measured on an Arc A380), so libplacebo
+            // outputs RGBA and the CPU converts to yuv420p; the QSV encoder's nv12 is then reached by
+            // the conversion ffmpeg inserts at the graph output. Intel only: NVIDIA keeps its tails.
+            if (IsIntelPath())
+            {
+                sb.Append(":format=rgba,hwdownload,format=rgba,scale=out_color_matrix=bt709:out_range=tv,format=yuv420p");
+                return sb.ToString();
+            }
+
             // Default: bring the frame back to system memory so NVENC re-uploads it itself.
             // GpuResidentEncode instead derives a CUDA device from the existing Vulkan one and
             // hands NVENC the frame without leaving the GPU - see the config page for why this
             // is opt-in rather than the default.
-            sb.Append(cfg?.GpuResidentEncode == true
+            sb.Append(GpuResidentEncodeOn()
                 ? ",hwmap=derive_device=cuda"
                 : ",hwdownload,format=yuv420p");
             return sb.ToString();

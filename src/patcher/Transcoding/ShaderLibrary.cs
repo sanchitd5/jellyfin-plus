@@ -934,6 +934,42 @@ namespace Jellyfin.Plugin.Plus.Patcher
 
         public static bool IsDenoiseLevel(string level) => level != null && _denoiseFilters.ContainsKey(level.Trim());
 
+        /// <summary>
+        /// The OptiX denoise levels (optix, optix-temporal, and the unlisted optix-hdr): the filter
+        /// takes AV_PIX_FMT_CUDA frames, so a server without an NVIDIA GPU cannot run them. Read off
+        /// the filter text, so a new OptiX level is covered by being written the way these are.
+        /// </summary>
+        public static bool IsNvidiaOnlyDenoise(string level) =>
+            level != null
+            && _denoiseFilters.TryGetValue(level.Trim(), out string filter)
+            && filter != null
+            && filter.IndexOf("optix=", StringComparison.OrdinalIgnoreCase) >= 0;
+
+        /// <summary>
+        /// The neural levels that need NVIDIA libraries over CUDA: dlpp-1..4 and vsr-rtcuda (the two
+        /// CUDA-native levels) and the retired Maxine "vsr". The ONNX levels are not here: ort falls
+        /// back to ONNX Runtime's CPU provider without CUDA, which is not CUDA-required (GPU_VENDORS.md 5.3).
+        /// </summary>
+        public static bool IsNvidiaOnlyNeural(string level) =>
+            level != null
+            && (IsCudaNeuralLevel(level) || level.Trim().Equals(VsrLevel, StringComparison.OrdinalIgnoreCase));
+
+        /// <summary>
+        /// The ONNX neural levels (realesr-*): runnable without NVIDIA, but their speed was only measured
+        /// on it, so Intel withholds them until it is measured there (UpscaleEngine.IntelWithholdReason).
+        /// </summary>
+        public static bool IsOnnxNeural(string level) =>
+            level != null
+            && !level.Trim().Equals("off", StringComparison.OrdinalIgnoreCase)
+            && _neuralModels.ContainsKey(level.Trim());
+
+        /// <summary>
+        /// Every game temporal upscaler: dlss and dlaa are NVIDIA's, and fsr2 is fed by NVOFA motion
+        /// vectors through CUDA (gu_inputs.h), so none of the three runs without an NVIDIA GPU.
+        /// </summary>
+        public static bool IsNvidiaOnlyGame(string level) =>
+            IsGameLevel(level) && !level.Trim().Equals("off", StringComparison.OrdinalIgnoreCase);
+
         /// <summary>The full path to a neural level's weights, or null when there is no such level.</summary>
         public static string NeuralModelPath(string level, UpscaleSettings cfg = null)
         {

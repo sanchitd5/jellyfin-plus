@@ -22,7 +22,13 @@ namespace Jellyfin.Plugin.Plus.Patcher
         public static string Apply(object logger, string settingsJson)
         {
             Configure(settingsJson);
+            GpuDetector.Start();
+            UpscaleEngine.WarmDevices();
             UpscalePatches.Apply(logger as ILogger);
+
+            // Off this thread: the encoder list and the AV1 test encode are ffmpeg runs, and the
+            // capability record and the transcode path only read what they leave behind.
+            UpscaleEngine.WarmProbes();
             return UpscalePatches.Status;
         }
 
@@ -90,7 +96,7 @@ namespace Jellyfin.Plugin.Plus.Patcher
         private static Dictionary<string, string> GameLabels(UpscaleSettings cfg)
         {
             var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-            foreach (string level in ShaderLibrary.AvailableGameLevels(cfg))
+            foreach (string level in UpscaleEngine.OfferedOnThisGpu("Game", ShaderLibrary.AvailableGameLevels(cfg)))
             {
                 map[level] = ShaderLibrary.GameLabel(level);
             }
@@ -102,7 +108,7 @@ namespace Jellyfin.Plugin.Plus.Patcher
         private static Dictionary<string, string> NeuralLabels(UpscaleSettings cfg)
         {
             var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-            foreach (string level in ShaderLibrary.AvailableNeuralLevels(cfg))
+            foreach (string level in UpscaleEngine.OfferedOnThisGpu("Neural", ShaderLibrary.AvailableNeuralLevels(cfg)))
             {
                 map[level] = ShaderLibrary.NeuralLabel(level);
             }
@@ -125,11 +131,14 @@ namespace Jellyfin.Plugin.Plus.Patcher
         private static Dictionary<string, object> Levels()
         {
             var cfg = UpscaleEngine.Settings;
-            return new Dictionary<string, object>
+            var levels = new Dictionary<string, object>
             {
                 ["Sr"] = ShaderLibrary.AvailableSrLevels(cfg),
                 ["Deblur"] = ShaderLibrary.AvailableDeblurLevels(cfg),
-                ["Denoise"] = ShaderLibrary.AvailableDenoiseLevels(),
+                // The OptiX levels are withheld on a detected Intel GPU (UpscaleEngine.OfferedOnThisGpu),
+                // as are the neural and game levels that need NVIDIA below; the list is unchanged on
+                // every other server.
+                ["Denoise"] = UpscaleEngine.OfferedOnThisGpu("Denoise", ShaderLibrary.AvailableDenoiseLevels()),
 
                 // Compression cleanup, ahead of any enlargement, and gated by its master switch for
                 // the same reason Neural, Game, Refine and Chroma are: Decide would force a level
@@ -145,7 +154,7 @@ namespace Jellyfin.Plugin.Plus.Patcher
                 // and Chroma are gated below: Decide would force the level back to off anyway.
                 ["Neural"] = cfg?.NeuralAllowed == false
                     ? new List<string> { "off" }
-                    : ShaderLibrary.AvailableNeuralLevels(cfg),
+                    : UpscaleEngine.OfferedOnThisGpu("Neural", ShaderLibrary.AvailableNeuralLevels(cfg)),
 
                 // Per-level wording for the two CUDA-native levels (dlpp-1..4, vsr-rtcuda) - the
                 // DEGRADED / "not a network" framing belongs here, server-side, same rule as
@@ -159,7 +168,7 @@ namespace Jellyfin.Plugin.Plus.Patcher
                 // Gated by its master switch too, for the same reason.
                 ["Game"] = cfg?.GameAllowed == false
                     ? new List<string> { "off" }
-                    : ShaderLibrary.AvailableGameLevels(cfg),
+                    : UpscaleEngine.OfferedOnThisGpu("Game", ShaderLibrary.AvailableGameLevels(cfg)),
                 ["GameLabels"] = GameLabels(cfg),
 
                 // The three synthesised-input options of those upscalers, their allowed values and
@@ -175,7 +184,7 @@ namespace Jellyfin.Plugin.Plus.Patcher
                 // Every one of these reads the configured directories, not the built-in defaults:
                 // the probe builds the panel, so a probe answering from different paths than the
                 // transcode reads would offer levels whose weights are not where the filter looks.
-                ["GameOptionLevels"] = ShaderLibrary.GameOptionLevels(cfg),
+                ["GameOptionLevels"] = UpscaleEngine.OfferedOnThisGpu("Game", ShaderLibrary.GameOptionLevels(cfg)),
 
                 // Two axes of their own, not extra rungs of the SR list: the refinement pass
                 // hooks POSTKERNEL and the chroma pass hooks CHROMA, so each composes with
@@ -199,18 +208,76 @@ namespace Jellyfin.Plugin.Plus.Patcher
                 // script would drift away from the dashboard the first time anyone tuned one.
                 ["MaxTargetHeight"] = cfg?.MaxTargetHeight ?? 0,
                 ["Upscalers"] = ShaderLibrary.Upscalers,
+
+                // The GPU capability record: what vendor this server has and what that vendor's
+                // The GPU capability record: what vendor this server has and what that vendor's
+                // chain can use. On a detected Intel GPU it also decides the Denoise, Neural and
+                // Game lists above (the NVIDIA-only levels are left out) and the Vulkan device. The
+                // summary only: this is served to every authenticated user, and the full record
+                // (device paths, PCI ids) is for Status.
+                ["Gpu"] = GpuPublic(),
             };
+
+            // Why a level is missing from the lists above, only where one is: an Intel server. The
+            // key is absent everywhere else, so the NVIDIA probe is what it always was.
+            var withheld = UpscaleEngine.WithheldLevels(cfg);
+            if (withheld.Count > 0)
+            {
+                levels["Withheld"] = withheld;
+            }
+
+            return levels;
+        }
+
+        /// <summary>The full GPU capability record under the current GpuVendor setting, for the administrator-only status route. Never throws.</summary>
+        private static GpuCapability Gpu()
+        {
+            return UpscaleEngine.Capability();
+        }
+
+        /// <summary>
+        /// The GPU capability record as JSON, for the plugin side (the load route tells NVIDIA from
+        /// Intel by it; only the vendor leaves that route). Primitives only across the load-context
+        /// boundary, like everything here.
+        /// </summary>
+        public static string GpuJson() => JsonSerializer.Serialize(Gpu());
+
+        /// <summary>The non-sensitive subset of the GPU record, for routes any authenticated user can reach. Never throws.</summary>
+        private static GpuSummary GpuPublic() => UpscaleEngine.CapabilitySummary();
+
+        /// <summary>
+        /// The session record as any authenticated user may read it: without the render-node paths
+        /// (<see cref="SessionRecord.VulkanDevice"/> and <see cref="SessionRecord.QsvDevice"/> name
+        /// the node). AGENTS.md invariant 13: those are for the administrator-only Status route,
+        /// which serves the records whole.
+        /// </summary>
+        private static System.Text.Json.Nodes.JsonObject PublicRecord(SessionRecord record)
+        {
+            var node = JsonSerializer.SerializeToNode(record) as System.Text.Json.Nodes.JsonObject;
+            node?.Remove("VulkanDevice");
+            node?.Remove("QsvDevice");
+            return node;
         }
 
         /// <summary>Status plus recent sessions, as JSON.</summary>
         public static string StatusJson()
         {
-            return JsonSerializer.Serialize(new Dictionary<string, object>
+            var status = new Dictionary<string, object>
             {
                 ["PatchActive"] = UpscalePatches.Active,
                 ["PatchStatus"] = UpscalePatches.Status,
+                ["Gpu"] = Gpu(),
                 ["Sessions"] = UpscaleEngine.History,
-            });
+            };
+
+            // Absent unless a detected Intel GPU withholds levels, so NVIDIA's status is unchanged.
+            var withheld = UpscaleEngine.WithheldLevels(UpscaleEngine.Settings);
+            if (withheld.Count > 0)
+            {
+                status["Withheld"] = withheld;
+            }
+
+            return JsonSerializer.Serialize(status);
         }
 
         /// <summary>
@@ -277,7 +344,7 @@ namespace Jellyfin.Plugin.Plus.Patcher
             {
                 ["PatchActive"] = UpscalePatches.Active,
                 ["Known"] = true,
-                ["Record"] = record,
+                ["Record"] = PublicRecord(record),
                 ["UpscaleApplied"] = record.UpscaleApplied,
                 ["DeblurApplied"] = record.DeblurApplied,
                 ["DenoiseApplied"] = record.DenoiseApplied,
@@ -321,6 +388,8 @@ namespace Jellyfin.Plugin.Plus.Patcher
                 // above still serves them, and that is the branch the probe takes.
                 ["Encoder"] = record.Encoder,
                 ["EncoderReason"] = record.EncoderReason,
+                ["Gpu"] = record.Gpu,
+                ["GpuResidentEncode"] = record.GpuResidentEncode,
                 ["Status"] = record.Status,
                 ["Summary"] = record.Summary,
             });

@@ -158,9 +158,23 @@ namespace Jellyfin.Plugin.Plus.Configuration
         /// <summary>
         /// Encoder used when this plugin forces a transcode. Blank or "auto" follows the codec the
         /// client negotiated. A named encoder applies only when ffmpeg has it and the session
-        /// declared that codec playable; otherwise the client-negotiated codec is used.
+        /// declared that codec playable; otherwise the client-negotiated codec is used. On an
+        /// Intel GPU an NVENC name (the default included) is treated as auto and the QSV encoder
+        /// for the codec is used.
         /// </summary>
         public string Encoder { get; set; } = "hevc_nvenc";
+
+        /// <summary>
+        /// Which GPU vendor the plugin treats this server as having: auto, nvidia, intel or none.
+        /// Auto detects it from /sys/class/drm/renderD*/device/vendor (0x10de NVIDIA, 0x8086 Intel),
+        /// with /proc/driver/nvidia or nvidia-smi as the tie-breaker, and picks NVIDIA first when
+        /// both are present, so an install that already works is unchanged. The value feeds the
+        /// GPU capability record shown on the dashboard, the probe and the session record, and,
+        /// when an Intel GPU is actually found, picks the QSV encoder and turns the GPU-resident
+        /// hand-off off. A vendor chosen and not found changes no command line. See
+        /// docs/architecture/GPU_VENDORS.md.
+        /// </summary>
+        public string GpuVendor { get; set; } = "auto";
 
         /// <summary>Turn a would-be video stream copy into a real transcode even without a session request.</summary>
         public bool ForceTranscode { get; set; }

@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# test-gpu-vendor.sh - tests for GPU vendor detection and for "report only".
+#
+#   scripts/test-gpu-vendor.sh /path/to/jfbin
+#
+# jfbin is a directory holding the server's own MediaBrowser.*.dll (a copy of the server's
+# /usr/lib/jellyfin/bin, see CLAUDE.md "Deploying"). The harness compiles the real patcher sources
+# against them (scripts/gpu-vendor-harness), so it needs no GPU and no running Jellyfin.
+#
+# What it proves (docs/architecture/GPU_VENDORS.md, PR 1, PR 2 and PR 3):
+#   - the PCI vendor ids map to the right vendor (0x10de NVIDIA, 0x8086 Intel, anything else none);
+#   - auto picks NVIDIA first, the explicit settings override it, a vendor that was chosen and not
+#     found reports Detected=false instead of claiming a capability;
+#   - the real sysfs reader works on a fake sysfs tree, and ignores a node with no /dev entry;
+#   - with GpuVendor set to ANY value, and no Intel GPU that was actually seen, HwaccelArgs,
+#     BuildChain and EncoderFor return exactly what they returned before the setting existed (the
+#     NVIDIA command lines are byte-identical), on a no-GPU, an NVIDIA and a mixed machine;
+#   - (PR 2) with an Intel GPU seen, the encoder is QSV (software when ffmpeg lists none), a VA-API
+#     encoder is refused, an NVENC setting is treated as auto, the chain never ends in the CUDA
+#     hand-off, and nothing emitted contains nvenc, cuda or vaapi;
+#   - (PR 2) the DRM fdinfo reader (i915 and xe fixtures, a fake /proc), the idle-residency reader,
+#     and GET /JellyfinPlus/Gpu/Load through the real controller;
+#   - (PR 3) on a no-GPU, an NVIDIA and a mixed machine the Vulkan device stays "vulkan=vk:0", the
+#     render-node test never runs, and the probe (the same keys and level lists as ShaderLibrary
+#     offers) and the status route carry nothing new; with an Intel GPU seen the Vulkan device is
+#     derived from its render node (never vk:0), falls back to vk:0 when the test start fails, a
+#     QSV device is pinned only above renderD135, a two-GPU machine gets the node of the vendor
+#     that was chosen, the NVIDIA-only levels (optix, dlpp, vsr-rtcuda, fsr2, dlss, dlaa) are
+#     withheld from the probe and not run on Intel, with the reason in the probe and the session
+#     record, and an NVIDIA session with the same request runs them;
+#   - (PR 3) the shim's optional render_node (scripts/test-shim-device.py, when python3 is present).
+#
+# Exit status: 0 every check passed, 1 a check failed, 2 the harness could not be built.
+set -uo pipefail
+
+JFBIN="${1:-}"
+[ -d "$JFBIN" ] || { echo "test-gpu-vendor: '$JFBIN' is not a directory (pass the server's bin dir with MediaBrowser.*.dll)" >&2; exit 2; }
+command -v dotnet >/dev/null || { echo "test-gpu-vendor: dotnet SDK not found" >&2; exit 2; }
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+OUT="$(mktemp -d "${TMPDIR:-/tmp}/gpu-vendor-harness.XXXXXX")"
+trap 'rm -rf "$OUT"' EXIT
+
+dotnet build "$HERE/gpu-vendor-harness/GpuVendorHarness.csproj" -c Release \
+    -p:JellyfinBin="$(cd "$JFBIN" && pwd)" -o "$OUT" --nologo -v q || { echo "test-gpu-vendor: build failed" >&2; exit 2; }
+
+# The harness prints one PASS line per check (1100+); show only failures and the count unless VERBOSE=1.
+dotnet "$OUT/GpuVendorHarness.dll" | { if [ -n "${VERBOSE:-}" ]; then cat; else grep -v '^PASS  '; fi; }
+status="${PIPESTATUS[0]}"
+
+if command -v python3 >/dev/null; then
+    echo
+    echo "shim device arguments (scripts/test-shim-device.py)"
+    python3 -I "$HERE/test-shim-device.py" || status=1
+    echo
+    echo "shim filter chain per vendor (scripts/test_shim_chain.py)"
+    python3 -I "$HERE/test_shim_chain.py" || status=1
+else
+    echo
+    echo "test-gpu-vendor: python3 not found, so the shim device checks (scripts/test-shim-device.py) were NOT run"
+fi
+
+exit "$status"
