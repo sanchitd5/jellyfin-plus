@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Linq;
@@ -100,7 +99,7 @@ namespace Jellyfin.Plugin.Plus.Patcher
         /// <summary>The GpuVendor setting, normalised: auto, nvidia, intel or none.</summary>
         public string Setting { get; set; } = GpuVendors.Auto;
 
-        /// <summary>True when hardware of <see cref="Vendor"/> was actually seen (a render node, the NVIDIA driver, or nvidia-smi).</summary>
+        /// <summary>True when hardware of <see cref="Vendor"/> was actually seen (a render node, or for NVIDIA an NVIDIA device in the container).</summary>
         public bool Detected { get; set; }
 
         /// <summary>The render node of the chosen vendor, or null: an NVIDIA GPU without nvidia_drm has none.</summary>
@@ -163,7 +162,7 @@ namespace Jellyfin.Plugin.Plus.Patcher
 
     /// <summary>
     /// The three things detection asks the machine, behind an interface so the decision can be
-    /// tested without a GPU. The real one reads sysfs, /proc and nvidia-smi.
+    /// tested without a GPU. The real one reads sysfs and /dev.
     /// </summary>
     public interface IGpuEnvironment
     {
@@ -176,11 +175,11 @@ namespace Jellyfin.Plugin.Plus.Patcher
         /// <summary>The path to report for a node.</summary>
         string DevicePath(string node);
 
-        /// <summary>True when the NVIDIA kernel driver is loaded (/proc/driver/nvidia).</summary>
-        bool NvidiaDriverLoaded();
-
-        /// <summary>True when nvidia-smi runs and lists a GPU. Slow, so asked last and only when nothing else answered.</summary>
-        bool NvidiaSmiLists();
+        /// <summary>
+        /// True when this container holds an NVIDIA device (/dev/nvidiactl or /dev/nvidia[0-9]*). /proc/driver
+        /// and nvidia-smi describe the host, so a pod with only an Intel GPU would wrongly count as NVIDIA.
+        /// </summary>
+        bool NvidiaDevicePresent();
 
         /// <summary>True when the file exists.</summary>
         bool FileExists(string path);
@@ -191,21 +190,19 @@ namespace Jellyfin.Plugin.Plus.Patcher
     {
         private readonly string _drmRoot;
         private readonly string _devRoot;
-        private readonly string _procNvidia;
-        private readonly Func<bool> _smi;
+        private readonly string _nvidiaDevRoot;
 
         public SystemGpuEnvironment()
-            : this("/sys/class/drm", "/dev/dri", "/proc/driver/nvidia", null)
+            : this("/sys/class/drm", "/dev/dri", "/dev")
         {
         }
 
-        /// <param name="smi">Replaces the nvidia-smi probe; null runs the real one.</param>
-        public SystemGpuEnvironment(string drmRoot, string devRoot, string procNvidia, Func<bool> smi)
+        /// <param name="nvidiaDevRoot">Where nvidiactl and nvidia[0-9]* live (/dev).</param>
+        public SystemGpuEnvironment(string drmRoot, string devRoot, string nvidiaDevRoot)
         {
             _drmRoot = drmRoot;
             _devRoot = devRoot;
-            _procNvidia = procNvidia;
-            _smi = smi;
+            _nvidiaDevRoot = nvidiaDevRoot;
         }
 
         public IReadOnlyList<string> RenderNodes()
@@ -233,7 +230,7 @@ namespace Jellyfin.Plugin.Plus.Patcher
             }
             catch (Exception)
             {
-                // an unreadable tree is an empty one; the tie-breakers still get asked
+                // an unreadable tree is an empty one; the NVIDIA device check still runs
             }
 
             // renderD128 before renderD129, numerically: the first node is the one the kernel
@@ -255,55 +252,20 @@ namespace Jellyfin.Plugin.Plus.Patcher
 
         public string DevicePath(string node) => _devRoot.TrimEnd('/') + "/" + node;
 
-        public bool NvidiaDriverLoaded()
+        public bool NvidiaDevicePresent()
         {
             try
             {
-                return Directory.Exists(_procNvidia);
-            }
-            catch (Exception)
-            {
-                return false;
-            }
-        }
-
-        public bool NvidiaSmiLists()
-        {
-            if (_smi != null)
-            {
-                return _smi();
-            }
-
-            try
-            {
-                var psi = new ProcessStartInfo("nvidia-smi", "-L")
+                if (File.Exists(Path.Combine(_nvidiaDevRoot, "nvidiactl")))
                 {
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    UseShellExecute = false,
-                };
-
-                using (var proc = Process.Start(psi))
-                {
-                    // Both pipes drained before the wait, as in UpscaleEngine's other probes.
-                    var stdout = proc.StandardOutput.ReadToEndAsync();
-                    var stderr = proc.StandardError.ReadToEndAsync();
-                    if (!proc.WaitForExit(3000))
-                    {
-                        try
-                        {
-                            proc.Kill();
-                        }
-                        catch (Exception)
-                        {
-                            // already gone
-                        }
-
-                        return false;
-                    }
-
-                    return proc.ExitCode == 0 && stdout.Result.IndexOf("GPU ", StringComparison.Ordinal) >= 0;
+                    return true;
                 }
+
+                // nvidia[0-9]* only: nvidia-uvm and nvidia-caps are not a GPU.
+                return Directory.Exists(_nvidiaDevRoot)
+                    && Directory.EnumerateFileSystemEntries(_nvidiaDevRoot, "nvidia*")
+                        .Select(Path.GetFileName)
+                        .Any(n => n.Length > "nvidia".Length && char.IsDigit(n["nvidia".Length]));
             }
             catch (Exception)
             {
@@ -466,7 +428,7 @@ namespace Jellyfin.Plugin.Plus.Patcher
 
             GpuDevice nvidiaNode = inv.Devices.FirstOrDefault(d => d.Vendor == GpuVendors.Nvidia);
             GpuDevice intelNode = inv.Devices.FirstOrDefault(d => d.Vendor == GpuVendors.Intel);
-            bool nvidiaSeen = nvidiaNode != null || inv.NvidiaDriverLoaded || inv.NvidiaSmiLists;
+            bool nvidiaSeen = nvidiaNode != null || inv.NvidiaDevice;
             bool intelSeen = intelNode != null;
 
             string vendor;
@@ -484,8 +446,8 @@ namespace Jellyfin.Plugin.Plus.Patcher
             {
                 vendor = GpuVendors.Nvidia;
                 reason = nvidiaSeen
-                    ? "GpuVendor is nvidia and an NVIDIA GPU was found" + WhyNvidia(nvidiaNode, inv)
-                    : "GpuVendor is nvidia but no NVIDIA GPU was found (no render node, no /proc/driver/nvidia, nvidia-smi lists none)";
+                    ? "GpuVendor is nvidia and an NVIDIA GPU was found" + WhyNvidia(nvidiaNode)
+                    : "GpuVendor is nvidia but no NVIDIA GPU was found (no NVIDIA render node, no /dev/nvidiactl or /dev/nvidia[0-9]* in this container)";
             }
             else if (chosen == GpuVendors.Intel)
             {
@@ -499,7 +461,7 @@ namespace Jellyfin.Plugin.Plus.Patcher
                 // NVIDIA first, so a server that already works keeps working when an Intel card
                 // is added beside it: the setting that existed before this one means nvidia.
                 vendor = GpuVendors.Nvidia;
-                reason = "auto: NVIDIA GPU found" + WhyNvidia(nvidiaNode, inv)
+                reason = "auto: NVIDIA GPU found" + WhyNvidia(nvidiaNode)
                     + (intelSeen ? "; an Intel GPU is also present and is not used (set GpuVendor to intel to choose it)" : string.Empty);
             }
             else if (intelSeen)
@@ -510,7 +472,7 @@ namespace Jellyfin.Plugin.Plus.Patcher
             else
             {
                 vendor = GpuVendors.None;
-                reason = "auto: no NVIDIA or Intel GPU found (no usable render node, no /proc/driver/nvidia, nvidia-smi lists none)";
+                reason = "auto: no NVIDIA or Intel GPU found (no usable render node, no /dev/nvidiactl or /dev/nvidia[0-9]* in this container)";
             }
 
             var cap = new GpuCapability
@@ -541,15 +503,10 @@ namespace Jellyfin.Plugin.Plus.Patcher
             return cap;
         }
 
-        private static string WhyNvidia(GpuDevice node, Inventory inv)
-        {
-            if (node != null)
-            {
-                return " (render node " + node.RenderNode + ")";
-            }
-
-            return inv.NvidiaDriverLoaded ? " (/proc/driver/nvidia, no render node)" : " (nvidia-smi, no render node)";
-        }
+        private static string WhyNvidia(GpuDevice node)
+            => node != null
+                ? " (render node " + node.RenderNode + ")"
+                : " (/dev/nvidia* device in the container, no render node)";
 
         private static bool OpenVinoProvider(string neuralModelDirectory, IGpuEnvironment env)
         {
@@ -567,18 +524,16 @@ namespace Jellyfin.Plugin.Plus.Patcher
             }
         }
 
-        /// <summary>What the machine said, once. nvidia-smi is asked only when no node and no driver answered.</summary>
+        /// <summary>What the machine said, once.</summary>
         private sealed class Inventory
         {
             public List<GpuDevice> Devices { get; private set; }
 
-            public bool NvidiaDriverLoaded { get; private set; }
-
-            public bool NvidiaSmiLists { get; private set; }
+            public bool NvidiaDevice { get; private set; }
 
             /// <summary>False means nothing usable was seen: possibly a driver still loading, so the answer is retried.</summary>
             public bool AnySupportedGpu
-                => NvidiaDriverLoaded || NvidiaSmiLists || Devices.Any(d => d.Vendor != null);
+                => NvidiaDevice || Devices.Any(d => d.Vendor != null);
 
             public static Inventory Gather(IGpuEnvironment env)
             {
@@ -594,9 +549,7 @@ namespace Jellyfin.Plugin.Plus.Patcher
                     });
                 }
 
-                inv.NvidiaDriverLoaded = env.NvidiaDriverLoaded();
-                bool answered = inv.NvidiaDriverLoaded || inv.Devices.Any(d => d.Vendor == GpuVendors.Nvidia);
-                inv.NvidiaSmiLists = !answered && env.NvidiaSmiLists();
+                inv.NvidiaDevice = env.NvidiaDevicePresent();
                 return inv;
             }
         }
