@@ -5019,16 +5019,21 @@ namespace Jellyfin.Plugin.Plus.Patcher
 
             AppendLibplaceboSegment(sb, plan, cfg);
 
+            // On an Intel GPU there is no CUDA hand-off (it is a Vulkan-to-CUDA map), so the tail
+            // is always a download, whatever GpuResidentEncode says. ANV's multi-planar YUV output
+            // from libplacebo comes back green (UAVG/VAVG 0, measured on an Arc A380), so libplacebo
+            // outputs RGBA and the CPU converts to yuv420p; the QSV encoder's nv12 is then reached by
+            // the conversion ffmpeg inserts at the graph output. Intel only: NVIDIA keeps its tails.
+            if (IsIntelPath())
+            {
+                sb.Append(":format=rgba,hwdownload,format=rgba,scale=out_color_matrix=bt709:out_range=tv,format=yuv420p");
+                return sb.ToString();
+            }
+
             // Default: bring the frame back to system memory so NVENC re-uploads it itself.
             // GpuResidentEncode instead derives a CUDA device from the existing Vulkan one and
             // hands NVENC the frame without leaving the GPU - see the config page for why this
             // is opt-in rather than the default.
-            //
-            // On an Intel GPU there is no such hand-off (it is a Vulkan-to-CUDA map), so the tail
-            // is always the download, whatever GpuResidentEncode says. It stays yuv420p: hwdownload
-            // yields the Vulkan frames' own format, which libplacebo leaves as the input's, and the
-            // QSV encoder's nv12 is reached by the conversion ffmpeg inserts at the graph output.
-            // The tail is therefore the string NVIDIA's non-resident path already uses.
             sb.Append(GpuResidentEncodeOn()
                 ? ",hwmap=derive_device=cuda"
                 : ",hwdownload,format=yuv420p");
