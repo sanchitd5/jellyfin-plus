@@ -39,9 +39,11 @@ only, params are a wire contract, no library content in the repo.
 Five custom ffmpeg filters live in a **separate patched binary** beside the stock one:
 `vf_oidn`, `vf_optix`, `vf_ort`, `vf_fsr2`, `vf_dlss`. The shim routes per session and asks the binary
 which filters it carries, stripping nodes it lacks - so a rebuild that drops a `vf_*.c` degrades
-gracefully instead of failing every session. **If you rebuild that binary, all five must survive.**
-Check `-filters` afterwards. `scripts/proxmox-build.sh --with-ffmpeg` builds it, verifies all five
-are present, and keeps the previous binary at `<binary>.prev` whether it succeeds or fails.
+gracefully instead of failing every session. **If you rebuild that binary, every filter its vendor
+requires must survive:** all five for `GPU_VENDOR=nvidia` (the default), `oidn` and `ort` for
+`GPU_VENDOR=intel`, plus `fsr2` when built with `WITH_FSR2=1` (one list, `scripts/ffmpeg-vendor.sh`).
+Check `-filters` afterwards. `scripts/proxmox-build.sh --with-ffmpeg` builds it, verifies the vendor's set is
+present, and keeps the previous binary at `<binary>.prev` whether it succeeds or fails.
 
 **A filter being present does not mean it runs, and the two binaries disagree in both directions.**
 `nlmeans_vulkan` exists in both and, before shaderc was built from source, compiled only in the
@@ -217,7 +219,7 @@ exist.
 
 `scripts/proxmox-build.sh` does the whole thing on the server: fetch, build both assemblies,
 optionally rebuild ffmpeg with `--with-ffmpeg`, stage, end in-flight transcodes, restart, publish the
-client. It refuses to deploy an ffmpeg missing any of the five filters and restores the previous one.
+client. It refuses to deploy an ffmpeg missing any filter its `GPU_VENDOR` requires (five on nvidia) and restores the previous one.
 
 **The cache-buster in `scripts/jellyfin-plus-webinject` is no longer a hand-bumped integer**
 (as of the `real-es-modules` pass, 2026-09-24). It used to be `VERSION=N`, manually incremented,

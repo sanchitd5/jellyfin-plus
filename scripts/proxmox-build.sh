@@ -8,10 +8,15 @@
 #   --branch=NAME        branch to build (default main)
 #   --jellyfin-bin=DIR   Jellyfin's assemblies (default /usr/lib/jellyfin/bin)
 #   --dotnet-root=DIR    dotnet SDK (default /opt/dotnet)
-#   --with-ffmpeg        rebuild the patched ffmpeg carrying the five custom filters (slow)
+#   --with-ffmpeg        rebuild the patched ffmpeg carrying the custom filters (slow): the five on
+#                        GPU_VENDOR=nvidia (default), oidn and ort on GPU_VENDOR=intel (plus fsr2 with WITH_FSR2=1)
 #   --with-shaders       re-fetch and re-derive the shader set
 #   --no-activate        build and stage only, leave the running server alone
 #   --keep-transcodes    refuse to restart while transcodes are in flight, instead of ending them
+#
+# GPU_VENDOR=intel with --with-ffmpeg builds the Intel Arc variant (scripts/build-ffmpeg.sh has the
+# details); the filters it must carry come from scripts/ffmpeg-vendor.sh, the one list both scripts read.
+# It refuses to replace a binary that carries optix (an NVIDIA build) unless ALLOW_VENDOR_SWITCH=1.
 #
 # Ordering is the whole point. Everything that can fail happens before anything the running
 # server can see, and the client script is published only after the server half is live, because
@@ -45,7 +50,7 @@ for arg in "$@"; do
         --with-shaders)     WITH_SHADERS=1 ;;
         --no-activate)      ACTIVATE=0 ;;
         --keep-transcodes)  KEEP_TRANSCODES=1 ;;
-        -h|--help)          sed -n '2,19p' "$0"; exit 0 ;;
+        -h|--help)          sed -n '2,23p' "$0"; exit 0 ;;
         *) echo "unknown option: $arg" >&2; exit 2 ;;
     esac
 done
@@ -104,13 +109,25 @@ if [ "$WITH_FFMPEG" = "1" ]; then
         echo "==> FAILED: WITH_MAXINE_VSR=1 but Maxine vsr is retired (set MAXINE_VSR_UNRETIRE=1 to override)" >&2
         exit 1
     fi
+    . ./scripts/ffmpeg-vendor.sh
+    GPU_VENDOR="${GPU_VENDOR:-nvidia}"
+    if ! ffmpeg_vendor_valid "$GPU_VENDOR"; then
+        echo "==> FAILED: GPU_VENDOR must be nvidia or intel, not '$GPU_VENDOR'" >&2
+        exit 1
+    fi
+    # Before the snapshot and the build: a mistyped GPU_VENDOR=intel must not replace an NVIDIA binary.
+    ffmpeg_vendor_switch_guard "$GPU_VENDOR" "$PATCHED_FFMPEG" || exit 1
+    # The NVIDIA-only filters default on for nvidia and off for intel, where build-ffmpeg.sh refuses them.
+    # fsr2 is off on intel too, but build-ffmpeg.sh allows it there (it needs the out-of-tree FSR2 SDK build).
+    nv_default=1
+    [ "$GPU_VENDOR" = "intel" ] && nv_default=0
     if [ -f "$PATCHED_FFMPEG" ]; then
         cp -a "$PATCHED_FFMPEG" "$PATCHED_FFMPEG.prev"
         echo "    previous binary saved as $PATCHED_FFMPEG.prev"
     fi
 
     # Every filter switched on, because the check below refuses to deploy a binary missing any of
-    # them. Asking for one and then demanding five is how this script spent a build producing a
+    # them. Asking for one and then demanding the full set is how this script spent a build producing a
     # binary it then rejected. build-ffmpeg.sh fails in preflight, in seconds, when an SDK is not
     # where it expects, and each WITH_* and SDK path here can be overridden from the environment.
     # build-ffmpeg.sh's own verify step `die`s on a missing filter, which under this script's
@@ -125,14 +142,15 @@ if [ "$WITH_FFMPEG" = "1" ]; then
     # AGENTS.md is explicit these two are not part of the mandatory five, so a box missing
     # their DLLs still gets a valid deploy, just without dlpp_rtcuda/vsr_rtcuda compiled in.
     PREFIX="$FFMPEG_PREFIX" \
+        GPU_VENDOR="$GPU_VENDOR" \
         WITH_OIDN="${WITH_OIDN:-1}" \
-        WITH_OPTIX="${WITH_OPTIX:-1}" \
+        WITH_OPTIX="${WITH_OPTIX:-$nv_default}" \
         WITH_ORT="${WITH_ORT:-1}" \
-        WITH_FSR2="${WITH_FSR2:-1}" \
-        WITH_DLSS="${WITH_DLSS:-1}" \
+        WITH_FSR2="${WITH_FSR2:-$nv_default}" \
+        WITH_DLSS="${WITH_DLSS:-$nv_default}" \
         WITH_MAXINE_VSR="${WITH_MAXINE_VSR:-0}" \
-        WITH_RTXDLPP="${WITH_RTXDLPP:-1}" \
-        WITH_RTXVSR="${WITH_RTXVSR:-1}" \
+        WITH_RTXDLPP="${WITH_RTXDLPP:-$nv_default}" \
+        WITH_RTXVSR="${WITH_RTXVSR:-$nv_default}" \
         OPTIX_SDK="${OPTIX_SDK:-/root/gameupscale/optix-dev-8.1.0}" \
         ./scripts/build-ffmpeg.sh || build_rc=$?
 
@@ -156,7 +174,9 @@ if [ "$WITH_FFMPEG" = "1" ]; then
         exit 1
     }
 
-    required_filters="oidn optix ort fsr2 dlss"
+    required_filters="$(ffmpeg_required_filters "$GPU_VENDOR")"
+    # intel does not require fsr2 by default, but a build that was asked for it must carry it.
+    [ "$GPU_VENDOR" = "intel" ] && [ "${WITH_FSR2:-0}" = "1" ] && required_filters="$required_filters fsr2"
     [ "${WITH_MAXINE_VSR:-0}" = "1" ] && required_filters="$required_filters vsr"
     # Capture the list once. Piping ffmpeg into `grep -q` under pipefail reports failure whenever
     # grep exits on its first match while ffmpeg is still writing (SIGPIPE, status 141), so a
@@ -179,7 +199,11 @@ if [ "$WITH_FFMPEG" = "1" ]; then
         fi
         exit 1
     fi
-    echo "    all five custom filters present$([ "${WITH_MAXINE_VSR:-0}" = "1" ] && echo ", plus vsr")"
+    if [ "$GPU_VENDOR" = "nvidia" ]; then
+        echo "    all five custom filters present$([ "${WITH_MAXINE_VSR:-0}" = "1" ] && echo ", plus vsr")"
+    else
+        echo "    all required filters present ($required_filters)"
+    fi
     # The snapshot STAYS. Deleting it on success left no way back from the case this check cannot
     # see: a binary that builds, installs and lists all five filters, and then fails against the
     # driver on the first frame. OptiX, NGX and NVOFA all negotiate at runtime, so linking proves

@@ -37,6 +37,16 @@
  *
  * Inference is synchronous and one frame at a time: these are small models and
  * the queueing machinery would buy nothing.  Pack and unpack are slice threaded.
+ *
+ * Three execution providers: CUDA (the default), CPU, and OpenVINO on an Intel GPU
+ * (device=openvino).  The OpenVINO provider is a separate shared object that ONNX
+ * Runtime loads when SessionOptionsAppendExecutionProvider_OpenVINO_V2 is called, so
+ * this file links nothing from OpenVINO and needs only onnxruntime_c_api.h.  An ONNX
+ * Runtime build carries the CUDA provider or the OpenVINO one, not both, so a binary
+ * is built for one of them (scripts/build-ffmpeg.sh ORT_EP).  OpenVINO is Apache-2.0
+ * and is what makes a binary that carries it GPLv3, as the OIDN build already is; this
+ * file stays LGPL-2.1-or-later.  Every provider failure warns and runs on the CPU
+ * rather than failing the session.  See docs/architecture/GPU_VENDORS.md 5.4.
  */
 
 #include "libavutil/mem.h"
@@ -48,11 +58,13 @@
 
 #include <onnxruntime_c_api.h>
 
+enum { ORT_DEVICE_CUDA = 0, ORT_DEVICE_CPU = 1, ORT_DEVICE_OPENVINO = 2 };
+
 typedef struct ORTContext {
     const AVClass *class;
 
     char *model;
-    int   device;        /* 0 = cuda, 1 = cpu */
+    int   device;        /* ORT_DEVICE_CUDA, ORT_DEVICE_CPU or ORT_DEVICE_OPENVINO */
     int   device_id;
     int   scale;         /* 0 = probe the model */
     int   fp16;
@@ -62,6 +74,7 @@ typedef struct ORTContext {
     OrtEnv         *env;
     OrtSessionOptions *opts;
     OrtSession     *session;
+    int             ep_openvino;   /* the OpenVINO provider is on s->opts */
     OrtMemoryInfo  *meminfo;
     OrtAllocator   *alloc;
 
@@ -194,11 +207,67 @@ static int run_session(AVFilterContext *ctx, int w, int h,
     return 0;
 }
 
+/* The session options every provider shares.  Also used to start again on the CPU when a session
+ * cannot be built with the OpenVINO provider, after the caller has released the old s->opts. */
+static av_cold int create_options(AVFilterContext *ctx)
+{
+    ORTContext *s = ctx->priv;
+    const OrtApi *ort = s->ort;
+
+    ORT_CHECK(ctx, ort->CreateSessionOptions(&s->opts));
+    ORT_CHECK(ctx, ort->SetSessionGraphOptimizationLevel(s->opts, ORT_ENABLE_ALL));
+    /* Always set this explicitly.  Left at the default, ONNX Runtime spawns one thread per
+     * core and pins each one, which fails noisily inside an LXC container with a restricted
+     * cpuset.  Inference runs on the GPU anyway; the CPU provider is a degraded fallback. */
+    ORT_CHECK(ctx, ort->SetIntraOpNumThreads(s->opts, s->threads > 0 ? s->threads : 1));
+    ORT_CHECK(ctx, ort->SetInterOpNumThreads(s->opts, 1));
+    return 0;
+}
+
+/* Append the OpenVINO provider for an Intel GPU: "GPU" is OpenVINO's first GPU and "GPU.n" the
+ * n-th, in OpenVINO's own order (an integrated GPU usually comes first).  Failure is not an error:
+ * warn and leave the options as they are, which runs on the CPU. */
+static av_cold void append_openvino(AVFilterContext *ctx)
+{
+#if ORT_API_VERSION >= 17
+    ORTContext *s = ctx->priv;
+    const OrtApi *ort = s->ort;
+    char dev[16];
+    const char *keys[] = { "device_type" };
+    const char *vals[] = { dev };
+    OrtStatus *st;
+
+    if (s->device_id > 0)
+        snprintf(dev, sizeof(dev), "GPU.%d", s->device_id);
+    else
+        snprintf(dev, sizeof(dev), "GPU");
+    st = ort->SessionOptionsAppendExecutionProvider_OpenVINO_V2(s->opts, keys, vals, 1);
+    if (st) {
+        av_log(ctx, AV_LOG_WARNING, "OpenVINO execution provider unavailable (%s), using CPU\n",
+               ort->GetErrorMessage(st));
+        ort->ReleaseStatus(st);
+        return;
+    }
+    s->ep_openvino = 1;
+#else
+    av_log(ctx, AV_LOG_WARNING, "this ONNX Runtime (API %d) predates the OpenVINO provider "
+           "options, using CPU\n", ORT_API_VERSION);
+#endif
+}
+
+static const char *device_name(const ORTContext *s)
+{
+    if (s->device == ORT_DEVICE_OPENVINO)
+        return s->ep_openvino ? "openvino" : "cpu";
+    return s->device == ORT_DEVICE_CUDA ? "cuda" : "cpu";
+}
+
 static av_cold int init_session(AVFilterContext *ctx)
 {
     ORTContext *s = ctx->priv;
     const OrtApi *ort;
     size_t n_in = 0, n_out = 0;
+    int ret;
 
     s->ort = ort = OrtGetApiBase()->GetApi(ORT_API_VERSION);
     if (!ort) {
@@ -211,15 +280,10 @@ static av_cold int init_session(AVFilterContext *ctx)
     }
 
     ORT_CHECK(ctx, ort->CreateEnv(ORT_LOGGING_LEVEL_WARNING, "ffmpeg_ort", &s->env));
-    ORT_CHECK(ctx, ort->CreateSessionOptions(&s->opts));
-    ORT_CHECK(ctx, ort->SetSessionGraphOptimizationLevel(s->opts, ORT_ENABLE_ALL));
-    /* Always set this explicitly.  Left at the default, ONNX Runtime spawns one thread per
-     * core and pins each one, which fails noisily inside an LXC container with a restricted
-     * cpuset.  Inference runs on the GPU anyway; the CPU provider is a degraded fallback. */
-    ORT_CHECK(ctx, ort->SetIntraOpNumThreads(s->opts, s->threads > 0 ? s->threads : 1));
-    ORT_CHECK(ctx, ort->SetInterOpNumThreads(s->opts, 1));
+    if ((ret = create_options(ctx)) < 0)
+        return ret;
 
-    if (s->device == 0) {
+    if (s->device == ORT_DEVICE_CUDA) {
         OrtCUDAProviderOptionsV2 *cuda = NULL;
         OrtStatus *st = ort->CreateCUDAProviderOptions(&cuda);
         if (!st) {
@@ -238,9 +302,32 @@ static av_cold int init_session(AVFilterContext *ctx)
                    ort->GetErrorMessage(st));
             ort->ReleaseStatus(st);
         }
+    } else if (s->device == ORT_DEVICE_OPENVINO) {
+        append_openvino(ctx);
     }
 
-    ORT_CHECK(ctx, ort->CreateSession(s->env, s->model, s->opts, &s->session));
+    if (s->ep_openvino) {
+        /* A device that is not there is refused at the append (the real provider says "Device GPU is
+         * not available" and the branch above handles it).  A model the provider cannot compile for
+         * the device would fail here instead, so this is the second place to catch it.  Same
+         * contract as the CUDA branch above: say so and run on the CPU once, with a fresh set of
+         * options and no provider. */
+        OrtStatus *st = ort->CreateSession(s->env, s->model, s->opts, &s->session);
+        if (st) {
+            av_log(ctx, AV_LOG_WARNING, "OpenVINO session could not be created (%s), using CPU\n",
+                   ort->GetErrorMessage(st));
+            ort->ReleaseStatus(st);
+            s->session = NULL;
+            s->ep_openvino = 0;
+            ort->ReleaseSessionOptions(s->opts);
+            s->opts = NULL;
+            if ((ret = create_options(ctx)) < 0)
+                return ret;
+            ORT_CHECK(ctx, ort->CreateSession(s->env, s->model, s->opts, &s->session));
+        }
+    } else {
+        ORT_CHECK(ctx, ort->CreateSession(s->env, s->model, s->opts, &s->session));
+    }
     ORT_CHECK(ctx, ort->GetAllocatorWithDefaultOptions(&s->alloc));
     ORT_CHECK(ctx, ort->SessionGetInputCount(s->session, &n_in));
     ORT_CHECK(ctx, ort->SessionGetOutputCount(s->session, &n_out));
@@ -323,7 +410,7 @@ static int config_input(AVFilterLink *inlink)
     av_log(ctx, AV_LOG_VERBOSE, "onnxruntime %s: %s, %dx%d -> %dx%d (x%d), device=%s\n",
            OrtGetApiBase()->GetVersionString(), s->model,
            s->in_w, s->in_h, s->out_w, s->out_h, s->scale,
-           s->device == 0 ? "cuda" : "cpu");
+           device_name(s));
     return 0;
 }
 
@@ -433,10 +520,11 @@ static const AVOption ort_options[] = {
     { "model", "path to the .onnx model", OFFSET(model), AV_OPT_TYPE_STRING,
       { .str = NULL }, 0, 0, VF },
     { "device", "execution provider", OFFSET(device), AV_OPT_TYPE_INT,
-      { .i64 = 0 }, 0, 1, VF, .unit = "device" },
-        { "cuda", "CUDA execution provider", 0, AV_OPT_TYPE_CONST, { .i64 = 0 }, 0, 0, VF, .unit = "device" },
-        { "cpu",  "CPU execution provider",  0, AV_OPT_TYPE_CONST, { .i64 = 1 }, 0, 0, VF, .unit = "device" },
-    { "device_id", "CUDA device index", OFFSET(device_id), AV_OPT_TYPE_INT,
+      { .i64 = ORT_DEVICE_CUDA }, 0, ORT_DEVICE_OPENVINO, VF, .unit = "device" },
+        { "cuda", "CUDA execution provider", 0, AV_OPT_TYPE_CONST, { .i64 = ORT_DEVICE_CUDA }, 0, 0, VF, .unit = "device" },
+        { "cpu",  "CPU execution provider",  0, AV_OPT_TYPE_CONST, { .i64 = ORT_DEVICE_CPU }, 0, 0, VF, .unit = "device" },
+        { "openvino", "OpenVINO execution provider, on an Intel GPU", 0, AV_OPT_TYPE_CONST, { .i64 = ORT_DEVICE_OPENVINO }, 0, 0, VF, .unit = "device" },
+    { "device_id", "CUDA device index, or for openvino the GPU number (0 is GPU, n is GPU.n)", OFFSET(device_id), AV_OPT_TYPE_INT,
       { .i64 = 0 }, 0, 15, VF },
     { "scale", "output scale factor, 0 to probe the model", OFFSET(scale), AV_OPT_TYPE_INT,
       { .i64 = 0 }, 0, 8, VF },

@@ -71,6 +71,12 @@
 #include "libavutil/tx.h"
 #include "avfilter.h"
 
+/* GU_NO_NVOF (set by build-ffmpeg.sh for the OpenVINO build): compile no CUDA and no NVOFA
+ * at all, so the build needs neither nv-codec-headers nor the Optical Flow SDK.  Motion vectors
+ * and the reactive mask are then zero, as they already are on an NVIDIA machine without NVOFA.
+ * Unset (every other build), the code below is the NVIDIA path: a CUDA that will not start is an
+ * error, and only a failed NVOFA init degrades to zero flow. */
+#ifndef GU_NO_NVOF
 #include <ffnvcodec/dynlink_loader.h>
 
 /* nvOpticalFlowCommon.h references this before declaring it; same forward
@@ -78,6 +84,7 @@
 typedef struct NV_OF_ROI_RECT NV_OF_ROI_RECT;
 #include "nvOpticalFlowCommon.h"
 #include "nvOpticalFlowCuda.h"
+#endif
 
 enum GUJitter { GU_JITTER_MEASURED = 0, GU_JITTER_CANCEL, GU_JITTER_ZERO, GU_JITTER_HALTON };
 enum GUDepth  { GU_DEPTH_FLAT = 0, GU_DEPTH_MODEL, GU_DEPTH_MODEL_STABLE };
@@ -108,6 +115,7 @@ typedef struct GUInputs {
     int    frame_index;
 
     /* ---- internals ---- */
+#ifndef GU_NO_NVOF
     CudaFunctions *cu;
     CUdevice   cu_device;
     CUcontext  cu_ctx;
@@ -118,6 +126,7 @@ typedef struct GUInputs {
     NvOFGPUBufferHandle nvof_frame[2];
     NvOFGPUBufferHandle nvof_out;
     uint32_t nvof_in_pitch, nvof_out_pitch;
+#endif
     int      nvof_slot, nvof_ready;
     int      grid_w, grid_h;
     int16_t *grid;          /* raw NVOFA output, grid_w*grid_h*2              */
@@ -149,6 +158,7 @@ typedef struct GUInputs {
 
 /* ------------------------------------------------------------------ CUDA -- */
 
+#ifndef GU_NO_NVOF
 #define GU_CHECK_CU(ctx, x)                                                      \
     do {                                                                         \
         CUresult _r = (x);                                                       \
@@ -160,6 +170,8 @@ typedef struct GUInputs {
             return AVERROR_EXTERNAL;                                             \
         }                                                                        \
     } while (0)
+
+#endif
 
 /* --------------------------------------------------------------- Hanning -- */
 
@@ -302,6 +314,7 @@ static void gu_pc_store_prev(GUInputs *g, const uint8_t *cur)
 
 /* ------------------------------------------------------------------ NVOFA -- */
 
+#ifndef GU_NO_NVOF
 static int gu_nvof_init(AVFilterContext *ctx, GUInputs *g)
 {
     NV_OF_STATUS (*create_instance)(uint32_t, NV_OF_CUDA_API_FUNCTION_LIST *);
@@ -502,8 +515,14 @@ static void gu_build_reactive(GUInputs *g)
             int sx, sy;
             gu_grid_sample(g, g->grid, x, y, &fx, &fy);
             sx = (int)lrintf(x + fx); sy = (int)lrintf(y + fy);
-            if (sx < 0) sx = 0; if (sx >= g->w) sx = g->w - 1;
-            if (sy < 0) sy = 0; if (sy >= g->h) sy = g->h - 1;
+            if (sx < 0)
+                sx = 0;
+            if (sx >= g->w)
+                sx = g->w - 1;
+            if (sy < 0)
+                sy = 0;
+            if (sy >= g->h)
+                sy = g->h - 1;
             /* the backward grid was produced with the roles swapped, so its
              * stored sign already means current -> previous once negated */
             gu_grid_sample(g, g->grid_bwd, sx, sy, &bx, &by);
@@ -516,6 +535,7 @@ static void gu_build_reactive(GUInputs *g)
             g->reactive[(size_t)y * g->w + x] = v;
         }
 }
+#endif /* !GU_NO_NVOF */
 
 /* ------------------------------------------------------------------ depth -- */
 
@@ -543,10 +563,15 @@ typedef const OrtApiBase *(*gu_ort_base_fn)(void);
 static void gu_depth_close(GUInputs *g)
 {
     if (g->ort_api) {
-        if (g->ort_alloc && g->depth_in_name)
-            GU_ORT->AllocatorFree(g->ort_alloc, g->depth_in_name);
-        if (g->ort_alloc && g->depth_out_name)
-            GU_ORT->AllocatorFree(g->ort_alloc, g->depth_out_name);
+        OrtStatus *st;
+        if (g->ort_alloc && g->depth_in_name) {
+            st = GU_ORT->AllocatorFree(g->ort_alloc, g->depth_in_name);
+            if (st) GU_ORT->ReleaseStatus(st);
+        }
+        if (g->ort_alloc && g->depth_out_name) {
+            st = GU_ORT->AllocatorFree(g->ort_alloc, g->depth_out_name);
+            if (st) GU_ORT->ReleaseStatus(st);
+        }
         if (g->ort_sess)    GU_ORT->ReleaseSession(g->ort_sess);
         if (g->ort_opts)    GU_ORT->ReleaseSessionOptions(g->ort_opts);
         if (g->ort_meminfo) GU_ORT->ReleaseMemoryInfo(g->ort_meminfo);
@@ -772,8 +797,14 @@ static void gu_depth_stabilise(GUInputs *g)
             float vx = g->flow[k * 2], vy = g->flow[k * 2 + 1];
             int sx = (int)lrintf(x - vx), sy = (int)lrintf(y - vy);
             float prev;
-            if (sx < 0) sx = 0; if (sx >= g->w) sx = g->w - 1;
-            if (sy < 0) sy = 0; if (sy >= g->h) sy = g->h - 1;
+            if (sx < 0)
+                sx = 0;
+            if (sx >= g->w)
+                sx = g->w - 1;
+            if (sy < 0)
+                sy = 0;
+            if (sy >= g->h)
+                sy = g->h - 1;
             prev = g->depth_prev[(size_t)sy * g->w + sx];
             g->depth[k] = a * g->depth[k] + (1.0f - a) * prev;
         }
@@ -784,6 +815,7 @@ static void gu_depth_stabilise(GUInputs *g)
 
 static void gu_inputs_uninit(GUInputs *g)
 {
+#ifndef GU_NO_NVOF
     if (g->cu && g->cu_ctx)
         g->cu->cuCtxPushCurrent(g->cu_ctx);
     if (g->nvof_session) {
@@ -795,13 +827,16 @@ static void gu_inputs_uninit(GUInputs *g)
         g->nvof_session = NULL;
     }
     if (g->nvof_lib) { dlclose(g->nvof_lib); g->nvof_lib = NULL; }
+#endif
     gu_depth_close(g);
+#ifndef GU_NO_NVOF
     if (g->cu && g->cu_ctx) {
         g->cu->cuCtxPopCurrent(&g->cu_ctx);
         g->cu->cuDevicePrimaryCtxRelease(g->cu_device);
         g->cu_ctx = NULL;
     }
     if (g->cu) { cuda_free_functions(&g->cu); g->cu = NULL; }
+#endif
 
     av_tx_uninit(&g->tx_fwd_row); av_tx_uninit(&g->tx_fwd_col);
     av_tx_uninit(&g->tx_inv_row); av_tx_uninit(&g->tx_inv_col);
@@ -833,6 +868,11 @@ static int gu_inputs_init(AVFilterContext *ctx, GUInputs *g, int w, int h)
         !g->luma_s || !g->depth_prev)
         return AVERROR(ENOMEM);
 
+#ifdef GU_NO_NVOF
+    av_log(ctx, AV_LOG_WARNING,
+           "built without NVOFA: motion vectors will be ZERO, which tells the upscaler "
+           "nothing moved\n");
+#else
     if ((ret = cuda_load_functions(&g->cu, ctx)) < 0) {
         av_log(ctx, AV_LOG_ERROR, "cannot load libcuda\n");
         return ret;
@@ -848,9 +888,12 @@ static int gu_inputs_init(AVFilterContext *ctx, GUInputs *g, int w, int h)
                "the upscaler nothing moved\n");
         g->nvof_ready = 0;
     }
+#endif
 
     if ((ret = gu_pc_init(ctx, g)) < 0) {
+#ifndef GU_NO_NVOF
         g->cu->cuCtxPopCurrent(&g->cu_ctx);
+#endif
         return ret;
     }
 
@@ -859,7 +902,9 @@ static int gu_inputs_init(AVFilterContext *ctx, GUInputs *g, int w, int h)
         g->depth_mode = GU_DEPTH_FLAT;
     }
 
+#ifndef GU_NO_NVOF
     GU_CHECK_CU(ctx, g->cu->cuCtxPopCurrent(&g->cu_ctx));
+#endif
 
     g->have_previous = 0;
     g->frame_index   = 0;
@@ -883,7 +928,10 @@ static int gu_inputs_frame(AVFilterContext *ctx, GUInputs *g, const AVFrame *in)
     const float *R = (const float *)in->data[2], *G = (const float *)in->data[0],
                 *B = (const float *)in->data[1];
     int rls = in->linesize[2] / 4, gls = in->linesize[0] / 4, bls = in->linesize[1] / 4;
-    int x, y, ret = 0;
+    int x, y;
+#ifndef GU_NO_NVOF
+    int ret = 0;
+#endif
 
     for (y = 0; y < g->h; y++)
         for (x = 0; x < g->w; x++) {
@@ -919,6 +967,7 @@ static int gu_inputs_frame(AVFilterContext *ctx, GUInputs *g, const AVFrame *in)
         gu_pc_store_prev(g, g->luma);
 
     /* ---- motion vectors -------------------------------------------------- */
+#ifndef GU_NO_NVOF
     gu_smooth_luma(g);
     if (g->nvof_ready) {
         int cur = g->nvof_slot, prev = g->nvof_slot ^ 1;
@@ -941,14 +990,18 @@ static int gu_inputs_frame(AVFilterContext *ctx, GUInputs *g, const AVFrame *in)
         g->cu->cuCtxPopCurrent(&g->cu_ctx);
         g->nvof_slot ^= 1;
         gu_expand_flow(g);
-    } else {
+    } else
+#endif
+    {
         memset(g->flow, 0, (size_t)g->w * g->h * 2 * sizeof(float));
     }
 
     /* ---- reactive mask --------------------------------------------------- */
+#ifndef GU_NO_NVOF
     if (g->react_mode == GU_REACT_FLOW && g->nvof_ready && g->have_previous)
         gu_build_reactive(g);
     else
+#endif
         memset(g->reactive, 0, (size_t)g->w * g->h * sizeof(float));
 
     /* ---- depth ----------------------------------------------------------- */

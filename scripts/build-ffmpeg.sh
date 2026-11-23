@@ -16,8 +16,9 @@
 # routes to it only for sessions that ask for a filter it alone provides.
 #
 # Every WITH_* below defaults to OFF except WITH_OIDN, so a machine holding none of the SDKs still
-# builds. scripts/proxmox-build.sh refuses to deploy a binary missing any of the five filters, so
-# a full deploy needs all five switched on with their SDKs in place.
+# builds. scripts/proxmox-build.sh refuses to deploy a binary missing a filter its GPU_VENDOR requires
+# (scripts/ffmpeg-vendor.sh): all five on nvidia, so a full deploy needs all five switched on with their
+# SDKs in place; oidn and ort on intel, plus fsr2 when WITH_FSR2=1.
 #
 # USAGE
 #   sudo ./scripts/build-ffmpeg.sh                     # OIDN only (default)
@@ -27,6 +28,41 @@
 #   WITH_OPTIX=1 WITH_ORT=1 WITH_FSR2=1 WITH_DLSS=1 \
 #        sudo -E ./scripts/build-ffmpeg.sh             # all five, SDK paths defaulted below
 #   PREFIX=/usr/lib/my-ffmpeg sudo -E ./scripts/build-ffmpeg.sh
+#   WITH_ORT=1 ORT_EP=openvino sudo -E ./scripts/build-ffmpeg.sh
+#                                                      # OIDN + the ort filter on an Intel GPU, no NVIDIA SDK
+#   GPU_VENDOR=intel sudo -E ./scripts/build-ffmpeg.sh # the Intel Arc variant, below
+#   GPU_VENDOR=intel PLAN_ONLY=1 ./scripts/build-ffmpeg.sh   # print what a build would do and stop
+#
+# GPU_VENDOR=nvidia|intel (default nvidia: everything below and above is today's build, unchanged).
+# intel is the build for a server whose GPU is an Intel Arc (docs/architecture/GPU_VENDORS.md 5.7). It
+# defaults to WITH_ORT=1 ORT_EP=openvino and turns on VA-API, libvpl (QSV) and libdrm, which the Vulkan
+# device taken from the render node needs. It leaves out nv-codec-headers, --enable-ffnvcodec/cuda/cuvid/
+# nvdec/nvenc, the CUDA-llvm flags, patches 0006, 0007 and 0010 to 0014 and the transpose_cuda check, and
+# it refuses WITH_OPTIX, WITH_DLSS, WITH_MAXINE_VSR, WITH_RTXDLPP, WITH_RTXVSR, ORT_EP=cuda, WITH_ORT=0,
+# WITH_OIDN=0 and BRIDGE_TEST=1, naming the variable. WITH_FSR2=1 is allowed on intel (the no-CUDA path
+# below). Patches 0008 and 0009 (generic hwmap format fixes) stay. libva, libvpl and libdrm come from apt,
+# so no download is added; the host also needs the VA-API and QSV runtimes (intel-media-va-driver-non-free,
+# libvpl2 or libmfx-gen1.2), which this script does not install. PLAN_ONLY=1 runs the preflight, prints
+# the plan: lines and exits before any root check, apt, download or write.
+#
+# ORT_EP=cuda|openvino (default cuda) says which ONNX Runtime the ort filter is built against. cuda is
+# the path described everywhere else in this header and is not changed. openvino builds the filter against
+# Intel's OpenVINO-enabled ONNX Runtime (the onnxruntime-openvino wheel, MIT, which carries the OpenVINO
+# runtime, Apache-2.0, so the binary is GPLv3 like the OIDN one) and applies ffmpeg/0015 instead of 0003,
+# so it needs none of WITH_OPTIX, OPTIX_SDK, NVOF_SDK, the CUDA runtime libraries or the NVPTX clang for
+# ONNX Runtime. It downloads three things, each pinned and checked against a sha256 below: that wheel (the
+# runtime, staged under <prefix>/ort/lib) and onnxruntime_c_api.h with the one header it includes (from
+# Microsoft's NuGet package; ORT_SDK=/path/with/include/ may name headers of the same version instead).
+# An ONNX Runtime carries the CUDA provider or the OpenVINO one, so one binary is one or the other, and it
+# is refused beside WITH_OPTIX, WITH_DLSS and WITH_MAXINE_VSR. WITH_FSR2=1 (with FSR2_SDK and FSR2_LIB, no
+# NVOF_SDK) is allowed: it applies ffmpeg/0016 and compiles gu_inputs.h with -DGU_NO_NVOF, so fsr2 runs with
+# zero motion vectors and no CUDA, and the build leaves <prefix>/fsr2-nocuda for the plugin to find (every
+# other build removes that file). With
+# GPU_VENDOR=nvidia FFmpeg's own nv-codec-headers (MIT, no SDK, no card: the driver is dlopen()ed), the
+# --enable-ffnvcodec/cuda/nvenc configure flags and patches 0006 to 0014 are still applied; GPU_VENDOR=intel
+# is the build without them. The Intel GPU plugin needs the host's OpenCL stack (ocl-icd-libopencl1,
+# intel-opencl-icd); this script does not install it. proxmox-build.sh passes GPU_VENDOR through.
+# docs/filters/NEURAL.md has the details.
 #
 # The build patches stack in order (0001 oidn, 0002 optix, 0003 ort, 0004 fsr2+dlss, 0005 vsr), each
 # patching context the previous one added, so the later options require the earlier ones. vf_vsr.c
@@ -72,10 +108,10 @@ set -euo pipefail
 
 FFMPEG_VER="${FFMPEG_VER:-8.1.2}"
 PREFIX="${PREFIX:-/usr/lib/jellyfin-ffmpeg-oidn}"
-BUILD="${BUILD:-$(mktemp -d)}"
+PLAN_ONLY="${PLAN_ONLY:-0}"
 
 # This script always extracts a fresh ffmpeg-8.1.2.tar.xz into a brand new mktemp -d, every
-# single run (see BUILD's default above and the tar xf below) - there is deliberately no
+# single run (see BUILD's default after the plan exit below and the tar xf below) - there is deliberately no
 # persistent build tree to reuse. Without CCACHE_BASEDIR, that alone defeats ccache almost
 # entirely: -I flags and -g3 debug info bake $BUILD's own random absolute path into every
 # compiler invocation's hash input, so byte-identical source compiled from two different
@@ -101,12 +137,27 @@ BUILD="${BUILD:-$(mktemp -d)}"
 # different-mktemp-root builds this script always produces. CCACHE_NOHASHDIR turns it off.
 # Retested with both set: 1 hit out of 2 on the same two-different-roots scenario - confirmed
 # fixed, not assumed. See livetestbox.md for the two failed attempts this was found through.
-export CCACHE_BASEDIR="$BUILD"
-export CCACHE_SLOPPINESS="include_file_mtime,include_file_ctime"
-export CCACHE_NOHASHDIR=1
+# The three exports sit after BUILD is created, below the plan exit.
+# nvidia (default) or intel; scripts/ffmpeg-vendor.sh holds the per-vendor required filters.
+source "$(dirname "${BASH_SOURCE[0]}")/ffmpeg-vendor.sh"
+GPU_VENDOR="${GPU_VENDOR:-nvidia}"
+ffmpeg_vendor_valid "$GPU_VENDOR" || { echo "GPU_VENDOR must be nvidia or intel, not '$GPU_VENDOR'" >&2; exit 1; }
+# What the vendor turns on by default; every other default below is the same for both.
+WITH_ORT_DEFAULT=0
+ORT_EP_DEFAULT=cuda
+if [[ "$GPU_VENDOR" == "intel" ]]; then
+    WITH_ORT_DEFAULT=1
+    ORT_EP_DEFAULT=openvino
+fi
 WITH_OIDN="${WITH_OIDN:-1}"
 WITH_OPTIX="${WITH_OPTIX:-0}"
-WITH_ORT="${WITH_ORT:-0}"
+WITH_ORT="${WITH_ORT:-$WITH_ORT_DEFAULT}"
+# cuda (default, today's build) or openvino (an Intel GPU, no NVIDIA SDK); see the header.
+ORT_EP="${ORT_EP:-$ORT_EP_DEFAULT}"
+case "$ORT_EP" in
+    cuda|openvino) ;;
+    *) echo "ORT_EP must be cuda or openvino, not '$ORT_EP'" >&2; exit 1 ;;
+esac
 WITH_FSR2="${WITH_FSR2:-0}"
 WITH_DLSS="${WITH_DLSS:-0}"
 WITH_MAXINE_VSR="${WITH_MAXINE_VSR:-0}"
@@ -133,6 +184,28 @@ if [[ -n "${WITH_VSR:-}" ]]; then
     echo "WITH_VSR was renamed WITH_MAXINE_VSR (Maxine, retired). RTX VSR will be WITH_RTXCUDA (planned, TASK.md 2.2). Unset WITH_VSR." >&2
     exit 1
 fi
+# An Intel binary carries no NVIDIA-only filter and links no CUDA: say which variable asked for one.
+# WITH_FSR2 is not here: with ORT_EP=openvino it builds without CUDA (patch 0016, -DGU_NO_NVOF).
+if [[ "$GPU_VENDOR" == "intel" ]]; then
+    for v in WITH_OPTIX WITH_DLSS WITH_MAXINE_VSR WITH_RTXDLPP WITH_RTXVSR; do
+        [[ "${!v}" != "1" ]] || { echo "GPU_VENDOR=intel cannot be built with $v=1: it needs the NVIDIA SDKs and CUDA" >&2; exit 1; }
+    done
+    [[ "$ORT_EP" == "openvino" ]] \
+        || { echo "GPU_VENDOR=intel cannot be built with ORT_EP=$ORT_EP: the CUDA ONNX Runtime has no Intel path" >&2; exit 1; }
+    for v in WITH_ORT WITH_OIDN; do
+        [[ "${!v}" == "1" ]] || { echo "GPU_VENDOR=intel needs $v=1: oidn and ort are the filters an Intel binary must carry" >&2; exit 1; }
+    done
+    [[ "${BRIDGE_TEST:-0}" != "1" ]] \
+        || { echo "GPU_VENDOR=intel cannot run BRIDGE_TEST=1: the test crosses CUDA and Vulkan and an Intel build has no CUDA" >&2; exit 1; }
+    # This script installs over $PREFIX/ffmpeg: a mistyped GPU_VENDOR must not replace an NVIDIA binary.
+    ffmpeg_vendor_switch_guard "$GPU_VENDOR" "$PREFIX/ffmpeg" || exit 1
+    # libvpl-dev is missing on older bases; say so now rather than when apt-get fails further in.
+    if command -v apt-cache >/dev/null 2>&1; then
+        vpl_candidate="$(apt-cache policy libvpl-dev 2>/dev/null | sed -n 's/^ *Candidate: //p')"
+        [[ -n "$vpl_candidate" && "$vpl_candidate" != "(none)" ]] \
+            || { echo "GPU_VENDOR=intel needs libvpl-dev from apt (QSV), and apt-cache policy shows no candidate: enable the repository that ships it, or build on a newer base" >&2; exit 1; }
+    fi
+fi
 # RETIRED 2026-09-23: Maxine VFX `vsr` (vf_vsr.c, patch 0005). NvVFX_Load hangs and NVIDIA ships no
 # TensorRT models for it, so it never produced a frame; a stuck test process held the GPU for days.
 # The source and every WITH_MAXINE_VSR block below stay in the tree, but this gate refuses to build it.
@@ -145,6 +218,10 @@ fi
 
 # Defaults are where these SDKs were unpacked on the build box. Nothing fetches them; a wrong path
 # fails in preflight naming the variable rather than 20 minutes into a compile.
+# Whether the caller named these, before the defaults below fill them in: ORT_EP=openvino fetches and
+# stages its own and only accepts ORT_SDK (headers) from the caller.
+ORT_SDK_GIVEN="${ORT_SDK:-}"
+ORT_LIB_GIVEN="${ORT_LIB:-}"
 ORT_SDK="${ORT_SDK:-/root/gameupscale}"
 # The ONNX Runtime headers and its shared libraries need not sit together, and on the build box
 # they do not: only the headers were kept beside the other SDKs, while the runtime was unpacked
@@ -184,6 +261,20 @@ VFXVSR_DIR="${VFXVSR_DIR:-/root/gameupscale/vfx/nvvfxvideosuperres}"
 # clean) and confirmed to get CreateEffect+Load further than the NGC SDK Core + hand-fetched
 # CUDA/NPP/cuDNN combination this project assembled first.
 VFXLIBS_DIR="${VFXLIBS_DIR:-/root/gameupscale/vfx/pywheel-libs}"
+# ORT_EP=openvino. One version for the runtime and the headers: the OpenVINO provider is built against
+# exactly one ONNX Runtime core, so the core comes from the same wheel as the provider and the headers
+# are checked against ORT_OPENVINO_API (the minor of the version, ORT_API_VERSION). The hashes are of
+# the wheel as pypi.org lists it and of the two headers inside Microsoft.ML.OnnxRuntime 1.24.1 on
+# nuget.org. Bump all of them together or the build refuses.
+# The soname staged in the lib loop below (libopenvino.so.2541) belongs to this wheel too: the wheel URL,
+# the sha256 and that soname change together.
+ORT_OPENVINO_VER="1.24.1"
+ORT_OPENVINO_API="24"
+ORT_OPENVINO_WHEEL="onnxruntime_openvino-1.24.1-cp312-cp312-manylinux_2_28_x86_64.whl"
+ORT_OPENVINO_URL="https://files.pythonhosted.org/packages/50/cf/17ba72de2df0fcba349937d2788f154397bbc2d1a2d67772a97e26f6bc5f/${ORT_OPENVINO_WHEEL}"
+ORT_OPENVINO_SHA256="d617fac2f59a6ab5ea59a788c3e1592240a129642519aaeaa774761dfe35150e"
+ORT_C_API_SHA256="7f03541b0233c53b8c91855910c9382c4fb4a26b8fe099965c7c3cad1af2ced6"
+ORT_EP_C_API_SHA256="7de0ebae527f18b39fbeb3129d5781a995e76f685842c2e16aa0468230e6368b"
 OIDN_VER="${OIDN_VER:-2.5.1}"
 LIBPLACEBO_TAG="${LIBPLACEBO_TAG:-v7.351.0}"
 # Pinned, like every other source build here. 2026.4 knows GL_EXT_expect_assume; the distro 2023.8
@@ -201,7 +292,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 say () { printf '\n== %s\n' "$*"; }
 die () { printf '!! %s\n' "$*" >&2; exit 1; }
 
-[[ $EUID -eq 0 ]] || die "run as root: it installs build deps and writes to ${PREFIX}"
+[[ "$PLAN_ONLY" == "1" || $EUID -eq 0 ]] || die "run as root: it installs build deps and writes to ${PREFIX}"
 
 # --- CUDA C -> PTX ----------------------------------------------------------------------------
 # gu_optix_nv12_rgbf32.cu / gu_dlpp_nv12_rgba.cu / gu_vsr_nv12_rgba.cu are ordinary CUDA C,
@@ -224,9 +315,11 @@ compile_cuda_to_header () {
 }
 
 # --- preflight ------------------------------------------------------------------------------------
-free_gb=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
-(( free_gb >= 12 )) || die "need ~12G free for the build tree, have ${free_gb}G"
-say "disk: ${free_gb}G free"
+if [[ "$PLAN_ONLY" != "1" ]]; then
+    free_gb=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+    (( free_gb >= 12 )) || die "need ~12G free for the build tree, have ${free_gb}G"
+    say "disk: ${free_gb}G free"
+fi
 
 if [[ "$WITH_OPTIX" == "1" ]]; then
     [[ -n "${OPTIX_SDK:-}" && -f "$OPTIX_SDK/include/optix.h" ]] \
@@ -246,7 +339,22 @@ if [[ "$WITH_FSR2" == "1" || "$WITH_DLSS" == "1" ]]; then
     [[ "$WITH_ORT" == "1" ]] \
         || die "WITH_FSR2/WITH_DLSS need WITH_ORT=1: patch 0004 applies on top of 0003"
 fi
-if [[ "$WITH_ORT" == "1" ]]; then
+if [[ "$WITH_ORT" == "1" && "$ORT_EP" == "openvino" ]]; then
+    # Intel's ONNX Runtime has no CUDA provider, and 0004 (fsr2, dlss) and 0005 (vsr) stack on 0003, which
+    # this build does not apply. optix, dlss and vsr are NVIDIA's; fsr2 is the exception, built with 0016
+    # and -DGU_NO_NVOF (no CUDA, so zero motion vectors).
+    [[ "$WITH_OPTIX" != "1" && "$WITH_DLSS" != "1" && "$WITH_MAXINE_VSR" != "1" ]] \
+        || die "ORT_EP=openvino cannot be built with WITH_OPTIX, WITH_DLSS or WITH_MAXINE_VSR: they need the NVIDIA SDKs and the CUDA ONNX Runtime"
+    [[ -z "$ORT_LIB_GIVEN" ]] \
+        || die "ORT_EP=openvino stages its own runtime from the pinned wheel; unset ORT_LIB (ORT_SDK may still name headers)"
+    if [[ -n "$ORT_SDK_GIVEN" ]]; then
+        [[ -f "$ORT_SDK/include/onnxruntime_c_api.h" ]] \
+            || die "ORT_EP=openvino: no onnxruntime_c_api.h under ORT_SDK=$ORT_SDK/include (leave ORT_SDK unset to fetch the pinned one)"
+    fi
+    # Another ONNX Runtime core beside this one's provider is how a CUDA install breaks quietly.
+    [[ ! -e "$PREFIX/ort/lib/libonnxruntime_providers_cuda.so" ]] \
+        || die "ORT_EP=openvino: $PREFIX/ort/lib already holds a CUDA ONNX Runtime (libonnxruntime_providers_cuda.so); use another PREFIX, or remove that directory if this machine is moving to Intel"
+elif [[ "$WITH_ORT" == "1" ]]; then
     [[ "$WITH_OPTIX" == "1" ]] \
         || die "WITH_ORT=1 needs WITH_OPTIX=1: patch 0003 applies on top of 0002"
     [[ -f "$ORT_SDK/include/onnxruntime_c_api.h" ]] \
@@ -259,7 +367,8 @@ if [[ "$WITH_ORT" == "1" ]]; then
 fi
 
 # vf_fsr2 and vf_dlss both pull in gu_inputs.h, which includes the Optical Flow headers.
-if [[ "$WITH_FSR2" == "1" || "$WITH_DLSS" == "1" ]]; then
+# The OpenVINO build compiles it with GU_NO_NVOF, which includes none of them.
+if [[ "$WITH_FSR2" == "1" || "$WITH_DLSS" == "1" ]] && [[ "$ORT_EP" != "openvino" ]]; then
     [[ -n "${NVOF_SDK:-}" ]] \
         || die "WITH_FSR2/WITH_DLSS need NVOF_SDK=/path/to/NVIDIAOpticalFlowSDK (see FSR2.md)"
 fi
@@ -267,7 +376,8 @@ fi
 # The headers sit in NvOFInterface/ in a git checkout and at the root of an unpacked release, so
 # resolve it once here rather than guessing one layout and failing the compile on the other.
 NVOF_INC=""
-if [[ -n "${NVOF_SDK:-}" ]]; then
+# NVOF_SDK has a default path, so only the OpenVINO build (GU_NO_NVOF, no NVOF headers) skips this.
+if [[ "$ORT_EP" != "openvino" && -n "${NVOF_SDK:-}" ]]; then
     if [[ -f "$NVOF_SDK/NvOFInterface/nvOpticalFlowCuda.h" ]]; then
         NVOF_INC="$NVOF_SDK/NvOFInterface"
     elif [[ -f "$NVOF_SDK/nvOpticalFlowCuda.h" ]]; then
@@ -339,21 +449,90 @@ if [[ "$WITH_MAXINE_VSR" == "1" ]]; then
         "hang; it is not a working upscaler."
 fi
 
+# --- the vendor plan ------------------------------------------------------------------------------
+# Everything that differs between the two builds is decided here, once, and the steps below read these
+# arrays, so what PLAN_ONLY prints is what runs. The nvidia values are the literals this script used to
+# hold, in the same order.
+# NOT libshaderc-dev. The distro package is what broke nlmeans_vulkan: see the shaderc build
+# below. cmake is here because that build needs it.
+APT_PKGS=(build-essential git curl ca-certificates pkg-config nasm yasm meson ninja-build cmake
+          python3 libx264-dev libxcb1-dev libvulkan-dev glslang-tools)
+NVCODEC=1
+BRIDGE_TEST_DEFAULT=1
+CUDA_LLVM_FLAGS=()
+# Every CUDA-kernel filter in FFmpeg (scale_cuda, transpose_cuda, thumbnail_cuda, ...) is gated on
+# cuda_nvcc or cuda_llvm, and this build had neither: only --enable-cuda, which gives
+# hwupload_cuda and nothing else. Jellyfin's own CUDA hwaccel chains emit transpose_cuda for a
+# rotated source, so those sessions died with "No such filter". cuda_llvm is meant to autodetect
+# but only looks for a binary named plain "clang"; this box has clang-18, so it never turned on.
+# The same clang already compiles this project's own kernels (see CLANG_CUDA above), and FFmpeg's
+# compat/cuda/cuda_runtime.h stands in for the CUDA SDK, so no toolkit is needed.
+if [[ "$GPU_VENDOR" == "intel" ]]; then
+    APT_PKGS+=(libva-dev libvpl-dev libdrm-dev)
+    NVCODEC=0
+    BRIDGE_TEST_DEFAULT=0
+    # 0008 and 0009 are format-negotiation fixes in the generic hwmap filter, not CUDA fixes, and a
+    # VA-API to Vulkan chain is the hwmap chain they were written for (GPU_VENDORS.md 5.7).
+    VENDOR_PATCHES=(0008-hwmap-chain-format.patch 0009-hwmap-query-formats.patch)
+    # libdrm: the Vulkan device taken from the render node (drm=dr:<node>, vulkan=vk@dr) needs it.
+    HWACCEL_FLAGS=(--enable-vaapi --enable-libvpl --enable-libdrm)
+else
+    VENDOR_PATCHES=(
+        0006-vulkan-to-cuda-hwmap.patch
+        0007-cuda-to-vulkan-hwmap.patch
+        0008-hwmap-chain-format.patch
+        0009-hwmap-query-formats.patch
+        0010-add-transpose-cuda-filter.patch
+        0014-cuda-vector-helpers-saturate-rintf.patch
+        0011-vulkan-cuda-import-dedicated.patch
+        0012-vulkan-from-cuda-stream-sync.patch
+        0013-vulkan-export-probe-real-format.patch
+    )
+    HWACCEL_FLAGS=(--enable-ffnvcodec --enable-cuda --enable-cuvid --enable-nvdec --enable-nvenc)
+    [[ -z "$CLANG_CUDA" ]] || CUDA_LLVM_FLAGS=(--enable-cuda-llvm --nvcc="$CLANG_CUDA")
+fi
+# ORT_EP=openvino builds on a box without CUDA too, so its bridge test is off whichever vendor asked.
+[[ "$WITH_ORT" == "1" && "$ORT_EP" == "openvino" ]] && BRIDGE_TEST_DEFAULT=0
+# fsr2 without CUDA (ORT_EP=openvino, either vendor): the three things that make it so, named once for
+# the build steps below and for the plan line.
+FSR2_NOCUDA_PATCH="0016-add-fsr2-filter-to-build-standalone.patch"
+FSR2_NOCUDA_CFLAG="-DGU_NO_NVOF"
+FSR2_NOCUDA_MARKER="$PREFIX/fsr2-nocuda"
+
+if [[ "$PLAN_ONLY" == "1" ]]; then
+    echo "plan: vendor: $GPU_VENDOR"
+    echo "plan: build: oidn=$WITH_OIDN optix=$WITH_OPTIX ort=$WITH_ORT ort_ep=$ORT_EP fsr2=$WITH_FSR2 dlss=$WITH_DLSS maxine_vsr=$WITH_MAXINE_VSR rtxdlpp=$WITH_RTXDLPP rtxvsr=$WITH_RTXVSR crashlog=$WITH_CRASHLOG"
+    echo "plan: apt: ${APT_PKGS[*]}"
+    if [[ "$NVCODEC" == "1" ]]; then echo "plan: nv-codec-headers: yes $NVCODEC_TAG"; else echo "plan: nv-codec-headers: no"; fi
+    echo "plan: patches: $(for p in "${VENDOR_PATCHES[@]}"; do printf '%s ' "${p%%-*}"; done | sed 's/ $//')"
+    echo "plan: hwaccel: ${HWACCEL_FLAGS[*]}"
+    echo "plan: cuda-llvm: ${CUDA_LLVM_FLAGS[*]:-none}"
+    echo "plan: required filters: $(ffmpeg_required_filters "$GPU_VENDOR")"
+    echo "plan: bridge test default: $BRIDGE_TEST_DEFAULT"
+    if [[ "$WITH_FSR2" == "1" && "$ORT_EP" == "openvino" ]]; then
+        echo "plan: fsr2: no CUDA: patch ${FSR2_NOCUDA_PATCH%%-*}, cflag $FSR2_NOCUDA_CFLAG, marker $FSR2_NOCUDA_MARKER"
+    fi
+    exit 0
+fi
+
+# Created only now, so a refusal or a kill in the preflight above has no directory to leak; the trap
+# comes with it and covers everything below, apt included.
+BUILD="${BUILD:-$(mktemp -d)}"
+cleanup () { [[ "$KEEP_BUILD" == "1" ]] || rm -rf "$BUILD"; }
+trap cleanup EXIT
+# Why these three: the comment under the PLAN_ONLY default at the top of this file.
+export CCACHE_BASEDIR="$BUILD"
+export CCACHE_SLOPPINESS="include_file_mtime,include_file_ctime"
+export CCACHE_NOHASHDIR=1
+
 say "installing build dependencies"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-# NOT libshaderc-dev. The distro package is what broke nlmeans_vulkan: see the shaderc build
-# below. cmake is here because that build needs it.
-apt-get install -y -qq --no-install-recommends \
-    build-essential git curl ca-certificates pkg-config nasm yasm meson ninja-build cmake \
-    python3 libx264-dev libxcb1-dev libvulkan-dev glslang-tools >/dev/null
+apt-get install -y -qq --no-install-recommends "${APT_PKGS[@]}" >/dev/null
 
 # The distro shaderc, if some earlier run installed it, would still be found by pkg-config and
 # would win on include order. Remove it rather than hope /usr/local sorts first.
 apt-get remove -y -qq libshaderc-dev libshaderc1 >/dev/null 2>&1 || true
-
-cleanup () { [[ "$KEEP_BUILD" == "1" ]] || rm -rf "$BUILD"; }
-trap cleanup EXIT
 
 # mktemp -d already made its own directory; this is here for a caller-supplied BUILD.
 mkdir -p "$BUILD"
@@ -425,10 +604,12 @@ else
 fi
 
 # --- nv-codec-headers -----------------------------------------------------------------------------
-say "nv-codec-headers ${NVCODEC_TAG} (must match the installed driver)"
-git clone -q https://github.com/FFmpeg/nv-codec-headers.git
-git -C nv-codec-headers checkout -q "$NVCODEC_TAG"
-make -C nv-codec-headers install PREFIX=/usr/local >/dev/null
+if [[ "$NVCODEC" == "1" ]]; then
+    say "nv-codec-headers ${NVCODEC_TAG} (must match the installed driver)"
+    git clone -q https://github.com/FFmpeg/nv-codec-headers.git
+    git -C nv-codec-headers checkout -q "$NVCODEC_TAG"
+    make -C nv-codec-headers install PREFIX=/usr/local >/dev/null
+fi
 
 # --- OIDN runtime ---------------------------------------------------------------------------------
 OIDN_FLAGS=()
@@ -446,6 +627,48 @@ if [[ "$WITH_OIDN" == "1" ]]; then
     OIDN_FLAGS=(--enable-libopenimagedenoise)
 fi
 
+# --- ONNX Runtime with the OpenVINO provider ------------------------------------------------------
+if [[ "$WITH_ORT" == "1" && "$ORT_EP" == "openvino" ]]; then
+    say "ONNX Runtime ${ORT_OPENVINO_VER} with the OpenVINO provider (Intel's wheel: MIT, with OpenVINO and oneTBB, Apache-2.0)"
+    ort_stage="$BUILD/ort-openvino"
+    mkdir -p "$ort_stage/lib"
+    curl -fsSL -o "$BUILD/$ORT_OPENVINO_WHEEL" "$ORT_OPENVINO_URL"
+    echo "$ORT_OPENVINO_SHA256  $BUILD/$ORT_OPENVINO_WHEEL" | sha256sum -c - \
+        || die "$ORT_OPENVINO_WHEEL does not match the pinned sha256 (ORT_OPENVINO_SHA256)"
+    # Only the libraries: the wheel's Python module is not wanted, and a wheel is a zip. Whatever is
+    # unpacked is data until it is checked, so Python runs isolated and writes bare file names only.
+    python3 -I - "$BUILD/$ORT_OPENVINO_WHEEL" "$ort_stage/lib" <<'PY' || die "could not unpack the ONNX Runtime libraries from the wheel"
+import os, sys, zipfile
+wheel, out = sys.argv[1:3]
+n = 0
+with zipfile.ZipFile(wheel) as z:
+    for info in z.infolist():
+        name = info.filename
+        if name.startswith("onnxruntime/capi/") and ".so" in name and "pybind" not in name:
+            with open(os.path.join(out, os.path.basename(name)), "wb") as f:
+                f.write(z.read(info))
+            n += 1
+print("unpacked %d libraries" % n)
+PY
+    for lib in libonnxruntime.so.${ORT_OPENVINO_VER} libonnxruntime_providers_openvino.so \
+               libonnxruntime_providers_shared.so libopenvino.so.2541 libopenvino_intel_gpu_plugin.so; do
+        [[ -f "$ort_stage/lib/$lib" ]] || die "the wheel holds no $lib: the pinned wheel is not the one this script was written for"
+    done
+    # The core's soname is libonnxruntime.so.1 and the linker looks for libonnxruntime.so.
+    ln -sf "libonnxruntime.so.${ORT_OPENVINO_VER}" "$ort_stage/lib/libonnxruntime.so.1"
+    ln -sf "libonnxruntime.so.1" "$ort_stage/lib/libonnxruntime.so"
+    if [[ -z "$ORT_SDK_GIVEN" ]]; then
+        python3 -I "$HERE/scripts/fetch-ort-header.py" "$ORT_OPENVINO_VER" "$ort_stage/include" \
+            "onnxruntime_c_api.h:$ORT_C_API_SHA256" "onnxruntime_ep_c_api.h:$ORT_EP_C_API_SHA256" \
+            || die "could not fetch the ONNX Runtime ${ORT_OPENVINO_VER} headers"
+        ORT_SDK="$ort_stage"
+    fi
+    # [[:space:]]*: Microsoft's header has CRLF line endings.
+    grep -Eq "^#define ORT_API_VERSION ${ORT_OPENVINO_API}[[:space:]]*\$" "$ORT_SDK/include/onnxruntime_c_api.h" \
+        || die "$ORT_SDK/include/onnxruntime_c_api.h is not ONNX Runtime API ${ORT_OPENVINO_API}: the headers must match the runtime in the wheel"
+    ORT_LIB="$ort_stage/lib"
+fi
+
 # --- ffmpeg ---------------------------------------------------------------------------------------
 say "FFmpeg ${FFMPEG_VER}"
 curl -fsSL -o "ffmpeg-${FFMPEG_VER}.tar.xz" "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VER}.tar.xz"
@@ -456,16 +679,18 @@ say "applying filter patches"
 cp "$HERE/ffmpeg/vf_oidn.c" libavfilter/
 patch -p1 < "$HERE/ffmpeg/0001-add-oidn-filter-to-build.patch"
 
-# Core libavutil fix, independent of any WITH_* filter and always applied: adds an
-# AV_PIX_FMT_CUDA case to vulkan_map_from() so `hwmap=derive_device=cuda` can resolve a Vulkan
-# source frame (a GPU-to-GPU cuMemcpy2DAsync via the existing vulkan_transfer_data_to_cuda(),
+# 0006 to 0014 are applied by the loop after these notes, in VENDOR_PATCHES order, independent of any
+# WITH_* filter. intel applies 0008 and 0009 only; the notes say what each one is.
+#
+# 0006, a core libavutil fix: adds an AV_PIX_FMT_CUDA case to vulkan_map_from() so
+# `hwmap=derive_device=cuda` can resolve a Vulkan source frame (a GPU-to-GPU cuMemcpy2DAsync via
+# the existing vulkan_transfer_data_to_cuda(),
 # not a host round trip, and not a true zero-copy map -- NVENC's CUDA input needs linear
 # memory, the Vulkan image imports into CUDA as a texture array). Without this,
 # `hwmap=derive_device=cuda` from any Vulkan-backed filter (oidn/optix/ort/fsr2/dlss) fails
 # with ENOSYS/-38; see livetestbox.md's "GpuResidentEncode" entry for how that was root-caused.
-patch -p1 < "$HERE/ffmpeg/0006-vulkan-to-cuda-hwmap.patch"
 
-# The reverse direction of 0006, also always applied: adds an AV_PIX_FMT_CUDA case to
+# 0007, the reverse direction of 0006: adds an AV_PIX_FMT_CUDA case to
 # vulkan_map_to() so `hwmap=derive_device=vulkan` can resolve a CUDA source frame (e.g. the
 # output of optix/dlpp_rtcuda/vsr_rtcuda feeding back into a Vulkan libplacebo chain). Reuses
 # vulkan_transfer_data_from_cuda(), which already existed upstream and is normally reached
@@ -473,15 +698,15 @@ patch -p1 < "$HERE/ffmpeg/0006-vulkan-to-cuda-hwmap.patch"
 # first (absent: CUDA's HWContextType has no such callback at all) and falls back to trying
 # Vulkan's own .map_to, which only had VAAPI/DRM_PRIME cases before this patch. Same GPU-to-GPU
 # cuMemcpy2DAsync reasoning as 0006, not a true zero-copy map, no host round trip.
-patch -p1 < "$HERE/ffmpeg/0007-cuda-to-vulkan-hwmap.patch"
-patch -p1 < "$HERE/ffmpeg/0008-hwmap-chain-format.patch"
-patch -p1 < "$HERE/ffmpeg/0009-hwmap-query-formats.patch"
-
-# Vendored from upstream FFmpeg PR #22493 (code.ffmpeg.org/FFmpeg/FFmpeg/pulls/22493, merged),
+#
+# 0008 and 0009: format negotiation in the generic hwmap filter (a chained map keeps its frame format;
+# derive_device=vulkan is pinned to the Vulkan format). No CUDA header or flag is involved.
+#
+# 0010, vendored from upstream FFmpeg PR #22493 (code.ffmpeg.org/FFmpeg/FFmpeg/pulls/22493, merged),
 # "avfilter: add transpose_cuda video filter" - its own Changelog entry places it under
 # "version <next>", i.e. after the 8.1 release this project's FFMPEG_VER pins, so the n8.1.2
-# tree never had it. Not one of this project's own filters and applies unconditionally, same as
-# 0006-0009: Jellyfin's own core EncodingHelper (not this project's code - grepped src/, no
+# tree never had it. Not one of this project's own filters and applies unconditionally on NVIDIA:
+# Jellyfin's own core EncodingHelper (not this project's code - grepped src/, no
 # match) emits "transpose_cuda" for a rotated source on the CUDA hwaccel path regardless of any
 # Jellyfin Plus setting, and the prebuilt jellyfin-ffmpeg binary this project runs alongside already
 # carries it (confirmed via -filters), so a session choosing a CUDA-native upscale level
@@ -494,13 +719,11 @@ patch -p1 < "$HERE/ffmpeg/0009-hwmap-query-formats.patch"
 # libavfilter/allfilters.c, and the two new files (vf_transpose_cuda.c, vf_transpose_cuda.cu -
 # a real CUDA kernel file, compiled through the same cuda_nvcc/cuda_llvm path this tree's other
 # *_cuda filters already use, not hand-written PTX).
-patch -p1 < "$HERE/ffmpeg/0010-add-transpose-cuda-filter.patch"
 
 # 0014: 0010's kernel calls saturate_rintf(), and the compat CUDA runtime it lands on has no
 # rintf(); both arrived upstream before that PR merged but after n8.1.2, so with 0010 alone the
 # kernel does not compile. Verbatim from upstream master (LGPL): a 23-line helper block appended
 # to libavfilter/cuda/vector_helpers.cuh and one rintf line in compat/cuda/cuda_runtime.h.
-patch -p1 < "$HERE/ffmpeg/0014-cuda-vector-helpers-saturate-rintf.patch"
 
 # 0011: hwcontext_vulkan.c's export_mem_to_cuda() imported Vulkan memory into CUDA without
 # CUDA_EXTERNAL_MEMORY_DEDICATED even though alloc_bind_mem() allocates it as a dedicated
@@ -508,13 +731,11 @@ patch -p1 < "$HERE/ffmpeg/0014-cuda-vector-helpers-saturate-rintf.patch"
 # hwmap followed by any Vulkan-side read (libplacebo, hwdownload) returned scrambled frames,
 # ~6-9 dB PSNR against the clean decode. cuda->vulkan->cuda alone stayed bit-exact because both
 # hops misread the memory the same way, which is why exit-code and frame-count checks all passed.
-patch -p1 < "$HERE/ffmpeg/0011-vulkan-cuda-import-dedicated.patch"
 
 # 0012: experiment. CUDA->Vulkan frames come out scrambled at 1280x720 and 1920x1080 but are exact
 # at 512x288, and the garbage differs from run to run - the signature of an ordering race, not a
 # layout mismatch. Make the CUDA copy complete before the semaphore is signalled, to see whether
 # the external semaphore is really ordering the two APIs.
-patch -p1 < "$HERE/ffmpeg/0012-vulkan-from-cuda-stream-sync.patch"
 
 # 0013: the real cause of the scrambled CUDA->Vulkan frames. try_export_flags() probed export
 # support with the combined multi-planar format, which NVIDIA does not offer for external memory,
@@ -522,7 +743,9 @@ patch -p1 < "$HERE/ffmpeg/0012-vulkan-from-cuda-stream-sync.patch"
 # export capability, and vulkan_export_to_cuda() exported the memory anyway (found with the Vulkan
 # validation layer: VUID-VkMemoryGetFdInfoKHR-handleType-00671 on both directions). Vulkan->CUDA
 # happened to read correctly; CUDA->Vulkan did not, at sizes and planes that varied run to run.
-patch -p1 < "$HERE/ffmpeg/0013-vulkan-export-probe-real-format.patch"
+for p in "${VENDOR_PATCHES[@]}"; do
+    patch -p1 < "$HERE/ffmpeg/$p"
+done
 
 OPTIX_FLAGS=()
 if [[ "$WITH_OPTIX" == "1" ]]; then
@@ -545,7 +768,12 @@ fi
 ORT_FLAGS=()
 if [[ "$WITH_ORT" == "1" ]]; then
     cp "$HERE/ffmpeg/vf_ort.c" libavfilter/
-    patch -p1 < "$HERE/ffmpeg/0003-add-ort-filter-to-build.patch"
+    if [[ "$ORT_EP" == "openvino" ]]; then
+        # 0003's context is lines 0002 (OptiX) added; 0015 is the same change against a tree without it.
+        patch -p1 < "$HERE/ffmpeg/0015-add-ort-filter-to-build-standalone.patch"
+    else
+        patch -p1 < "$HERE/ffmpeg/0003-add-ort-filter-to-build.patch"
+    fi
     # rpath, not -L, decides what the installed binary loads: the runtime tree is staged under
     # PREFIX and the build copy of it may not survive this script.
     export CFLAGS="-I${ORT_SDK}/include ${CFLAGS:-}"
@@ -558,8 +786,15 @@ if [[ "$WITH_FSR2" == "1" || "$WITH_DLSS" == "1" ]]; then
     cp "$HERE/ffmpeg/gu_inputs.h" libavfilter/
     if [[ "$WITH_FSR2" == "1" ]]; then cp "$HERE/ffmpeg/vf_fsr2.c" libavfilter/; fi
     if [[ "$WITH_DLSS" == "1" ]]; then cp "$HERE/ffmpeg/vf_dlss.c" libavfilter/; fi
-    patch -p1 < "$HERE/ffmpeg/0004-add-fsr2-and-dlss-filters-to-build.patch"
-    export CFLAGS="-I${NVOF_INC} ${CFLAGS:-}"
+    if [[ "$ORT_EP" == "openvino" ]]; then
+        # 0004's context is lines 0002 and 0003 added; 0016 is its fsr2 half against 0001 and 0015.
+        # GU_NO_NVOF leaves CUDA and NVOFA out of gu_inputs.h, so no NVOF_SDK and no ffnvcodec for it.
+        patch -p1 < "$HERE/ffmpeg/$FSR2_NOCUDA_PATCH"
+        export CFLAGS="$FSR2_NOCUDA_CFLAG ${CFLAGS:-}"
+    else
+        patch -p1 < "$HERE/ffmpeg/0004-add-fsr2-and-dlss-filters-to-build.patch"
+        export CFLAGS="-I${NVOF_INC} ${CFLAGS:-}"
+    fi
     if [[ "$WITH_FSR2" == "1" ]]; then
         # Without -DFFX_GCC, ffx_types.h defines FFX_API as __declspec(dllexport) and every FSR2
         # header fails to parse.
@@ -683,17 +918,8 @@ if [[ "${NO_CCACHE:-0}" != "1" ]] && command -v ccache >/dev/null 2>&1; then
     say "ccache found -- compiler invocations will be cached (NO_CCACHE=1 to disable)"
 fi
 
-# Every CUDA-kernel filter in FFmpeg (scale_cuda, transpose_cuda, thumbnail_cuda, ...) is gated on
-# cuda_nvcc or cuda_llvm, and this build had neither: only --enable-cuda, which gives
-# hwupload_cuda and nothing else. Jellyfin's own CUDA hwaccel chains emit transpose_cuda for a
-# rotated source, so those sessions died with "No such filter". cuda_llvm is meant to autodetect
-# but only looks for a binary named plain "clang"; this box has clang-18, so it never turned on.
-# The same clang already compiles this project's own kernels (see CLANG_CUDA above), and FFmpeg's
-# compat/cuda/cuda_runtime.h stands in for the CUDA SDK, so no toolkit is needed.
-CUDA_LLVM_FLAGS=()
-if [[ -n "$CLANG_CUDA" ]]; then
-    CUDA_LLVM_FLAGS=(--enable-cuda-llvm --nvcc="$CLANG_CUDA")
-else
+# CUDA_LLVM_FLAGS is set in the vendor plan above.
+if [[ "$GPU_VENDOR" == "nvidia" && -z "$CLANG_CUDA" ]]; then
     echo "!! no clang found: transpose_cuda and the other CUDA-kernel filters will be missing" >&2
 fi
 
@@ -704,9 +930,10 @@ PKG_CONFIG_PATH="/usr/local/lib/x86_64-linux-gnu/pkgconfig:${PKG_CONFIG_PATH:-}"
     --disable-doc --disable-htmlpages --disable-manpages \
     --enable-gpl --enable-version3 \
     --enable-vulkan --enable-libplacebo --enable-libshaderc --enable-libx264 \
-    --enable-ffnvcodec --enable-cuda --enable-cuvid --enable-nvdec --enable-nvenc \
-    "${CUDA_LLVM_FLAGS[@]}" \
-    "${OIDN_FLAGS[@]}" "${OPTIX_FLAGS[@]}" "${ORT_FLAGS[@]}" "${GAME_FLAGS[@]}" "${VSR_FLAGS[@]}" \
+    "${HWACCEL_FLAGS[@]}" \
+    ${CUDA_LLVM_FLAGS[@]+"${CUDA_LLVM_FLAGS[@]}"} \
+    ${OIDN_FLAGS[@]+"${OIDN_FLAGS[@]}"} ${OPTIX_FLAGS[@]+"${OPTIX_FLAGS[@]}"} ${ORT_FLAGS[@]+"${ORT_FLAGS[@]}"} \
+    ${GAME_FLAGS[@]+"${GAME_FLAGS[@]}"} ${VSR_FLAGS[@]+"${VSR_FLAGS[@]}"} \
     --extra-libs="$EXTRA_LIBS"
 
 # By this point configure has already generated config.mak, config_components.h and
@@ -739,10 +966,15 @@ if [[ "$WITH_ORT" == "1" ]]; then
     # beside them come from NVIDIA's wheels by hand, and libonnxruntime_providers_cuda.so gets a
     # patchelf rpath fix there which overwriting would undo. NEURAL.md has both.
     mkdir -p "$PREFIX/ort/lib"
+    if [[ "$ORT_EP" == "openvino" ]]; then
+        # The whole set, not only libonnxruntime*: the provider, OpenVINO, its GPU plugin and oneTBB sit
+        # beside the core and find each other through their own $ORIGIN rpath, which is why no patchelf
+        # fix is needed here (the CUDA provider has none). The wheel is pinned, so this is a refresh.
+        cp -a "$ORT_LIB"/. "$PREFIX/ort/lib/"
     # Nothing to stage when the runtime is already the thing we linked against, which is the case
     # on a box where the release tarball was unpacked straight into the prefix and only its headers
     # were kept beside the other SDKs.
-    if [[ "$(cd "$ORT_LIB" && pwd -P)" != "$(cd "$PREFIX/ort/lib" && pwd -P)" ]]; then
+    elif [[ "$(cd "$ORT_LIB" && pwd -P)" != "$(cd "$PREFIX/ort/lib" && pwd -P)" ]]; then
         for lib in "$ORT_LIB"/libonnxruntime*; do
             [[ -e "$lib" ]] || continue
             [[ -e "$PREFIX/ort/lib/$(basename "$lib")" ]] || cp -a "$lib" "$PREFIX/ort/lib/"
@@ -789,9 +1021,29 @@ if [[ "$WITH_ORT" == "1" ]]; then
     "$PREFIX/ffmpeg" -hide_banner -filters 2>/dev/null | grep -E "\bort\b" \
         && echo "  ort: present" || die "ort filter missing from the build"
 fi
+if [[ "$WITH_ORT" == "1" && "$ORT_EP" == "openvino" ]]; then
+    # Captured first: grep -q closing the pipe early would SIGPIPE ffmpeg, which fails under pipefail.
+    ort_help="$("$PREFIX/ffmpeg" -hide_banner -h filter=ort 2>/dev/null || true)"
+    grep -q "openvino" <<<"$ort_help" \
+        && echo "  ort: device=openvino offered" || die "the ort filter in this build has no device=openvino"
+    # What the plugin's OpenVinoAvailable looks for (GpuVendor.cs): the provider beside the core.
+    [[ -f "$PREFIX/ort/lib/libonnxruntime_providers_openvino.so" ]] \
+        && echo "  ort: libonnxruntime_providers_openvino.so staged" \
+        || die "$PREFIX/ort/lib/libonnxruntime_providers_openvino.so was not staged"
+    echo "  note: whether the Intel GPU is used needs the host's OpenCL runtime (intel-opencl-icd); watch a real" \
+         "encode at -v verbose for 'OpenVINO execution provider unavailable', the line that says it ran on the CPU"
+fi
+# What the plugin's NoCudaGameAvailable looks for (GpuVendor.cs): this binary's fsr2 runs without CUDA.
+# Removed by every build, then written only for the CUDA-free fsr2 one and only after its check, so a
+# CUDA build or a failed check never leaves one beside a binary it does not describe.
+rm -f "$FSR2_NOCUDA_MARKER"
 if [[ "$WITH_FSR2" == "1" ]]; then
     "$PREFIX/ffmpeg" -hide_banner -filters 2>/dev/null | grep -E "\bfsr2\b" \
         && echo "  fsr2: present" || die "fsr2 filter missing from the build"
+    if [[ "$ORT_EP" == "openvino" ]]; then
+        : > "$FSR2_NOCUDA_MARKER"
+        echo "  fsr2: built without CUDA (zero motion vectors), marked $FSR2_NOCUDA_MARKER"
+    fi
 fi
 if [[ "$WITH_DLSS" == "1" ]]; then
     "$PREFIX/ffmpeg" -hide_banner -filters 2>/dev/null | grep -E "\bdlss\b" \
@@ -813,17 +1065,30 @@ if [[ "$WITH_RTXVSR" == "1" ]]; then
         || die "vsr_rtcuda filter missing from the build"
 fi
 
-if [[ -n "$CLANG_CUDA" ]]; then
+if [[ ${#CUDA_LLVM_FLAGS[@]} -gt 0 ]]; then
     "$PREFIX/ffmpeg" -hide_banner -filters 2>/dev/null | grep -E "\btranspose_cuda\b" \
         && echo "  transpose_cuda: present" \
         || die "transpose_cuda filter missing from the build (--enable-cuda-llvm did not take effect)"
+fi
+
+if [[ "$GPU_VENDOR" == "intel" ]]; then
+    # Captured, not piped into grep -q: under pipefail grep's early exit can SIGPIPE ffmpeg and fail a match.
+    hwaccels_out=$("$PREFIX/ffmpeg" -hide_banner -hwaccels 2>/dev/null) || true
+    encoders_out=$("$PREFIX/ffmpeg" -hide_banner -encoders 2>/dev/null) || true
+    grep -qw vaapi <<<"$hwaccels_out" \
+        && echo "  vaapi: present" || die "vaapi hwaccel missing from the build (libva-dev, --enable-vaapi)"
+    for enc in h264_qsv hevc_qsv av1_qsv; do
+        grep -qw "$enc" <<<"$encoders_out" \
+            && echo "  $enc: present" || die "$enc encoder missing from the build (libvpl-dev, --enable-libvpl)"
+    done
 fi
 
 # Filters being present says nothing about pixels. The CUDA<->Vulkan bridge (0006-0012) once
 # passed every exit-code and frame-count check while returning scrambled frames, so a build whose
 # bridge corrupts is a failed build. BRIDGE_TEST=0 skips it, for building a binary that is known
 # to be broken in order to debug it; never for anything that gets deployed.
-if [[ "${BRIDGE_TEST:-1}" == "1" ]]; then
+# The bridge is the NVIDIA hand-off (CUDA and Vulkan); BRIDGE_TEST_DEFAULT is 0 where that is absent.
+if [[ "${BRIDGE_TEST:-$BRIDGE_TEST_DEFAULT}" == "1" ]]; then
     "$HERE/scripts/test-hwmap-bridge.sh" "$PREFIX/ffmpeg" \
         || die "the CUDA<->Vulkan bridge returns corrupted frames (scripts/test-hwmap-bridge.sh); BRIDGE_TEST=0 skips this"
 fi
@@ -836,6 +1101,16 @@ The plugin's shim routes to this binary only for sessions requesting a filter it
 everything else keeps using the stock jellyfin-ffmpeg. If this binary is deleted the plugin strips
 the affected filter from the chain, so those sessions play unenhanced rather than failing.
 
+EOF
+if [[ "$GPU_VENDOR" == "intel" ]]; then
+    if [[ "$WITH_FSR2" == "1" ]]; then intel_filters="oidn, ort and fsr2"; else intel_filters="oidn and ort only"; fi
+    cat <<EOF
+This is the Intel variant: ${intel_filters}. QSV and VA-API need the host's media runtime
+(intel-media-va-driver-non-free, libvpl2 or libmfx-gen1.2) to run; this script does not install it.
+EOF
+else
+    cat <<EOF
 Re-run this after an NVIDIA driver change if the OptiX, FSR2 or DLSS levels stop working: OptiX,
 NVOFA and NGX all negotiate against the driver at runtime, which no rebuild here controls.
 EOF
+fi
