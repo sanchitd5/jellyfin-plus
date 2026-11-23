@@ -34,7 +34,7 @@ stock one rather than over it:
 |---|---|---|
 | `denoise=oidn` | `vf_oidn` | Intel Open Image Denoise runtime (fetched by the build script) |
 | `denoise=optix*` | `vf_optix` | OptiX + Optical Flow SDK **headers** at build time; both libraries are `dlopen`ed from the display driver at runtime, so no CUDA toolkit is needed |
-| `neural=` | `vf_ort` | ONNX Runtime with the CUDA execution provider, plus model weights you export yourself |
+| `neural=` | `vf_ort` | ONNX Runtime with the CUDA execution provider (the OpenVINO provider on an Intel GPU), plus model weights you export yourself |
 | `game=` | `vf_fsr2`, `vf_dlss` | FidelityFX FSR2 sources, NVIDIA NGX SDK, and a depth model for `depth=model` |
 
 **Without that binary nothing breaks.** The server asks it which filters it carries and strips the
@@ -513,11 +513,13 @@ Dashboard → Plugins → Jellyfin Plus. Defaults suit a single busy GPU:
 | `DeblurLevel` / `DeblurAllowed` | `off` / true | RCAS sharpening; SR already sharpens, so default off |
 | `DenoiseLevel` / `DenoiseAllowed` | `off` / true | `light` = nlmeans_vulkan, `strong` = nlmeans_vulkan s=2.0 |
 | `SrMinScaleFactor` | 1.60 | below this ratio the SR network is skipped (see below); 0 disables |
+| `NeuralMaxSourceHeight` | 0 | 0 = off. Above 0, the Real-ESRGAN (`ort`) levels run only for sources at or below this height and a taller source takes the shader path; when nothing names a level the cheapest installed weight is chosen (on Intel only with the OpenVINO provider). 480 is the recommended value on an Intel GPU and is not measured; see [NEURAL.md](filters/NEURAL.md) and [GPU_VENDORS.md](architecture/GPU_VENDORS.md) |
 | `Deband` | true | with `grain=0` |
 | `MinScaleFactor` | 1.15 | skip near-identity upscales entirely |
 | `MaxSourceHeight` | 1440 | never upscale sources taller than this |
-| `MaxConcurrent` | 4 | beyond this, stock transcoding is used |
-| `Encoder` | `hevc_nvenc` | falls back to the client's codec when unsupported; `av1_nvenc` requires compute 8.9+ (Ada Lovelace), guarded automatically |
+| `MaxConcurrent` | 4 | beyond this, stock transcoding is used. On a small Intel GPU doing 4K output, 1 is the recommended value: the one A380 measurement (one session, 1080p to 2160p, 38 to 40 fps) leaves little over real time for one session and none is known for two. The default is unchanged |
+| `Encoder` | `hevc_nvenc` | falls back to the client's codec when unsupported; `av1_nvenc` requires compute 8.9+ (Ada Lovelace), guarded automatically. On an Intel GPU an NVENC name is treated as auto and the QSV encoder for the codec is used (`av1_qsv` is test-encoded first and swapped to HEVC if it fails) |
+| `GpuVendor` | `auto` | `auto` / `nvidia` / `intel` / `none`. Says what the dashboard, the probe and Recent sessions report about the GPU and, when an Intel GPU is actually found, selects the QSV encoder, turns the GPU-resident hand-off off, starts the Vulkan device from the GPU's render node instead of `vk:0`, and stops offering the levels that need NVIDIA (`optix`, `dlpp-*`, `vsr-rtcuda`, `fsr2`, `dlss`, `dlaa`) and the ONNX levels (`realesr-*`, not measured on Intel), saying why; NVIDIA commands are unchanged (see [GPU_VENDORS.md](architecture/GPU_VENDORS.md)) |
 | `RequireClientOptIn` | false | off (default) = enhance every eligible transcode |
 | `ForceTranscode` | false | turn a would-be stream copy into a real transcode |
 | `ForceTranscodeForDirectPlay` | false | see below — stops clients direct playing eligible material |

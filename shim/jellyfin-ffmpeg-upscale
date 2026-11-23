@@ -54,6 +54,7 @@ REAL_FFPROBE = "/usr/lib/jellyfin-ffmpeg/ffprobe"
 CONFIG_PATH = "/etc/jellyfin-upscale.json"
 LOG_PATH = "/var/log/jellyfin-upscale.log"
 SLOT_DIR = "/run/jellyfin-upscale"
+DRM_ROOT = "/sys/class/drm"
 
 DEFAULTS = {
     "enabled": True,
@@ -67,6 +68,12 @@ DEFAULTS = {
     "shader_cache_dir": "/var/cache/jellyfin/gpu-upscale-shaders",
     "upscaler": "ewa_lanczos",
     "encoder": "hevc_nvenc",
+    # Unset keeps "-init_hw_device vulkan=vk:0", the first Vulkan device. On an Intel GPU, or a
+    # server with more than one, name the render node (for example "/dev/dri/renderD129") and the
+    # Vulkan device is derived from it. Nothing here detects a GPU or tests the node: set it only
+    # where you know it, and use an encoder that GPU can run ("hevc_qsv" on Intel). Hand-set only:
+    # the plugin's ShimBridge.Sync keeps a value found here but never writes it.
+    "render_node": None,
     "min_scale_factor": 1.15,     # skip near-identity upscales
     # Below this ratio the fixed-2x network is skipped and the chain is plain scaling plus the
     # sharpener. Measured: libplacebo shrinks a 2x network's output back, and at 1.5x what
@@ -429,7 +436,42 @@ def build_chain(cfg, tw, th, ratio):
     placebo = "libplacebo=w=%d:h=%d:upscaler=%s" % (tw, th, cfg["upscaler"])
     if files:
         placebo += ":custom_shader_path=%s" % compose_shader(cfg, files)
+    if render_node_is_intel(cfg):
+        # ANV returns green frames for libplacebo's multi-planar YUV output (UAVG/VAVG 0), so it
+        # outputs RGBA and the conversion to yuv420p happens on the CPU. The shim cannot see the
+        # source's tags, hence bt709/tv.
+        return ("format=yuv420p,hwupload,%s:format=rgba,hwdownload,format=rgba,"
+                "scale=out_color_matrix=bt709:out_range=tv,format=yuv420p" % placebo)
     return "format=yuv420p,hwupload,%s,hwdownload,format=yuv420p" % placebo
+
+
+def render_node_is_intel(cfg):
+    """True when render_node is a plain render node whose PCI vendor is Intel (0x8086).
+
+    The same sysfs file GpuVendor.cs reads. Anything unset, invalid or unreadable is not Intel,
+    so those keep the chain they always had.
+    """
+    node = cfg.get("render_node")
+    if not (isinstance(node, str) and re.fullmatch(r"/dev/dri/renderD[0-9]+", node)):
+        return False
+    try:
+        with open(os.path.join(DRM_ROOT, os.path.basename(node), "device", "vendor")) as fh:
+            return fh.read().strip().lower() == "0x8086"
+    except Exception:
+        return False
+
+
+def device_args(cfg):
+    """The Vulkan device arguments: the first Vulkan device, or one derived from render_node.
+
+    Only a plain /dev/dri/renderD<digits> path is used; anything else keeps vk:0 rather than put
+    an unvetted string on the command line.
+    """
+    node = cfg.get("render_node")
+    if isinstance(node, str) and re.fullmatch(r"/dev/dri/renderD[0-9]+", node):
+        return ["-init_hw_device", "drm=dr:" + node, "-init_hw_device", "vulkan=vk@dr",
+                "-filter_hw_device", "vk"]
+    return ["-init_hw_device", "vulkan=vk:0", "-filter_hw_device", "vk"]
 
 
 def rewrite_args(cfg, args, chain):
@@ -462,7 +504,7 @@ def rewrite_args(cfg, args, chain):
         # everything after the last -i and before the output file (the last arg).
         out = out[:-1] + ["-vf", chain] + out[-1:]
 
-    return ["-init_hw_device", "vulkan=vk:0", "-filter_hw_device", "vk"] + out
+    return device_args(cfg) + out
 
 
 # Held open, and locked, for as long as this shim runs: the lock is what proves the

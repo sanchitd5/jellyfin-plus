@@ -148,6 +148,7 @@ esbuild) support natively.
 
 | file | exports |
 |---|---|
+| `src/Transcoding/GpuFdinfo.cs` | `DrmFdinfo` (`Parse` one fdinfo file of an i915 or xe DRM client, `Scan` a /proc tree for the clients on a render node, `Compute` busy percent and video-engine clients from two samples), `GpuIdleResidency` (`Read`/`IdlePercent` of the sysfs RC6 and GT-idle counters); BCL only, compiled by the test harness; used by `GpuLoadController` |
 | `src/Transcoding/CpuBudget.cs` | `CpuBudget` (`Cores`, `PlaybackCores`, `BackgroundDegree`, pure `ContainerCores`/`PlaybackCoresFor`/`Budget`/`ParseStatTicks`; one 2 s /proc sampler of ffmpeg CPU), `DynamicGate` (async gate whose limit is re-read on every acquire/release) |
 
 ## Entry point

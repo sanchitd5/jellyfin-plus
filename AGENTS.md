@@ -33,7 +33,7 @@ Layout:
 ```
 src/                    plugin assembly (loads into Jellyfin's collectible ALC), grouped by feature:
                         Hosting/ (PatcherLoader), Transcoding/ (UpscaleController, GpuLoadController,
-                        CpuBudget, ShimBridge), Library/ (FilterCache, FolderImageLinkTasks,
+                        GpuFdinfo (Intel load from DRM fdinfo, BCL only), CpuBudget, ShimBridge), Library/ (FilterCache, FolderImageLinkTasks,
                         LibraryCensusController, IngestController, TagAdminController, ImageWarmController),
                         Search/ (SearchFacetsController, FtsIndex), Markers/, Moments/, SmartTags/;
                         Plugin.cs at the root. Hosted/scheduled/post-scan services are the *Tasks/FilterCache/FtsIndex files.

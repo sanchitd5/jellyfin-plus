@@ -27,6 +27,24 @@
 #   WITH_OPTIX=1 WITH_ORT=1 WITH_FSR2=1 WITH_DLSS=1 \
 #        sudo -E ./scripts/build-ffmpeg.sh             # all five, SDK paths defaulted below
 #   PREFIX=/usr/lib/my-ffmpeg sudo -E ./scripts/build-ffmpeg.sh
+#   WITH_ORT=1 ORT_EP=openvino sudo -E ./scripts/build-ffmpeg.sh
+#                                                      # OIDN + the ort filter on an Intel GPU, no NVIDIA SDK
+#
+# ORT_EP=cuda|openvino (default cuda) says which ONNX Runtime the ort filter is built against. cuda is
+# the path described everywhere else in this header and is not changed. openvino builds the filter against
+# Intel's OpenVINO-enabled ONNX Runtime (the onnxruntime-openvino wheel, MIT, which carries the OpenVINO
+# runtime, Apache-2.0, so the binary is GPLv3 like the OIDN one) and applies ffmpeg/0015 instead of 0003,
+# so it needs none of WITH_OPTIX, OPTIX_SDK, NVOF_SDK, the CUDA runtime libraries or the NVPTX clang for
+# ONNX Runtime. It downloads three things, each pinned and checked against a sha256 below: that wheel (the
+# runtime, staged under <prefix>/ort/lib) and onnxruntime_c_api.h with the one header it includes (from
+# Microsoft's NuGet package; ORT_SDK=/path/with/include/ may name headers of the same version instead).
+# An ONNX Runtime carries the CUDA provider or the OpenVINO one, so one binary is one or the other, and it
+# is refused beside WITH_OPTIX, WITH_FSR2, WITH_DLSS and WITH_MAXINE_VSR. Not removed by it, and PR 8 of
+# docs/architecture/GPU_VENDORS.md is where they go: FFmpeg's own nv-codec-headers (MIT, no SDK, no card:
+# the driver is dlopen()ed), the --enable-ffnvcodec/cuda/nvenc configure flags and patches 0006 to 0014
+# are still applied. The Intel GPU plugin needs the host's OpenCL stack (ocl-icd-libopencl1,
+# intel-opencl-icd); this script does not install it. proxmox-build.sh does not know ORT_EP: it requires
+# the five NVIDIA-era filters and so refuses this binary. docs/filters/NEURAL.md has the details.
 #
 # The build patches stack in order (0001 oidn, 0002 optix, 0003 ort, 0004 fsr2+dlss, 0005 vsr), each
 # patching context the previous one added, so the later options require the earlier ones. vf_vsr.c
@@ -107,6 +125,12 @@ export CCACHE_NOHASHDIR=1
 WITH_OIDN="${WITH_OIDN:-1}"
 WITH_OPTIX="${WITH_OPTIX:-0}"
 WITH_ORT="${WITH_ORT:-0}"
+# cuda (default, today's build) or openvino (an Intel GPU, no NVIDIA SDK); see the header.
+ORT_EP="${ORT_EP:-cuda}"
+case "$ORT_EP" in
+    cuda|openvino) ;;
+    *) echo "ORT_EP must be cuda or openvino, not '$ORT_EP'" >&2; exit 1 ;;
+esac
 WITH_FSR2="${WITH_FSR2:-0}"
 WITH_DLSS="${WITH_DLSS:-0}"
 WITH_MAXINE_VSR="${WITH_MAXINE_VSR:-0}"
@@ -145,6 +169,10 @@ fi
 
 # Defaults are where these SDKs were unpacked on the build box. Nothing fetches them; a wrong path
 # fails in preflight naming the variable rather than 20 minutes into a compile.
+# Whether the caller named these, before the defaults below fill them in: ORT_EP=openvino fetches and
+# stages its own and only accepts ORT_SDK (headers) from the caller.
+ORT_SDK_GIVEN="${ORT_SDK:-}"
+ORT_LIB_GIVEN="${ORT_LIB:-}"
 ORT_SDK="${ORT_SDK:-/root/gameupscale}"
 # The ONNX Runtime headers and its shared libraries need not sit together, and on the build box
 # they do not: only the headers were kept beside the other SDKs, while the runtime was unpacked
@@ -184,6 +212,20 @@ VFXVSR_DIR="${VFXVSR_DIR:-/root/gameupscale/vfx/nvvfxvideosuperres}"
 # clean) and confirmed to get CreateEffect+Load further than the NGC SDK Core + hand-fetched
 # CUDA/NPP/cuDNN combination this project assembled first.
 VFXLIBS_DIR="${VFXLIBS_DIR:-/root/gameupscale/vfx/pywheel-libs}"
+# ORT_EP=openvino. One version for the runtime and the headers: the OpenVINO provider is built against
+# exactly one ONNX Runtime core, so the core comes from the same wheel as the provider and the headers
+# are checked against ORT_OPENVINO_API (the minor of the version, ORT_API_VERSION). The hashes are of
+# the wheel as pypi.org lists it and of the two headers inside Microsoft.ML.OnnxRuntime 1.24.1 on
+# nuget.org. Bump all of them together or the build refuses.
+# The soname staged in the lib loop below (libopenvino.so.2541) belongs to this wheel too: the wheel URL,
+# the sha256 and that soname change together.
+ORT_OPENVINO_VER="1.24.1"
+ORT_OPENVINO_API="24"
+ORT_OPENVINO_WHEEL="onnxruntime_openvino-1.24.1-cp312-cp312-manylinux_2_28_x86_64.whl"
+ORT_OPENVINO_URL="https://files.pythonhosted.org/packages/50/cf/17ba72de2df0fcba349937d2788f154397bbc2d1a2d67772a97e26f6bc5f/${ORT_OPENVINO_WHEEL}"
+ORT_OPENVINO_SHA256="d617fac2f59a6ab5ea59a788c3e1592240a129642519aaeaa774761dfe35150e"
+ORT_C_API_SHA256="7f03541b0233c53b8c91855910c9382c4fb4a26b8fe099965c7c3cad1af2ced6"
+ORT_EP_C_API_SHA256="7de0ebae527f18b39fbeb3129d5781a995e76f685842c2e16aa0468230e6368b"
 OIDN_VER="${OIDN_VER:-2.5.1}"
 LIBPLACEBO_TAG="${LIBPLACEBO_TAG:-v7.351.0}"
 # Pinned, like every other source build here. 2026.4 knows GL_EXT_expect_assume; the distro 2023.8
@@ -246,7 +288,21 @@ if [[ "$WITH_FSR2" == "1" || "$WITH_DLSS" == "1" ]]; then
     [[ "$WITH_ORT" == "1" ]] \
         || die "WITH_FSR2/WITH_DLSS need WITH_ORT=1: patch 0004 applies on top of 0003"
 fi
-if [[ "$WITH_ORT" == "1" ]]; then
+if [[ "$WITH_ORT" == "1" && "$ORT_EP" == "openvino" ]]; then
+    # Intel's ONNX Runtime has no CUDA provider, and 0004 (fsr2, dlss) and 0005 (vsr) stack on 0003, which
+    # this build does not apply. None of these is an Intel filter in any case.
+    [[ "$WITH_OPTIX" != "1" && "$WITH_FSR2" != "1" && "$WITH_DLSS" != "1" && "$WITH_MAXINE_VSR" != "1" ]] \
+        || die "ORT_EP=openvino cannot be built with WITH_OPTIX, WITH_FSR2, WITH_DLSS or WITH_MAXINE_VSR: they need the NVIDIA SDKs and the CUDA ONNX Runtime"
+    [[ -z "$ORT_LIB_GIVEN" ]] \
+        || die "ORT_EP=openvino stages its own runtime from the pinned wheel; unset ORT_LIB (ORT_SDK may still name headers)"
+    if [[ -n "$ORT_SDK_GIVEN" ]]; then
+        [[ -f "$ORT_SDK/include/onnxruntime_c_api.h" ]] \
+            || die "ORT_EP=openvino: no onnxruntime_c_api.h under ORT_SDK=$ORT_SDK/include (leave ORT_SDK unset to fetch the pinned one)"
+    fi
+    # Another ONNX Runtime core beside this one's provider is how a CUDA install breaks quietly.
+    [[ ! -e "$PREFIX/ort/lib/libonnxruntime_providers_cuda.so" ]] \
+        || die "ORT_EP=openvino: $PREFIX/ort/lib already holds a CUDA ONNX Runtime (libonnxruntime_providers_cuda.so); use another PREFIX, or remove that directory if this machine is moving to Intel"
+elif [[ "$WITH_ORT" == "1" ]]; then
     [[ "$WITH_OPTIX" == "1" ]] \
         || die "WITH_ORT=1 needs WITH_OPTIX=1: patch 0003 applies on top of 0002"
     [[ -f "$ORT_SDK/include/onnxruntime_c_api.h" ]] \
@@ -446,6 +502,48 @@ if [[ "$WITH_OIDN" == "1" ]]; then
     OIDN_FLAGS=(--enable-libopenimagedenoise)
 fi
 
+# --- ONNX Runtime with the OpenVINO provider ------------------------------------------------------
+if [[ "$WITH_ORT" == "1" && "$ORT_EP" == "openvino" ]]; then
+    say "ONNX Runtime ${ORT_OPENVINO_VER} with the OpenVINO provider (Intel's wheel: MIT, with OpenVINO and oneTBB, Apache-2.0)"
+    ort_stage="$BUILD/ort-openvino"
+    mkdir -p "$ort_stage/lib"
+    curl -fsSL -o "$BUILD/$ORT_OPENVINO_WHEEL" "$ORT_OPENVINO_URL"
+    echo "$ORT_OPENVINO_SHA256  $BUILD/$ORT_OPENVINO_WHEEL" | sha256sum -c - \
+        || die "$ORT_OPENVINO_WHEEL does not match the pinned sha256 (ORT_OPENVINO_SHA256)"
+    # Only the libraries: the wheel's Python module is not wanted, and a wheel is a zip. Whatever is
+    # unpacked is data until it is checked, so Python runs isolated and writes bare file names only.
+    python3 -I - "$BUILD/$ORT_OPENVINO_WHEEL" "$ort_stage/lib" <<'PY' || die "could not unpack the ONNX Runtime libraries from the wheel"
+import os, sys, zipfile
+wheel, out = sys.argv[1:3]
+n = 0
+with zipfile.ZipFile(wheel) as z:
+    for info in z.infolist():
+        name = info.filename
+        if name.startswith("onnxruntime/capi/") and ".so" in name and "pybind" not in name:
+            with open(os.path.join(out, os.path.basename(name)), "wb") as f:
+                f.write(z.read(info))
+            n += 1
+print("unpacked %d libraries" % n)
+PY
+    for lib in libonnxruntime.so.${ORT_OPENVINO_VER} libonnxruntime_providers_openvino.so \
+               libonnxruntime_providers_shared.so libopenvino.so.2541 libopenvino_intel_gpu_plugin.so; do
+        [[ -f "$ort_stage/lib/$lib" ]] || die "the wheel holds no $lib: the pinned wheel is not the one this script was written for"
+    done
+    # The core's soname is libonnxruntime.so.1 and the linker looks for libonnxruntime.so.
+    ln -sf "libonnxruntime.so.${ORT_OPENVINO_VER}" "$ort_stage/lib/libonnxruntime.so.1"
+    ln -sf "libonnxruntime.so.1" "$ort_stage/lib/libonnxruntime.so"
+    if [[ -z "$ORT_SDK_GIVEN" ]]; then
+        python3 -I "$HERE/scripts/fetch-ort-header.py" "$ORT_OPENVINO_VER" "$ort_stage/include" \
+            "onnxruntime_c_api.h:$ORT_C_API_SHA256" "onnxruntime_ep_c_api.h:$ORT_EP_C_API_SHA256" \
+            || die "could not fetch the ONNX Runtime ${ORT_OPENVINO_VER} headers"
+        ORT_SDK="$ort_stage"
+    fi
+    # [[:space:]]*: Microsoft's header has CRLF line endings.
+    grep -Eq "^#define ORT_API_VERSION ${ORT_OPENVINO_API}[[:space:]]*\$" "$ORT_SDK/include/onnxruntime_c_api.h" \
+        || die "$ORT_SDK/include/onnxruntime_c_api.h is not ONNX Runtime API ${ORT_OPENVINO_API}: the headers must match the runtime in the wheel"
+    ORT_LIB="$ort_stage/lib"
+fi
+
 # --- ffmpeg ---------------------------------------------------------------------------------------
 say "FFmpeg ${FFMPEG_VER}"
 curl -fsSL -o "ffmpeg-${FFMPEG_VER}.tar.xz" "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VER}.tar.xz"
@@ -545,7 +643,12 @@ fi
 ORT_FLAGS=()
 if [[ "$WITH_ORT" == "1" ]]; then
     cp "$HERE/ffmpeg/vf_ort.c" libavfilter/
-    patch -p1 < "$HERE/ffmpeg/0003-add-ort-filter-to-build.patch"
+    if [[ "$ORT_EP" == "openvino" ]]; then
+        # 0003's context is lines 0002 (OptiX) added; 0015 is the same change against a tree without it.
+        patch -p1 < "$HERE/ffmpeg/0015-add-ort-filter-to-build-standalone.patch"
+    else
+        patch -p1 < "$HERE/ffmpeg/0003-add-ort-filter-to-build.patch"
+    fi
     # rpath, not -L, decides what the installed binary loads: the runtime tree is staged under
     # PREFIX and the build copy of it may not survive this script.
     export CFLAGS="-I${ORT_SDK}/include ${CFLAGS:-}"
@@ -739,10 +842,15 @@ if [[ "$WITH_ORT" == "1" ]]; then
     # beside them come from NVIDIA's wheels by hand, and libonnxruntime_providers_cuda.so gets a
     # patchelf rpath fix there which overwriting would undo. NEURAL.md has both.
     mkdir -p "$PREFIX/ort/lib"
+    if [[ "$ORT_EP" == "openvino" ]]; then
+        # The whole set, not only libonnxruntime*: the provider, OpenVINO, its GPU plugin and oneTBB sit
+        # beside the core and find each other through their own $ORIGIN rpath, which is why no patchelf
+        # fix is needed here (the CUDA provider has none). The wheel is pinned, so this is a refresh.
+        cp -a "$ORT_LIB"/. "$PREFIX/ort/lib/"
     # Nothing to stage when the runtime is already the thing we linked against, which is the case
     # on a box where the release tarball was unpacked straight into the prefix and only its headers
     # were kept beside the other SDKs.
-    if [[ "$(cd "$ORT_LIB" && pwd -P)" != "$(cd "$PREFIX/ort/lib" && pwd -P)" ]]; then
+    elif [[ "$(cd "$ORT_LIB" && pwd -P)" != "$(cd "$PREFIX/ort/lib" && pwd -P)" ]]; then
         for lib in "$ORT_LIB"/libonnxruntime*; do
             [[ -e "$lib" ]] || continue
             [[ -e "$PREFIX/ort/lib/$(basename "$lib")" ]] || cp -a "$lib" "$PREFIX/ort/lib/"
@@ -789,6 +897,18 @@ if [[ "$WITH_ORT" == "1" ]]; then
     "$PREFIX/ffmpeg" -hide_banner -filters 2>/dev/null | grep -E "\bort\b" \
         && echo "  ort: present" || die "ort filter missing from the build"
 fi
+if [[ "$WITH_ORT" == "1" && "$ORT_EP" == "openvino" ]]; then
+    # Captured first: grep -q closing the pipe early would SIGPIPE ffmpeg, which fails under pipefail.
+    ort_help="$("$PREFIX/ffmpeg" -hide_banner -h filter=ort 2>/dev/null || true)"
+    grep -q "openvino" <<<"$ort_help" \
+        && echo "  ort: device=openvino offered" || die "the ort filter in this build has no device=openvino"
+    # What the plugin's OpenVinoAvailable looks for (GpuVendor.cs): the provider beside the core.
+    [[ -f "$PREFIX/ort/lib/libonnxruntime_providers_openvino.so" ]] \
+        && echo "  ort: libonnxruntime_providers_openvino.so staged" \
+        || die "$PREFIX/ort/lib/libonnxruntime_providers_openvino.so was not staged"
+    echo "  note: whether the Intel GPU is used needs the host's OpenCL runtime (intel-opencl-icd); watch a real" \
+         "encode at -v verbose for 'OpenVINO execution provider unavailable', the line that says it ran on the CPU"
+fi
 if [[ "$WITH_FSR2" == "1" ]]; then
     "$PREFIX/ffmpeg" -hide_banner -filters 2>/dev/null | grep -E "\bfsr2\b" \
         && echo "  fsr2: present" || die "fsr2 filter missing from the build"
@@ -823,7 +943,10 @@ fi
 # passed every exit-code and frame-count check while returning scrambled frames, so a build whose
 # bridge corrupts is a failed build. BRIDGE_TEST=0 skips it, for building a binary that is known
 # to be broken in order to debug it; never for anything that gets deployed.
-if [[ "${BRIDGE_TEST:-1}" == "1" ]]; then
+# The bridge is the NVIDIA hand-off (CUDA and Vulkan); an Intel build machine has no CUDA to cross it.
+BRIDGE_TEST_DEFAULT=1
+[[ "$WITH_ORT" == "1" && "$ORT_EP" == "openvino" ]] && BRIDGE_TEST_DEFAULT=0
+if [[ "${BRIDGE_TEST:-$BRIDGE_TEST_DEFAULT}" == "1" ]]; then
     "$HERE/scripts/test-hwmap-bridge.sh" "$PREFIX/ffmpeg" \
         || die "the CUDA<->Vulkan bridge returns corrupted frames (scripts/test-hwmap-bridge.sh); BRIDGE_TEST=0 skips this"
 fi

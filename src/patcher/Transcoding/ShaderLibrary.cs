@@ -543,8 +543,9 @@ namespace Jellyfin.Plugin.Plus.Patcher
 
         /// <summary>
         /// NEURAL SUPER-RESOLUTION: a CPU-side network pass that enlarges the frame BEFORE
-        /// hwupload, run by the "ort" filter - ONNX Runtime on its CUDA execution provider,
-        /// carried by the SAME patched binary as oidn and optix.
+        /// hwupload, run by the "ort" filter - ONNX Runtime on its CUDA execution provider (or, on
+        /// an Intel GPU, the OpenVINO one, GPU_VENDORS.md 5.4), carried by the SAME patched binary
+        /// as oidn and optix.
         ///
         /// It is a separate axis from SrLevel and not a rung of anything. SrLevel is a libplacebo
         /// custom shader that runs inside the scaling pass; these are ONNX graphs that cannot be
@@ -563,7 +564,8 @@ namespace Jellyfin.Plugin.Plus.Patcher
         /// hardware, and they are roughly an order of magnitude more expensive than the shader
         /// that ships as the default. They are here because they are reachable by name and by the
         /// Advanced row, exactly as oidn and optix are, and for no other reason. Nothing selects
-        /// them automatically and they are not costed into the generated quality ladder.
+        /// them automatically (except an operator's own NeuralMaxSourceHeight, UpscaleEngine.
+        /// RouteNeuralBySourceHeight) and they are not costed into the generated quality ladder.
         ///
         /// The weights are NOT distributed with this plugin. They are exported from the official
         /// Real-ESRGAN checkpoints; see NEURAL.md. A level whose .onnx file is not present is not
@@ -934,6 +936,43 @@ namespace Jellyfin.Plugin.Plus.Patcher
 
         public static bool IsDenoiseLevel(string level) => level != null && _denoiseFilters.ContainsKey(level.Trim());
 
+        /// <summary>
+        /// The OptiX denoise levels (optix, optix-temporal, and the unlisted optix-hdr): the filter
+        /// takes AV_PIX_FMT_CUDA frames, so a server without an NVIDIA GPU cannot run them. Read off
+        /// the filter text, so a new OptiX level is covered by being written the way these are.
+        /// </summary>
+        public static bool IsNvidiaOnlyDenoise(string level) =>
+            level != null
+            && _denoiseFilters.TryGetValue(level.Trim(), out string filter)
+            && filter != null
+            && filter.IndexOf("optix=", StringComparison.OrdinalIgnoreCase) >= 0;
+
+        /// <summary>
+        /// The neural levels that need NVIDIA libraries over CUDA: dlpp-1..4 and vsr-rtcuda (the two
+        /// CUDA-native levels) and the retired Maxine "vsr". The ONNX levels are not here: ort runs on
+        /// OpenVINO on an Intel GPU, or falls back to ONNX Runtime's CPU provider, so they are not
+        /// CUDA-required (GPU_VENDORS.md 5.3 and 5.4).
+        /// </summary>
+        public static bool IsNvidiaOnlyNeural(string level) =>
+            level != null
+            && (IsCudaNeuralLevel(level) || level.Trim().Equals(VsrLevel, StringComparison.OrdinalIgnoreCase));
+
+        /// <summary>
+        /// The ONNX neural levels (realesr-*): runnable without NVIDIA, but their speed was only measured
+        /// on it, so Intel withholds them until it is measured there (UpscaleEngine.IntelWithholdReason).
+        /// </summary>
+        public static bool IsOnnxNeural(string level) =>
+            level != null
+            && !level.Trim().Equals("off", StringComparison.OrdinalIgnoreCase)
+            && _neuralModels.ContainsKey(level.Trim());
+
+        /// <summary>
+        /// Every game temporal upscaler: dlss and dlaa are NVIDIA's, and fsr2 is fed by NVOFA motion
+        /// vectors through CUDA (gu_inputs.h), so none of the three runs without an NVIDIA GPU.
+        /// </summary>
+        public static bool IsNvidiaOnlyGame(string level) =>
+            IsGameLevel(level) && !level.Trim().Equals("off", StringComparison.OrdinalIgnoreCase);
+
         /// <summary>The full path to a neural level's weights, or null when there is no such level.</summary>
         public static string NeuralModelPath(string level, UpscaleSettings cfg = null)
         {
@@ -1300,7 +1339,8 @@ namespace Jellyfin.Plugin.Plus.Patcher
         {
             try
             {
-                return path != null && File.Exists(path);
+                return path != null
+                    && (WeightFileExistsSource != null ? WeightFileExistsSource(path) : File.Exists(path));
             }
             catch (Exception)
             {
@@ -1366,9 +1406,15 @@ namespace Jellyfin.Plugin.Plus.Patcher
         /// The session's source and output heights decide which weight of the asked-for family
         /// actually runs; see NeuralForRatio. levelUsed reports the weight that ran, so a
         /// substitution reaches the session record and the panel rather than happening silently.
+        ///
+        /// device is the ort filter's own device option ("cpu" or "openvino"), or null for the
+        /// filter's default, which is CUDA. Null adds nothing to the string, so every server that is
+        /// not on the Intel path gets the node it always got. Anything else is ignored rather than
+        /// put on a command line.
         /// </summary>
         public static string NeuralFilter(
-            string level, int sourceHeight, int outputHeight, out string levelUsed, UpscaleSettings cfg = null)
+            string level, int sourceHeight, int outputHeight, out string levelUsed, UpscaleSettings cfg = null,
+            string device = null)
         {
             levelUsed = "off";
 
@@ -1411,7 +1457,79 @@ namespace Jellyfin.Plugin.Plus.Patcher
             string path = NeuralModelPath(chosen, cfg);
 
             levelUsed = chosen;
-            return "format=gbrpf32le,ort=model=" + path + ",format=yuv420p";
+            string deviceArg = string.Equals(device, "cpu", StringComparison.Ordinal)
+                || string.Equals(device, "openvino", StringComparison.Ordinal)
+                ? ":device=" + device
+                : string.Empty;
+            return "format=gbrpf32le,ort=model=" + path + deviceArg + ",format=yuv420p";
+        }
+
+        /// <summary>True for the ONNX levels (realesr-*) that the ort filter runs; false for off, dlpp-*, vsr-rtcuda and vsr.</summary>
+        public static bool IsOnnxNeuralLevel(string level) =>
+            level != null
+            && _neuralModels.TryGetValue(level.Trim(), out string file)
+            && file != null;
+
+        /// <summary>
+        /// The ONNX level the engine picks for a source small enough to route to the neural path when
+        /// nothing named one: the cheapest weight whose file is installed (the menu is cheapest
+        /// first), or null when none is. The ratio substitution (NeuralForRatio) still applies to it.
+        /// </summary>
+        public static string AutoNeuralLevel(UpscaleSettings cfg = null)
+        {
+            // Planned for every session at or below the height line: stat the weights once per
+            // directory per AutoNeuralTtlMs, not on every plan. A weight installed later shows up
+            // within the TTL, with no restart.
+            string dir = NeuralModelDirectoryFor(cfg);
+            long now = AutoNeuralClockMs();
+            lock (_autoNeuralLock)
+            {
+                if (_autoNeuralCache.TryGetValue(dir, out (string Level, long At) hit)
+                    && now - hit.At < AutoNeuralTtlMs)
+                {
+                    return hit.Level;
+                }
+            }
+
+            string picked = null;
+            foreach (string level in _neuralMenu)
+            {
+                if (IsOnnxNeuralLevel(level) && NeuralWeightsPresent(NeuralModelPath(level, cfg)))
+                {
+                    picked = level;
+                    break;
+                }
+            }
+
+            lock (_autoNeuralLock)
+            {
+                _autoNeuralCache[dir] = (picked, now);
+            }
+
+            return picked;
+        }
+
+        private const long AutoNeuralTtlMs = 30000;
+        private static readonly object _autoNeuralLock = new object();
+        private static readonly Dictionary<string, (string Level, long At)> _autoNeuralCache =
+            new Dictionary<string, (string Level, long At)>(StringComparer.Ordinal);
+
+        /// <summary>Replaces the file-exists check the weights are looked up with. For the tests.</summary>
+        internal static Func<string, bool> WeightFileExistsSource { get; set; }
+
+        /// <summary>Replaces the clock the auto-pick cache ages by (milliseconds). For the tests.</summary>
+        internal static Func<long> AutoNeuralClockSource { get; set; }
+
+        private static long AutoNeuralClockMs() =>
+            AutoNeuralClockSource != null ? AutoNeuralClockSource() : Environment.TickCount64;
+
+        /// <summary>Forgets the cached auto-pick. For the tests.</summary>
+        internal static void ResetAutoNeuralCache()
+        {
+            lock (_autoNeuralLock)
+            {
+                _autoNeuralCache.Clear();
+            }
         }
 
         /// <summary>
@@ -1563,11 +1681,11 @@ namespace Jellyfin.Plugin.Plus.Patcher
         /// installed. Derived from the directory the runtime assets already live in, so the path
         /// is stated once rather than spelled out at each use.
         /// </summary>
-        public static string PatchedFfmpegPath()
+        public static string PatchedFfmpegPath(UpscaleSettings cfg = null)
         {
             try
             {
-                string dir = Path.GetDirectoryName(NeuralModelDirectory);
+                string dir = Path.GetDirectoryName(NeuralModelDirectoryFor(cfg));
                 if (string.IsNullOrEmpty(dir))
                 {
                     return null;
