@@ -325,12 +325,14 @@ else:
 # The filter list is followed by thousands of lines, as the real binary's is: a `| grep -q` that quits at
 # its match then SIGPIPEs the writer, and under pipefail that reads as "no such filter".
 FFMPEG_STUB = r'''#!/bin/sh
+[ -z "${FAKE_FFMPEG_LOG:-}" ] || echo "$*" >> "$FAKE_FFMPEG_LOG"
 case "$*" in
 *-filters*)
     for f in oidn ort fsr2 libplacebo xpsnr; do echo " T.. $f  V->V stub"; done
     i=0; while [ $i -lt 4000 ]; do echo " T.. pad$i  V->V padding so the pipe fills"; i=$((i + 1)); done
     exit 0;;
 *xpsnr=*)
+    [ "${FAKE_XPSNR_FAIL:-}" = 1 ] && exit 1
     case "$*" in *shader.mkv*) echo "XPSNR y: 40.0 u: 40.0 v: 40.0" >&2;; *) echo "XPSNR y: 30.0 u: 30.0 v: 30.0" >&2;; esac
     exit 0;;
 *-benchmark*)
@@ -340,7 +342,23 @@ esac
 exit 0
 '''
 
-FFPROBE_STUB = '#!/bin/sh\ncase "$*" in *r_frame_rate*) echo 24/1;; *height,codec_name*) echo h264,1080;; *) echo h264;; esac\n'
+# Width and height per clip: the tears masters are letterboxed (1920x858 at 1080p), wide_ is a 16:9 title, any
+# other clip is unreadable.
+FFPROBE_STUB = r'''#!/bin/sh
+case "$*" in
+*r_frame_rate*) echo 24/1;;
+*stream=width,height*)
+    case "$*" in
+    *tears_360p*) echo 640,286;;
+    *tears_720p* | *pan_720p*) echo 1280,572;;
+    *tears_1080p* | *pan_1080p*) echo 1920,858;;
+    *wide_360p*) echo 640,360;;
+    *) exit 1;;
+    esac;;
+*height,codec_name*) echo h264,1080;;
+*) echo h264;;
+esac
+'''
 
 # `date +%H%M` is the only thing it fakes (FAKE_HM); everything else is the real date. With FAKE_TZ_LOG set
 # it appends the TZ the script called it with, so a test can see which zone the gate asked for.
@@ -351,7 +369,7 @@ DATE_STUB = ('#!/bin/sh\nfor a in "$@"; do\n  if [ "$a" = "+%H%M" ] && [ -n "${F
 # A fake Jellyfin: serves JSON by URL path from $FAKE_DIR/scenario.json, logs every call (argv, stdin,
 # POST body) to $FAKE_DIR/log.jsonl, and keeps the plugin configuration and started sessions in state.json.
 FAKE_CURL = r'''#!@PY@
-import json, os, sys, urllib.parse
+import json, os, re, sys, urllib.parse
 
 d = os.environ["FAKE_DIR"]
 argv = sys.argv[1:]
@@ -372,13 +390,21 @@ u = urllib.parse.urlparse(url)
 path, q = u.path, urllib.parse.parse_qs(u.query)
 
 
+want_code = "-w" in argv
+
+
 def out(obj, raw=False):
     sys.stdout.write(obj if raw else json.dumps(obj))
+    if want_code:
+        sys.stdout.write("\n200")
     sys.exit(0)
 
 
-def fail():
-    sys.stderr.write("curl: (22) The requested URL returned error: 404\n")
+def fail(code=404):
+    # curl -f writes no body on an HTTP error, but -w still prints its code
+    if want_code:
+        sys.stdout.write("\n%d" % code)
+    sys.stderr.write("curl: (22) The requested URL returned error: %d\n" % code)
     sys.exit(22)
 
 
@@ -394,6 +420,15 @@ def save():
 
 if path == "/System/Info/Public":
     out({"ServerName": "fake"})
+# Jellyfin 12.4 has the legacy X-Emby-Token header off: only this Authorization header is a login
+m = re.search(r'^header = "((?:[^"\\]|\\.)*)"$', stdin, re.M)
+header = re.sub(r"\\(.)", r"\1", m.group(1)) if m else ""
+if header != 'Authorization: MediaBrowser Token="%s"' % os.environ["FAKE_TOKEN"]:
+    fail(401)
+if path == "/System/Info":
+    if sc.get("info_status"):
+        fail(sc["info_status"])
+    out({"Version": "12.4.0"})
 if sc.get("fail_all"):
     fail()
 cfg_max = st["config"].get("NeuralMaxSourceHeight", 0)
@@ -410,6 +445,10 @@ if path == "/JellyfinPlus/Status":
 if path == "/JellyfinPlus/Gpu/Load":
     out({"gpuBusyPercent": 12})
 if path == "/Items":
+    if sc.get("items_status"):
+        fail(sc["items_status"])
+    if sc.get("items_empty"):
+        out({"Items": []})
     out({"Items": [{"Id": "id%d" % h, "Path": "/media/tears_%dp.mkv" % h} for h in (360, 720, 1080, 2160)]})
 if path.startswith("/JellyfinPlus/Session/"):
     sid = path.rsplit("/", 1)[1]
@@ -499,6 +538,7 @@ class World:
             "BENCH_FFMPEG": ff, "BENCH_STOCK_FFMPEG": ff, "BENCH_CLIPS": self.clips, "BENCH_OUT": self.out,
             "BENCH_JELLYFIN_URL": "http://jf.test", "BENCH_JELLYFIN_TOKEN": TOKEN, "BENCH_SHIM_LOG": self.shim,
             "BENCH_RUNS": "1", "BENCH_CONFIRM_NO_GATES": "1", "FAKE_DIR": self.fake, "FAKE_SHIM_LOG": self.shim,
+            "FAKE_TOKEN": TOKEN, "FAKE_FFMPEG_LOG": os.path.join(self.root, "ffmpeg.log"),
             "REAL_DATE": REAL_DATE or "date"}, **(extra or {})), path=self.stubs)
 
     def run(self, args, script=BENCH, **extra):
@@ -573,7 +613,13 @@ def test_mutants(tmp):
         ("windows-ignored", 'BLOCK_WINDOWS="${BENCH_BLOCK_WINDOWS:-0100-0700,1630-1830}"', 'BLOCK_WINDOWS="0100-0700,1630-1830"', window_failures),
         ("malformed-accepted", "^[0-9]{4}-[0-9]{4}(,[0-9]{4}-[0-9]{4})*$", "^[0-9-]+(,[0-9-]+)*$", window_failures),
         ("run-fps-lost-failure", '|| { echo 0; rm -f "$log"; return 1; }', "|| true", runfps_failures),
-        ("token-on-argv", 'curl -fsS --config - "$@" "$JF_URL$p"', 'curl -fsS -H "X-Emby-Token: $JF_TOKEN" "$@" "$JF_URL$p"', token_failures),
+        ("token-on-argv", 'curl -fsS --config - "$@" "$JF_URL$p"',
+         'curl -fsS -H "Authorization: MediaBrowser Token=\\"$JF_TOKEN\\"" "$@" "$JF_URL$p"', token_failures),
+        ("legacy-header", 'Authorization: MediaBrowser Token=\\\\"%s\\\\"', "X-Emby-Token: %s", token_failures),
+        ("xpsnr-zero", 'c=$(xpsnr_y "$1" "$3") || return 1\n    b=$(xpsnr_y "$2" "$3") || return 1',
+         'c=$(xpsnr_y "$1" "$3" || echo 0); b=$(xpsnr_y "$2" "$3" || echo 0)', xpsnr_failures),
+        ("item-error-swallowed", 'ITEM_ERR="item lookup HTTP $API_CODE"; return 1;', "return 0;", item_failures),
+        ("dims-nominal", "NF >= 2 && $1 > 0 && $2 > 0", "0", size_failures),
     ]:
         path = mutant_dir(tmp, name, old, new)
         check(f"mutant {name} is caught by its behaviour check", bool(fn(path, tmp, "mut-" + name)))
@@ -1101,7 +1147,7 @@ def token_failures(script, tmp, tag):
     """The admin token goes to curl on stdin (--config -), never on its command line, on every call."""
     bad = []
     w = World(tmp, tag)
-    w.run(["--rows", "3"], script=script)
+    rc, out, err = w.run(["--rows", "3"], script=script)
     log = w.log()
     if not log:
         return ["no curl call logged"]
@@ -1111,6 +1157,92 @@ def token_failures(script, tmp, tag):
         bad.append("token missing from stdin on some call")
     if not all("--config" in e["argv"] for e in log):
         bad.append("not --config -")
+    # Jellyfin 12.4 takes only the MediaBrowser Authorization header; the fake rejects anything else with 401
+    if not all('Authorization: MediaBrowser Token=\\"%s\\"' % TOKEN in e["stdin"] for e in log):
+        bad.append("not the MediaBrowser Authorization header")
+    if any("X-Emby-Token" in e["stdin"] for e in log):
+        bad.append("legacy X-Emby-Token header")
+    if results(out).get(3, ("",))[0] != "PASS":
+        bad.append("row 3 does not authenticate: %s" % (results(out).get(3),))
+    return bad
+
+
+def ffmpeg_runs(w):
+    """The -vf command lines the stub ffmpeg was given in this world."""
+    p = os.path.join(w.root, "ffmpeg.log")
+    return [l for l in open(p).read().splitlines() if " -vf " in l] if os.path.exists(p) else []
+
+
+def pan_clips(w):
+    for n in ("pan_720p.mkv", "pan_1080p.mkv"):
+        open(os.path.join(w.clips, n), "w").close()
+
+
+def size_failures(script, tmp, tag):
+    """Output sizes follow the master's own (letterboxed) shape, never the nominal 16:9 size."""
+    bad = []
+    for row, title, clip, ow, oh in [
+        (2, "tears", "tears_360p", 1920, 858),
+        (3, "tears", "tears_720p", 1920, 858),
+        (4, "tears", "tears_1080p", 3840, 1716),
+        (8, "tears", "pan_720p", 1920, 858),
+        (11, "tears", "tears_1080p", 3840, 1716),
+        (2, "wide", "wide_360p", 1920, 1080),  # a 16:9 clip keeps 16:9: the 858 is derived, not fixed
+        (4, "unreadable", "unreadable_1080p", 3840, 2160),  # ffprobe fails: the nominal size, not a crash
+    ]:
+        w = World(tmp, f"{tag}-{row}-{title}", extra={"BENCH_TITLE": title, "BENCH_PLEX_TRANSCODING": "1"})
+        pan_clips(w)
+        w.run(["--rows", str(row)], script=script)
+        lines = [l for l in ffmpeg_runs(w) if f"/{clip}.mkv" in l]
+        want = re.compile(rf"(w={ow}:h={oh}|scale={ow}:{oh}:)(?!\d)")
+        if not lines:
+            bad.append(f"row{row}-{title}:no ffmpeg run")
+        for l in lines:
+            sizes = re.findall(r"(?:w=(\d+):h=(\d+)|scale=(\d+):(\d+):)", l)
+            if not want.search(l) or any((a or c, b or d) != (str(ow), str(oh)) for a, b, c, d in sizes):
+                bad.append(f"row{row}-{title}:{l[-90:]}")
+    return bad
+
+
+def xpsnr_failures(script, tmp, tag):
+    """A failed xpsnr run is a FAIL that says so, never a 0 dB score and a +0.00 delta."""
+    bad = []
+    w = World(tmp, tag)
+    pan_clips(w)
+    rc, out, err = w.run(["--rows", "2,3,4,8,9"], script=script, FAKE_XPSNR_FAIL="1")
+    res = results(out)
+    for row in (2, 3, 4, 8, 9):
+        st, detail = res.get(row, ("", ""))
+        if st != "FAIL" or "xpsnr failed" not in detail or "xpsnr_delta=+0.00" in detail or "+0.00dB" in detail:
+            bad.append(f"row{row}:{st}:{detail[:60]}")
+    w = World(tmp, tag + "-good")
+    rc, out, err = w.run(["--rows", "2,3"], script=script)
+    for row in (2, 3):
+        st, detail = results(out).get(row, ("", ""))
+        if st != "PASS" or "xpsnr_delta=+10.00dB" not in detail:
+            bad.append(f"good-row{row}:{st}:{detail[:60]}")
+    return bad
+
+
+def item_failures(script, tmp, tag):
+    """An HTTP error from the item lookup is its own failure, distinct from a clip missing from the library."""
+    bad = []
+    w = World(tmp, tag, {"items_status": 500}, {"BENCH_ORT_MODEL": "/m/model.onnx"})
+    rc, out, err = w.run(["--rows", "3,4,5,6,10,12"], script=script)
+    res = results(out)
+    for row in (3, 4, 5, 6, 10, 12):
+        st, detail = res.get(row, ("", ""))
+        if st != "FAIL" or "item lookup HTTP 500" not in detail or "not in the Jellyfin library" in detail:
+            bad.append(f"http500-row{row}:{st}:{detail[:60]}")
+    if w.posts()[-1:] != [w.config0]:
+        bad.append("row 6 left the plugin configuration changed")
+    w = World(tmp, tag + "-empty", {"items_empty": True})
+    rc, out, err = w.run(["--rows", "3,6,10,12"], script=script)
+    res = results(out)
+    for row in (3, 6, 10, 12):
+        st, detail = res.get(row, ("", ""))
+        if st != "FAIL" or "not in the Jellyfin library" not in detail or "item lookup" in detail:
+            bad.append(f"empty-row{row}:{st}:{detail[:60]}")
     return bad
 
 
@@ -1161,6 +1293,33 @@ def test_hermetic_api(tmp):
     check("the token is on curl's stdin, not its command line", not bad, str(bad))
     bad = runfps_failures(BENCH, tmp, "runfps")
     check("a failed ffmpeg run reaches the FAIL branch of rows 2 and 11", not bad, str(bad))
+    bad = size_failures(BENCH, tmp, "sizes")
+    check("rows 2, 3, 4, 8 and 11 scale to the master's letterboxed size, a 16:9 clip keeps 16:9", not bad, str(bad))
+    bad = xpsnr_failures(BENCH, tmp, "xpsnr")
+    check("a failed xpsnr is FAIL 'xpsnr failed' on rows 2, 3, 4, 8 and 9, never +0.00 dB", not bad, str(bad))
+    bad = item_failures(BENCH, tmp, "items")
+    check("an item lookup HTTP error is its own FAIL, distinct from 'not in the library'", not bad, str(bad))
+
+
+def test_token_rejected(tmp):
+    """Jellyfin 12.4 answers 401 to a token it does not accept: have_api must see that, not pass on /System/Info/Public."""
+    w = World(tmp, "badtoken", extra={"BENCH_JELLYFIN_TOKEN": "wrong-token", "BENCH_ORT_MODEL": "/m/model.onnx"})
+    rc, out, err = w.run(["--rows", "1,3,5,6,10,12"])
+    res = results(out)
+    check("a rejected token is FAIL 'token rejected' on rows 1, 3, 5, 6, 10 and 12",
+          all(res.get(r, ("", ""))[0] == "FAIL" and "token rejected" in res[r][1] for r in (1, 3, 5, 6, 10, 12)), f"{res} {err}")
+    check("a rejected token stops at the probe: no library, plugin or stream call",
+          not any(re.search(r"/Items|/Plugins|/Videos|/JellyfinPlus", u) for u in w.urls()), str(w.urls()))
+    check("a rejected token is not the token in the output", "wrong-token" not in out + err)
+    w = World(tmp, "info503", {"info_status": 503}, {"BENCH_ORT_MODEL": "/m/model.onnx"})
+    rc, out, err = w.run(["--rows", "1,3,6,10,12"])
+    res = results(out)
+    check("an API that errors on the probe without a 401 stays SKIP, not 'token rejected'",
+          all(res.get(r, ("",))[0] == "SKIP" for r in (1, 6, 10, 12)) and "token rejected" not in out and "e2e=SKIP" in res.get(3, ("", ""))[1],
+          f"{res} {err}")
+    w = World(tmp, "notoken", extra={"BENCH_JELLYFIN_TOKEN": ""})
+    rc, out, err = w.run(["--rows", "1,6"])
+    check("no token at all is SKIP and makes no call", all(results(out).get(r, ("",))[0] == "SKIP" for r in (1, 6)) and not w.log(), str(results(out)))
 
 
 def test_row_1_scope(tmp):
@@ -1328,7 +1487,7 @@ def main():
         return 1
     with tempfile.TemporaryDirectory() as tmp:
         for part in (test_plan_and_refusals, test_stub_run, test_mutants, test_webinject_without_dpkg_package,
-                     test_gates_and_confirmation, test_hermetic_api, test_row_1_scope, test_row_6, test_row_5,
+                     test_gates_and_confirmation, test_hermetic_api, test_token_rejected, test_row_1_scope, test_row_6, test_row_5,
                      test_shared_files):
             sub = os.path.join(tmp, part.__name__)
             os.makedirs(sub)

@@ -31,7 +31,7 @@
 #   BENCH_FSR2_OPTS       extra fsr2 filter options      (none)
 #   BENCH_RUNS            runs per figure                3
 #   BENCH_JELLYFIN_URL    the test Jellyfin              http://127.0.0.1:8096
-#   BENCH_JELLYFIN_TOKEN  an admin API token             (none)
+#   BENCH_JELLYFIN_TOKEN  an admin API token, sent as the MediaBrowser Authorization header   (none)
 #   BENCH_ASSERT_QUIET=1  the caller asserts no vzdump, no Plex or production Jellyfin transcode
 #   BENCH_PLEX_TRANSCODING=1  the caller asserts one Plex hardware transcode is running (row 11 only)
 #   BENCH_CONFIRM_NO_GATES=1  required with --no-gates: the caller owns the quiet-box check the gates make
@@ -341,17 +341,30 @@ run_fps() {
     printf '%s\n' "${vals[@]}" | median
 }
 
-# xpsnr_y <candidate> <master>: the luma XPSNR of a candidate against its master.
+# xpsnr_y <candidate> <master>: the luma XPSNR of a candidate against its master. Returns 1 and prints nothing
+# when ffmpeg fails or no score parses: a score that was not measured must never read as 0 dB.
 xpsnr_y() {
-    local log
+    local log v
     log=$(mktemp)
     cmd_xpsnr "$1" "$2" "$OUT/xpsnr.txt"
-    "${CMD[@]}" 2>"$log" >/dev/null || { echo 0; rm -f "$log"; return 1; }
-    awk '/XPSNR y:/ { for (i = 1; i <= NF; i++) if ($i == "y:") v = $(i + 1) } END { print v + 0 }' "$log"
+    "${CMD[@]}" 2>"$log" >/dev/null || { rm -f "$log"; return 1; }
+    v=$(awk '/XPSNR y:/ { for (i = 1; i <= NF; i++) if ($i == "y:") v = $(i + 1) } END { if (v != "") print v + 0 }' "$log")
     rm -f "$log"
+    [[ -n "$v" ]] || return 1
+    echo "$v"
 }
 
 src_fps() { "$FFPROBE" -v error -select_streams v:0 -show_entries stream=r_frame_rate -of csv=p=0 "$1" | awk -F/ '{ printf "%.3f\n", $1 / ($2 ? $2 : 1) }'; }
+
+# scaled_dims <clip> <nominal-src-height> <dst-w> <dst-h>: "W H" for an output built from <clip>, the clip's own
+# shape scaled by dst-h/src-height and rounded to even, so a letterboxed master (1920x858) stays letterboxed and
+# the candidate, the bicubic control and the master compare at one size. ffprobe failing gives the nominal size.
+scaled_dims() {
+    local d
+    d=$("$FFPROBE" -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0 "$1" 2>/dev/null \
+        | awk -F, -v sh="$2" -v dh="$4" 'NF >= 2 && $1 > 0 && $2 > 0 { f = dh / sh; printf "%d %d\n", int($1 * f / 2 + 0.5) * 2, int($2 * f / 2 + 0.5) * 2 }') || d=""
+    echo "${d:-$3 $4}"
+}
 
 # ---- Jellyfin API ----------------------------------------------------------------------------------
 
@@ -361,15 +374,53 @@ api() {
     local p="$1" tok="$JF_TOKEN"
     shift
     tok="${tok//\\/\\\\}"; tok="${tok//\"/\\\"}"
-    printf 'header = "X-Emby-Token: %s"\n' "$tok" | curl -fsS --config - "$@" "$JF_URL$p"
+    printf 'header = "Authorization: MediaBrowser Token=\\"%s\\""\n' "$tok" | curl -fsS --config - "$@" "$JF_URL$p"
 }
-have_api() { [[ -n "$JF_TOKEN" ]] && api /System/Info/Public >/dev/null 2>&1; }
+
+# api_get <path>: one call, called directly (not in $(...)) so it can set API_BODY and API_CODE (000 when curl
+# could not connect). Returns 1 on an HTTP or transport error.
+API_BODY=""
+API_CODE=000
+api_get() {
+    local raw rc=0
+    raw=$(api "$1" -w '\n%{http_code}' 2>/dev/null) || rc=$?
+    API_CODE="${raw##*$'\n'}"
+    API_BODY="${raw%$'\n'*}"
+    [[ "$API_CODE" =~ ^[0-9]{3}$ ]] || API_CODE=000
+    return "$rc"
+}
+
+# An authed probe: /System/Info/Public answers anyone, so it passes with a token the server rejects.
+# API_WHY says why it failed: rejected (401/403, the token is wrong) or unreachable.
+API_WHY=""
+have_api() {
+    API_WHY=""
+    [[ -n "$JF_TOKEN" ]] || return 1
+    api_get /System/Info && return 0
+    case "$API_CODE" in 401 | 403) API_WHY=rejected ;; *) API_WHY=unreachable ;; esac
+    return 1
+}
+# no_api <row> <skip text>: after have_api failed. A rejected token is a FAIL, never a quiet SKIP.
+no_api() {
+    if [[ "$API_WHY" == rejected ]]; then
+        record "$1" FAIL "token rejected (HTTP $API_CODE) by $JF_URL/System/Info: BENCH_JELLYFIN_TOKEN is not valid for this server"
+    else
+        record "$1" SKIP "$2"
+    fi
+}
 
 # The bytes the shim log gained since this run began: a line from an earlier session says nothing about this one.
 shim_log_new() { if [[ -r "$SHIM_LOG" ]]; then tail -c +$((SHIM_LOG_START + 1)) "$SHIM_LOG"; fi; }
 
-item_id() { # a clip file name; empty when the library lacks it or the API fails
-    api "/Items?Recursive=true&Fields=Path&SearchTerm=${1%.*}" | jq -r --arg n "$1" 'first(.Items[] | select(.Path | endswith("/" + $n)) | .Id) // empty' || true
+# item_id <clip file name>: sets ITEM_ID (empty when the library lacks the clip). Returns 1 with ITEM_ERR on an
+# HTTP or transport error, so a 401 or 500 is not reported as a clip missing from the library. Call it directly.
+ITEM_ID=""
+ITEM_ERR=""
+item_id() {
+    ITEM_ID=""; ITEM_ERR=""
+    api_get "/Items?Recursive=true&Fields=Path&SearchTerm=${1%.*}" || { ITEM_ERR="item lookup HTTP $API_CODE"; return 1; }
+    ITEM_ID=$(jq -r --arg n "$1" 'first(.Items[] | select(.Path | endswith("/" + $n)) | .Id) // empty' <<<"$API_BODY") \
+        || { ITEM_ERR="item lookup: unreadable answer (HTTP $API_CODE)"; return 1; }
 }
 
 # api_stream <item id> <height> <extra query>: 0 and STREAM_SPEED (media seconds per wall second over the
@@ -402,7 +453,7 @@ api_stream() {
 # ---- the rows --------------------------------------------------------------------------------------
 
 row_1() {
-    have_api || { record 1 SKIP "no Jellyfin API: set BENCH_JELLYFIN_URL and BENCH_JELLYFIN_TOKEN"; return; }
+    have_api || { no_api 1 "no Jellyfin API: set BENCH_JELLYFIN_URL and BENCH_JELLYFIN_TOKEN"; return; }
     local st probe bad="" why="" offered
     st=$(api /JellyfinPlus/Status) || { record 1 FAIL "GET /JellyfinPlus/Status failed"; return; }
     probe=$(api /JellyfinPlus/Session/bench-probe) || { record 1 FAIL "GET /JellyfinPlus/Session failed"; return; }
@@ -427,32 +478,46 @@ row_1() {
     if [[ -z "$bad" ]]; then record 1 PASS "vendor intel, $NODE, fsr2 offered, no NVIDIA-only level offered$why"; else record 1 FAIL "$bad"; fi
 }
 
-xpsnr_delta() { # candidate bicubic master -> candidate minus bicubic, in dB
+xpsnr_delta() { # candidate bicubic master -> candidate minus bicubic, in dB; 1 when either score is missing
     local c b
-    c=$(xpsnr_y "$1" "$3"); b=$(xpsnr_y "$2" "$3")
+    # explicit: inside a caller's `d=$(...) || ...` errexit is off, so a failed score would not stop this
+    c=$(xpsnr_y "$1" "$3") || return 1
+    b=$(xpsnr_y "$2" "$3") || return 1
     awk -v c="$c" -v b="$b" 'BEGIN { printf "%.2f\n", c - b }'
 }
 
-shader_row() { # row src-height dst-w dst-h fps-min xpsnr-min [e2e]
-    local row="$1" sh="$2" w="$3" h="$4" fmin="$5" xmin="$6" e2e="${7:-0}" fps d status=PASS detail="" id src
+shader_row() { # row src-height dst-w dst-h fps-min xpsnr-min [e2e]; dst-w/dst-h are the 16:9 nominal, the clip's shape decides the real size
+    local row="$1" sh="$2" w="$3" h="$4" fmin="$5" xmin="$6" e2e="${7:-0}" fps d status=PASS detail="" src ow oh
     mkdir -p "$OUT"
-    fps=$(run_fps "$(clip "$sh")" "$(chain_shader "$w" "$h")") || { record "$row" FAIL "ffmpeg failed"; return; }
-    cmd_run "$(clip "$sh")" "$(chain_shader "$w" "$h")" "$OUT/r$row-shader.mkv"; "${CMD[@]}" >/dev/null 2>&1 || true
-    cmd_run "$(clip "$sh")" "$(chain_bicubic "$w" "$h")" "$OUT/r$row-bicubic.mkv"; "${CMD[@]}" >/dev/null 2>&1 || true
-    d=$(xpsnr_delta "$OUT/r$row-shader.mkv" "$OUT/r$row-bicubic.mkv" "$(clip "$h")") || d=0
-    detail="fps=$fps xpsnr_delta=+${d}dB"
+    read -r ow oh <<<"$(scaled_dims "$(clip "$sh")" "$sh" "$w" "$h")"
+    fps=$(run_fps "$(clip "$sh")" "$(chain_shader "$ow" "$oh")") || { record "$row" FAIL "ffmpeg failed"; return; }
+    cmd_run "$(clip "$sh")" "$(chain_shader "$ow" "$oh")" "$OUT/r$row-shader.mkv"; "${CMD[@]}" >/dev/null 2>&1 || true
+    cmd_run "$(clip "$sh")" "$(chain_bicubic "$ow" "$oh")" "$OUT/r$row-bicubic.mkv"; "${CMD[@]}" >/dev/null 2>&1 || true
+    detail="fps=$fps"
+    if d=$(xpsnr_delta "$OUT/r$row-shader.mkv" "$OUT/r$row-bicubic.mkv" "$(clip "$h")"); then
+        detail+=" xpsnr_delta=+${d}dB"
+        ge "$d" "$xmin" || status=FAIL
+    else
+        detail+=" xpsnr failed (ffmpeg xpsnr of the ${ow}x${oh} outputs against $(clip "$h"))"
+        status=FAIL
+    fi
     if [[ "$fmin" != 0 ]]; then ge "$fps" "$fmin" || status=FAIL; fi
-    ge "$d" "$xmin" || status=FAIL
     if [[ "$e2e" == 1 ]]; then
         if have_api; then
-            id=$(item_id "${TITLE}_${sh}p.mkv"); src=$(src_fps "$(clip "$sh")" 2>/dev/null || true)
-            if api_stream "$id" "$h" "sr=fsrcnnx"; then
+            src=$(src_fps "$(clip "$sh")" 2>/dev/null || true)
+            if ! item_id "${TITLE}_${sh}p.mkv"; then
+                detail+=" e2e=FAIL($ITEM_ERR)"
+                status=FAIL
+            elif api_stream "$ITEM_ID" "$h" "sr=fsrcnnx"; then
                 detail+=" e2e=${STREAM_SPEED}x_realtime src_fps=$src"
                 ge "$STREAM_SPEED" "$E2E_X" || status=FAIL
             else
                 detail+=" e2e=FAIL($STREAM_ERR)"
                 status=FAIL
             fi
+        elif [[ "$API_WHY" == rejected ]]; then
+            detail+=" e2e=FAIL(token rejected (HTTP $API_CODE) by $JF_URL/System/Info)"
+            status=FAIL
         else
             detail+=" e2e=SKIP(no API)"
             [[ "$status" == PASS ]] && status=SKIP
@@ -472,11 +537,16 @@ row_5() {
     f720=$(run_fps "$(clip 720)" "$(chain_ort 1920 1080)") || { record 5 FAIL "the ort chain failed at 720p (fps_720p=$f720)"; return; }
     note="fps_360p=$f360 fps_720p=$f720 (real time = source fps; choose NeuralMaxSourceHeight from these)"
     if ! have_api; then
-        record 5 MANUAL "$note device=SKIP(no API: the session record is what proves openvino)"
+        if [[ "$API_WHY" == rejected ]]; then
+            record 5 FAIL "$note token rejected (HTTP $API_CODE) by $JF_URL/System/Info"
+        else
+            record 5 MANUAL "$note device=SKIP(no API: the session record is what proves openvino)"
+        fi
         return
     fi
     # the device comes from a neural stream of this run: the record is per PlaySessionId
-    if ! api_stream "$(item_id "${TITLE}_360p.mkv")" 1080 "neural=$NEURAL_LEVEL"; then
+    item_id "${TITLE}_360p.mkv" || { record 5 FAIL "$note $ITEM_ERR"; return; }
+    if ! api_stream "$ITEM_ID" 1080 "neural=$NEURAL_LEVEL"; then
         record 5 FAIL "$note neural stream: $STREAM_ERR"
         return
     fi
@@ -500,8 +570,8 @@ cfg_restore() {
 }
 
 row_6() {
-    have_api || { record 6 SKIP "no Jellyfin API"; return; }
-    local cfg id rec routing applied seen new
+    have_api || { no_api 6 "no Jellyfin API"; return; }
+    local cfg rec routing applied seen new
     CFG_ID=$(api /Plugins | jq -r 'first(.[] | select(.Name == "Jellyfin Plus") | .Id) // empty' || true)
     [[ -n "$CFG_ID" ]] || { record 6 FAIL "the Jellyfin Plus plugin is not listed by GET /Plugins"; return; }
     cfg=$(api "/Plugins/$CFG_ID/Configuration") || { record 6 FAIL "GET the plugin configuration failed"; return; }
@@ -519,8 +589,8 @@ row_6() {
         record 6 FAIL "the probe shows NeuralMaxSourceHeight=${seen:-none}, not 480: the plugin does not apply the setting, so row 6 proves nothing"
         return
     fi
-    id=$(item_id "${TITLE}_720p.mkv")
-    if ! api_stream "$id" 1080 "neural=$NEURAL_LEVEL"; then
+    item_id "${TITLE}_720p.mkv" || { cfg_restore; record 6 FAIL "$ITEM_ERR"; return; }
+    if ! api_stream "$ITEM_ID" 1080 "neural=$NEURAL_LEVEL"; then
         cfg_restore
         record 6 FAIL "neural stream: $STREAM_ERR"
         return
@@ -562,10 +632,11 @@ row_7() {
 row_8() {
     [[ -f "$CLIPS/pan_720p.mkv" && -f "$CLIPS/pan_1080p.mkv" ]] || { record 8 SKIP "no pan_720p.mkv / pan_1080p.mkv"; return; }
     mkdir -p "$OUT"
-    cmd_run "$CLIPS/pan_720p.mkv" "$(chain_fsr2 1920 1080)" "$OUT/pan-fsr2.mkv"; "${CMD[@]}" >/dev/null 2>&1 || { record 8 FAIL "fsr2 chain failed"; return; }
-    cmd_run "$CLIPS/pan_720p.mkv" "$(chain_bicubic 1920 1080)" "$OUT/pan-bicubic.mkv"; "${CMD[@]}" >/dev/null 2>&1 || true
-    local d
-    d=$(xpsnr_delta "$OUT/pan-fsr2.mkv" "$OUT/pan-bicubic.mkv" "$CLIPS/pan_1080p.mkv")
+    local d ow oh
+    read -r ow oh <<<"$(scaled_dims "$CLIPS/pan_720p.mkv" 720 1920 1080)"
+    cmd_run "$CLIPS/pan_720p.mkv" "$(chain_fsr2 "$ow" "$oh")" "$OUT/pan-fsr2.mkv"; "${CMD[@]}" >/dev/null 2>&1 || { record 8 FAIL "fsr2 chain failed"; return; }
+    cmd_run "$CLIPS/pan_720p.mkv" "$(chain_bicubic "$ow" "$oh")" "$OUT/pan-bicubic.mkv"; "${CMD[@]}" >/dev/null 2>&1 || true
+    d=$(xpsnr_delta "$OUT/pan-fsr2.mkv" "$OUT/pan-bicubic.mkv" "$CLIPS/pan_1080p.mkv") || { record 8 FAIL "xpsnr failed (the ${ow}x${oh} outputs against $CLIPS/pan_1080p.mkv)"; return; }
     if ge "$d" 0; then record 8 PASS "xpsnr_delta=+${d}dB"; else record 8 FAIL "xpsnr_delta=${d}dB: ship the image without fsr2-nocuda"; fi
 }
 
@@ -580,17 +651,18 @@ row_9() {
     "${CMD[@]}" >/dev/null 2>"$off_log" || { record 9 FAIL "software chain failed"; return; }
     on_cpu=$(tr '\r' '\n' <"$on_log" | awk '/^bench:/ { for (i = 1; i <= NF; i++) if ($i ~ /^utime=/) { v = $i; sub(/utime=/, "", v); sub(/s/, "", v); print v } }' | tail -1)
     off_cpu=$(tr '\r' '\n' <"$off_log" | awk '/^bench:/ { for (i = 1; i <= NF; i++) if ($i ~ /^utime=/) { v = $i; sub(/utime=/, "", v); sub(/s/, "", v); print v } }' | tail -1)
-    gain=$(awk -v a="${on_cpu:-0}" -v b="${off_cpu:-0}" 'BEGIN { printf "%.1f\n", b > 0 ? (b - a) / b * 100 : 0 }')
-    x=$(xpsnr_y "$OUT/hwdec-on.mkv" "$OUT/hwdec-off.mkv")
+    gain=$(awk -v a="${on_cpu:-0}" -v b="${off_cpu:-0}" 'BEGIN { printf "%.1f\n", (b > 0 ? (b - a) / b * 100 : 0) }')
+    x=$(xpsnr_y "$OUT/hwdec-on.mkv" "$OUT/hwdec-off.mkv") || { record 9 FAIL "xpsnr failed (hwdec-on against hwdec-off)"; return; }
     ge "$gain" "$HWDEC_CPU_GAIN" || status=FAIL
     ge "$x" "$HWDEC_XPSNR_MIN" || status=FAIL
     record 9 "$status" "cpu_gain=${gain}% xpsnr_on_vs_off=${x}dB (the video-engine-busy and command-identical-when-off checks are made on the served session, row 12)"
 }
 
 row_10() {
-    have_api || { record 10 SKIP "no Jellyfin API"; return; }
+    have_api || { no_api 10 "no Jellyfin API"; return; }
     local id codec load fd status=PASS stream_err=""
-    id=$(item_id "${TITLE}_1080p.mkv")
+    item_id "${TITLE}_1080p.mkv" || { record 10 FAIL "$ITEM_ERR"; return; }
+    id="$ITEM_ID"
     mkdir -p "$OUT"
     rm -f "$OUT/r10-load" "$OUT/r10-fd"
     # Sampled while the stream's segments are being produced; both read the same window.
@@ -613,15 +685,17 @@ row_10() {
 
 row_11() {
     [[ "${BENCH_PLEX_TRANSCODING:-}" == 1 ]] || { record 11 SKIP "set BENCH_PLEX_TRANSCODING=1 while one Plex hardware transcode runs"; return; }
-    local fps
-    fps=$(run_fps "$(clip 1080)" "$(chain_shader 3840 2160)") || { record 11 FAIL "ffmpeg failed"; return; }
+    local fps ow oh
+    read -r ow oh <<<"$(scaled_dims "$(clip 1080)" 1080 3840 2160)"
+    fps=$(run_fps "$(clip 1080)" "$(chain_shader "$ow" "$oh")") || { record 11 FAIL "ffmpeg failed"; return; }
     if ge "$fps" "$FPS_R11"; then record 11 PASS "fps=$fps under contention"; else record 11 FAIL "fps=$fps under contention"; fi
 }
 
 row_12() {
-    have_api || { record 12 SKIP "no Jellyfin API"; return; }
+    have_api || { no_api 12 "no Jellyfin API"; return; }
     local h id bad="" seen="" got codec new
-    id=$(item_id "${TITLE}_2160p.mkv")
+    item_id "${TITLE}_2160p.mkv" || { record 12 FAIL "$ITEM_ERR"; return; }
+    id="$ITEM_ID"
     for h in 480 720 1080 2160; do
         if ! api_stream "$id" "$h" "sr=fsrcnnx"; then
             bad+=" ${h}p:$STREAM_ERR"
