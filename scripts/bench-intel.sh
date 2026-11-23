@@ -29,7 +29,8 @@
 #   BENCH_SHADER          the FSRCNNX shader             /usr/share/jellyfin-shaders/FSRCNNX_x2_8-0-4-1.glsl
 #   BENCH_ORT_MODEL       an ONNX model for row 5        (none: row 5 SKIPs)
 #   BENCH_FSR2_OPTS       extra fsr2 filter options      (none)
-#   BENCH_RUNS            runs per figure                3
+#   BENCH_RUNS            runs per figure                3          (row 5 runs once per clip, see ORT_FRAMES)
+#   BENCH_RUN_TIMEOUT     seconds each measured ffmpeg may run (then TERM, KILL 10 s later; the row records FAIL timeout after Ns)   240
 #   BENCH_JELLYFIN_URL    the test Jellyfin              http://127.0.0.1:8096
 #   BENCH_JELLYFIN_TOKEN  an admin API token, sent as the MediaBrowser Authorization header   (none)
 #   BENCH_ASSERT_QUIET=1  the caller asserts no vzdump, no Plex or production Jellyfin transcode
@@ -60,6 +61,12 @@ SHADER="${BENCH_SHADER:-/usr/share/jellyfin-shaders/FSRCNNX_x2_8-0-4-1.glsl}"
 ORT_MODEL="${BENCH_ORT_MODEL:-}"
 FSR2_OPTS="${BENCH_FSR2_OPTS:-}"
 RUNS="${BENCH_RUNS:-3}"
+RUN_TIMEOUT="${BENCH_RUN_TIMEOUT:-240}"
+# Row 5 (Real-ESRGAN x2 through ORT on OpenVINO) runs ~1-2 fps on an A380 and compiles the model on every
+# invocation: RUNS x the whole clip took hours. 48 frames, one run per clip, bounds it to minutes and still
+# shows whether the model runs on the GPU and roughly how fast. The fps it reports includes the compile time.
+ORT_FRAMES=48
+ORT_RUNS=1
 JF_URL="${BENCH_JELLYFIN_URL:-http://127.0.0.1:8096}"
 JF_TOKEN="${BENCH_JELLYFIN_TOKEN:-}"
 SHIM_LOG="${BENCH_SHIM_LOG:-/var/log/jellyfin-upscale.log}"
@@ -143,9 +150,11 @@ chain_ort() { echo "format=yuv420p,format=gbrpf32le,ort=model=${ORT_MODEL:-MODEL
 chain_fsr2() { echo "format=yuv420p,format=gbrpf32le,fsr2=w=$1:h=$2${FSR2_OPTS:+:$FSR2_OPTS},format=yuv420p,hwupload,libplacebo=w=$1:h=$2,hwdownload,format=yuv420p"; }
 chain_hwdec() { echo "setparams=range=tv,hwmap=derive_device=vulkan,libplacebo=w=$1:h=$2:upscaler=ewa_lanczos:custom_shader_path=$SHADER,hwdownload,format=nv12"; }
 
-# cmd_run <clip> <chain> [output]: a measured run; output omitted = discard (-f null), else lossless ffv1.
+# cmd_run <clip> <chain> [output] [frames]: a measured run; output omitted = discard (-f null), else lossless
+# ffv1; frames given = stop after that many frames (-frames:v).
 cmd_run() {
     CMD=("$PATCHED_FFMPEG" -hide_banner -nostdin -y -benchmark -stats "${INIT[@]}" -i "$1" -vf "$2" -an)
+    if [[ -n "${4:-}" ]]; then CMD+=(-frames:v "$4"); fi
     if [[ -n "${3:-}" ]]; then CMD+=(-c:v ffv1 "$3"); else CMD+=(-f null -); fi
 }
 # cmd_run_hw: as cmd_run with VA-API decode and the VA-API to Vulkan device (GPU_VENDORS.md 5.6).
@@ -168,6 +177,14 @@ cmd_still() {
 # Frames to ignore at the start of the still test: ceil(8 * scale^2), the first two jitter cycles.
 still_skip() { awk -v s="$1" 'BEGIN { v = 8 * s * s; printf "%d\n", (v == int(v)) ? v : int(v) + 1 }'; }
 
+# ff_exec: run CMD under a hard time limit. The plan prints CMD without this wrapper; every measured run goes
+# through it, so a hung chain (a model compile, a GPU hang) ends the row instead of the whole bench.
+ff_exec() { timeout --kill-after=10 "$RUN_TIMEOUT" "${CMD[@]}"; }
+# timed_out <exit status>: 124 is timeout's own; 137 is the KILL it sends when ffmpeg ignored the TERM.
+timed_out() { [[ "$1" == 124 || "$1" == 137 ]]; }
+# why <exit status> <text>: "timeout after Ns" when the run was timed out, else the text.
+why() { if timed_out "$1"; then echo "timeout after ${RUN_TIMEOUT}s"; else echo "$2"; fi; }
+
 # ---- the plan --------------------------------------------------------------------------------------
 
 plan_cmd() { # label, then CMD is set
@@ -179,6 +196,7 @@ print_plan() {
     echo "plan: bench-intel: rows=${ROWS[*]} runs=$RUNS mode=dry-run"
     echo "plan: required filters: $(ffmpeg_required_filters intel) fsr2"
     echo "plan: gates: window outside $BLOCK_TEXT $BLOCK_TZ; memory PSI some avg60 < 1%; BENCH_ASSERT_QUIET=1 (no vzdump, no Plex or production Jellyfin transcode: the pod cannot see them)"
+    echo "plan: every measured ffmpeg runs under timeout --kill-after=10 ${RUN_TIMEOUT}s (BENCH_RUN_TIMEOUT); row 5 runs ${ORT_RUNS}x per clip, ${ORT_FRAMES} frames"
     echo "plan: binary: $PATCHED_FFMPEG; stock: $STOCK_FFMPEG; clips: $CLIPS ($TITLE); out: $OUT; render node: $NODE"
     for r in "${ROWS[@]}"; do
         printf 'plan: row %s: %s\n' "$r" "$(row_title "$r")"
@@ -194,8 +212,8 @@ print_plan() {
             4)  cmd_run "$(clip 1080)" "$(chain_shader 3840 2160)"; plan_cmd 4
                 echo "plan: row 4 cmd: forced transcode of $(clip 1080) at 2160p through $JF_URL (QSV encode, 5 segments timed)"
                 echo "plan: row 4 threshold: fps>=$FPS_R4 e2e>=${E2E_X}x xpsnr>=+$XPSNR_R4" ;;
-            5)  cmd_run "$(clip 360)" "$(chain_ort 1920 1080)"; plan_cmd 5
-                cmd_run "$(clip 720)" "$(chain_ort 1920 1080)"; plan_cmd 5
+            5)  cmd_run "$(clip 360)" "$(chain_ort 1920 1080)" "" "$ORT_FRAMES"; plan_cmd 5
+                cmd_run "$(clip 720)" "$(chain_ort 1920 1080)" "" "$ORT_FRAMES"; plan_cmd 5
                 echo "plan: row 5 cmd: a 360p stream with neural=realesr-anime-x2, then NeuralDevice from $JF_URL/JellyfinPlus/Session/<its PlaySessionId>"
                 echo "plan: row 5 threshold: device=openvino; largest NeuralMaxSourceHeight holding >=${E2E_X}x" ;;
             6)  echo "plan: row 6 cmd: set NeuralMaxSourceHeight=480 (restored after), transcode $(clip 720) with neural=$NEURAL_LEVEL, read Session/<id> NeuralRouting" ;;
@@ -322,14 +340,16 @@ ffmpeg_pid() {
     return 0
 }
 
-# run_fps <clip> <chain> [output]: the median fps of RUNS runs (frames over wall time, from -benchmark).
+# run_fps <clip> <chain> [output] [runs] [frames]: the median fps of <runs> (default RUNS) runs (frames over wall
+# time, from -benchmark). On failure it prints 0 and returns ffmpeg's exit status (124 = timed out, see why); callers
+# run it in $(...), so the status is its return value, not a variable.
 run_fps() {
-    local i log n v vals=()
+    local i log n v vals=() runs="${4:-$RUNS}" rc
     log=$(mktemp)
-    for ((i = 0; i < RUNS; i++)); do
-        cmd_run "$1" "$2" "${3:-}"
+    for ((i = 0; i < runs; i++)); do
+        cmd_run "$1" "$2" "${3:-}" "${5:-}"
         # collected in this shell, not piped into median from the loop: a return inside a pipe is lost
-        "${CMD[@]}" 2>"$log" >/dev/null || { echo 0; rm -f "$log"; return 1; }
+        ff_exec 2>"$log" >/dev/null || { rc=$?; echo 0; rm -f "$log"; return "$rc"; }
         # -stats separates its updates with \r, so the bench: line can share a line with the last one
         tr '\r' '\n' <"$log" >"$log.n"
         n=$(awk '/^frame=/ { gsub(/frame= */, ""); f = $1 } END { print f + 0 }' "$log.n")
@@ -341,14 +361,16 @@ run_fps() {
     printf '%s\n' "${vals[@]}" | median
 }
 
-# xpsnr_y <candidate> <master>: the luma XPSNR of a candidate against its master. Returns 1 and prints nothing
-# when ffmpeg fails or no score parses: a score that was not measured must never read as 0 dB.
+# xpsnr_y <candidate> <master>: the luma XPSNR of a candidate against its master. Prints nothing and returns
+# non-zero (ffmpeg's status: 124 = timed out; 1 when no score parses) when it was not measured: a score that was
+# not measured must never read as 0 dB.
 xpsnr_y() {
-    local log v
+    local log v rc
     log=$(mktemp)
     cmd_xpsnr "$1" "$2" "$OUT/xpsnr.txt"
-    "${CMD[@]}" 2>"$log" >/dev/null || { rm -f "$log"; return 1; }
-    v=$(awk '/XPSNR y:/ { for (i = 1; i <= NF; i++) if ($i == "y:") v = $(i + 1) } END { if (v != "") print v + 0 }' "$log")
+    ff_exec 2>"$log" >/dev/null || { rc=$?; rm -f "$log"; return "$rc"; }
+    # ffmpeg prints `XPSNR  y: 14.4167  u: ...`: two spaces after XPSNR, so match on whitespace, not one blank
+    v=$(awk '/XPSNR +y:/ { for (i = 1; i <= NF; i++) if ($i == "y:") v = $(i + 1) } END { if (v != "") print v + 0 }' "$log")
     rm -f "$log"
     [[ -n "$v" ]] || return 1
     echo "$v"
@@ -356,14 +378,15 @@ xpsnr_y() {
 
 src_fps() { "$FFPROBE" -v error -select_streams v:0 -show_entries stream=r_frame_rate -of csv=p=0 "$1" | awk -F/ '{ printf "%.3f\n", $1 / ($2 ? $2 : 1) }'; }
 
-# scaled_dims <clip> <nominal-src-height> <dst-w> <dst-h>: "W H" for an output built from <clip>, the clip's own
-# shape scaled by dst-h/src-height and rounded to even, so a letterboxed master (1920x858) stays letterboxed and
-# the candidate, the bicubic control and the master compare at one size. ffprobe failing gives the nominal size.
-scaled_dims() {
+# master_dims <reference master> <dst-w> <dst-h>: "W H" of the reference master itself (ffprobe), the size the test
+# output, the bicubic control and the master all compare at. Never the source clip's shape scaled: the masters are
+# letterboxed and cut from the 2160p one, so 3840x1714 is the 2160p master but 1920x858 doubled is 3840x1716.
+# ffprobe failing (no such master, no stream) gives the nominal size.
+master_dims() {
     local d
     d=$("$FFPROBE" -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0 "$1" 2>/dev/null \
-        | awk -F, -v sh="$2" -v dh="$4" 'NF >= 2 && $1 > 0 && $2 > 0 { f = dh / sh; printf "%d %d\n", int($1 * f / 2 + 0.5) * 2, int($2 * f / 2 + 0.5) * 2 }') || d=""
-    echo "${d:-$3 $4}"
+        | awk -F, 'NF >= 2 && $1 > 0 && $2 > 0 { printf "%d %d\n", $1, $2 }') || d=""
+    echo "${d:-$2 $3}"
 }
 
 # ---- Jellyfin API ----------------------------------------------------------------------------------
@@ -478,27 +501,30 @@ row_1() {
     if [[ -z "$bad" ]]; then record 1 PASS "vendor intel, $NODE, fsr2 offered, no NVIDIA-only level offered$why"; else record 1 FAIL "$bad"; fi
 }
 
-xpsnr_delta() { # candidate bicubic master -> candidate minus bicubic, in dB; 1 when either score is missing
+xpsnr_delta() { # candidate bicubic master -> candidate minus bicubic, in dB; non-zero (xpsnr_y's status) when either score is missing
     local c b
     # explicit: inside a caller's `d=$(...) || ...` errexit is off, so a failed score would not stop this
-    c=$(xpsnr_y "$1" "$3") || return 1
-    b=$(xpsnr_y "$2" "$3") || return 1
+    c=$(xpsnr_y "$1" "$3") || return $?
+    b=$(xpsnr_y "$2" "$3") || return $?
     awk -v c="$c" -v b="$b" 'BEGIN { printf "%.2f\n", c - b }'
 }
 
-shader_row() { # row src-height dst-w dst-h fps-min xpsnr-min [e2e]; dst-w/dst-h are the 16:9 nominal, the clip's shape decides the real size
-    local row="$1" sh="$2" w="$3" h="$4" fmin="$5" xmin="$6" e2e="${7:-0}" fps d status=PASS detail="" src ow oh
+shader_row() { # row src-height dst-w dst-h fps-min xpsnr-min [e2e]; dst-w/dst-h are the 16:9 nominal, the dst-h master's own shape decides the real size
+    local row="$1" sh="$2" w="$3" h="$4" fmin="$5" xmin="$6" e2e="${7:-0}" fps d status=PASS detail="" src ow oh rc=0 xrc=0
     mkdir -p "$OUT"
-    read -r ow oh <<<"$(scaled_dims "$(clip "$sh")" "$sh" "$w" "$h")"
-    fps=$(run_fps "$(clip "$sh")" "$(chain_shader "$ow" "$oh")") || { record "$row" FAIL "ffmpeg failed"; return; }
-    cmd_run "$(clip "$sh")" "$(chain_shader "$ow" "$oh")" "$OUT/r$row-shader.mkv"; "${CMD[@]}" >/dev/null 2>&1 || true
-    cmd_run "$(clip "$sh")" "$(chain_bicubic "$ow" "$oh")" "$OUT/r$row-bicubic.mkv"; "${CMD[@]}" >/dev/null 2>&1 || true
+    read -r ow oh <<<"$(master_dims "$(clip "$h")" "$w" "$h")"
+    fps=$(run_fps "$(clip "$sh")" "$(chain_shader "$ow" "$oh")") || { rc=$?; record "$row" FAIL "$(why "$rc" "ffmpeg failed")"; return; }
+    cmd_run "$(clip "$sh")" "$(chain_shader "$ow" "$oh")" "$OUT/r$row-shader.mkv"; ff_exec >/dev/null 2>&1 || rc=$?
+    timed_out "$rc" && { record "$row" FAIL "$(why "$rc" "")"; return; }
+    cmd_run "$(clip "$sh")" "$(chain_bicubic "$ow" "$oh")" "$OUT/r$row-bicubic.mkv"; ff_exec >/dev/null 2>&1 || rc=$?
+    timed_out "$rc" && { record "$row" FAIL "$(why "$rc" "")"; return; }
     detail="fps=$fps"
-    if d=$(xpsnr_delta "$OUT/r$row-shader.mkv" "$OUT/r$row-bicubic.mkv" "$(clip "$h")"); then
+    d=$(xpsnr_delta "$OUT/r$row-shader.mkv" "$OUT/r$row-bicubic.mkv" "$(clip "$h")") || xrc=$?
+    if [[ "$xrc" == 0 ]]; then
         detail+=" xpsnr_delta=+${d}dB"
         ge "$d" "$xmin" || status=FAIL
     else
-        detail+=" xpsnr failed (ffmpeg xpsnr of the ${ow}x${oh} outputs against $(clip "$h"))"
+        detail+=" xpsnr failed ($(why "$xrc" "ffmpeg xpsnr of the ${ow}x${oh} outputs against $(clip "$h")"))"
         status=FAIL
     fi
     if [[ "$fmin" != 0 ]]; then ge "$fps" "$fmin" || status=FAIL; fi
@@ -533,9 +559,10 @@ row_4() { shader_row 4 1080 3840 2160 "$FPS_R4" "$XPSNR_R4" 1; }
 row_5() {
     [[ -n "$ORT_MODEL" ]] || { record 5 SKIP "no BENCH_ORT_MODEL"; return; }
     local f360 f720 rec dev applied status=MANUAL note
-    f360=$(run_fps "$(clip 360)" "$(chain_ort 1920 1080)") || { record 5 FAIL "the ort chain failed at 360p (fps_360p=$f360)"; return; }
-    f720=$(run_fps "$(clip 720)" "$(chain_ort 1920 1080)") || { record 5 FAIL "the ort chain failed at 720p (fps_720p=$f720)"; return; }
-    note="fps_360p=$f360 fps_720p=$f720 (real time = source fps; choose NeuralMaxSourceHeight from these)"
+    local rc
+    f360=$(run_fps "$(clip 360)" "$(chain_ort 1920 1080)" "" "$ORT_RUNS" "$ORT_FRAMES") || { rc=$?; record 5 FAIL "$(why "$rc" "the ort chain failed at 360p (fps_360p=$f360)")"; return; }
+    f720=$(run_fps "$(clip 720)" "$(chain_ort 1920 1080)" "" "$ORT_RUNS" "$ORT_FRAMES") || { rc=$?; record 5 FAIL "$(why "$rc" "the ort chain failed at 720p (fps_720p=$f720)")"; return; }
+    note="fps_360p=$f360 fps_720p=$f720 over the first $ORT_FRAMES frames, one run each, model compile included (real time = source fps; choose NeuralMaxSourceHeight from these)"
     if ! have_api; then
         if [[ "$API_WHY" == rejected ]]; then
             record 5 FAIL "$note token rejected (HTTP $API_CODE) by $JF_URL/System/Info"
@@ -610,12 +637,12 @@ row_6() {
 row_7() {
     [[ -f "$CLIPS/still_720p.png" ]] || { record 7 SKIP "no $CLIPS/still_720p.png"; return; }
     mkdir -p "$OUT"
-    local skip kind status=PASS detail f
+    local skip kind status=PASS detail f rc
     skip=$(still_skip 1.5)
     for kind in fsr2 control; do
         if [[ "$kind" == fsr2 ]]; then cmd_still "$CLIPS/still_720p.png" "$(chain_fsr2 1920 1080)" "$OUT/still-$kind.txt"
         else cmd_still "$CLIPS/still_720p.png" "$(chain_shader 1920 1080)" "$OUT/still-$kind.txt"; fi
-        "${CMD[@]}" >/dev/null 2>&1 || { record 7 FAIL "$kind chain failed"; return; }
+        ff_exec >/dev/null 2>&1 || { rc=$?; record 7 FAIL "$(why "$rc" "$kind chain failed")"; return; }
     done
     # Row 7 scales 720p to 1080p, i.e. 1.5x: skip = ceil(8 * 2.25) = 18 frames.
     f=$(awk -v skip="$skip" '/YAVG=/ { split($0, a, "="); n++; if (n > skip) { s += a[2]; c++; if (a[2] > 16) bad++ } } END { printf "%.3f %.1f\n", c ? s / c : -1, c ? 100 * (c - bad) / c : 0 }' "$OUT/still-fsr2.txt")
@@ -632,27 +659,28 @@ row_7() {
 row_8() {
     [[ -f "$CLIPS/pan_720p.mkv" && -f "$CLIPS/pan_1080p.mkv" ]] || { record 8 SKIP "no pan_720p.mkv / pan_1080p.mkv"; return; }
     mkdir -p "$OUT"
-    local d ow oh
-    read -r ow oh <<<"$(scaled_dims "$CLIPS/pan_720p.mkv" 720 1920 1080)"
-    cmd_run "$CLIPS/pan_720p.mkv" "$(chain_fsr2 "$ow" "$oh")" "$OUT/pan-fsr2.mkv"; "${CMD[@]}" >/dev/null 2>&1 || { record 8 FAIL "fsr2 chain failed"; return; }
-    cmd_run "$CLIPS/pan_720p.mkv" "$(chain_bicubic "$ow" "$oh")" "$OUT/pan-bicubic.mkv"; "${CMD[@]}" >/dev/null 2>&1 || true
-    d=$(xpsnr_delta "$OUT/pan-fsr2.mkv" "$OUT/pan-bicubic.mkv" "$CLIPS/pan_1080p.mkv") || { record 8 FAIL "xpsnr failed (the ${ow}x${oh} outputs against $CLIPS/pan_1080p.mkv)"; return; }
+    local d ow oh rc=0
+    read -r ow oh <<<"$(master_dims "$CLIPS/pan_1080p.mkv" 1920 1080)"
+    cmd_run "$CLIPS/pan_720p.mkv" "$(chain_fsr2 "$ow" "$oh")" "$OUT/pan-fsr2.mkv"; ff_exec >/dev/null 2>&1 || { rc=$?; record 8 FAIL "$(why "$rc" "fsr2 chain failed")"; return; }
+    cmd_run "$CLIPS/pan_720p.mkv" "$(chain_bicubic "$ow" "$oh")" "$OUT/pan-bicubic.mkv"; ff_exec >/dev/null 2>&1 || rc=$?
+    timed_out "$rc" && { record 8 FAIL "$(why "$rc" "")"; return; }
+    d=$(xpsnr_delta "$OUT/pan-fsr2.mkv" "$OUT/pan-bicubic.mkv" "$CLIPS/pan_1080p.mkv") || { rc=$?; record 8 FAIL "xpsnr failed ($(why "$rc" "the ${ow}x${oh} outputs against $CLIPS/pan_1080p.mkv"))"; return; }
     if ge "$d" 0; then record 8 PASS "xpsnr_delta=+${d}dB"; else record 8 FAIL "xpsnr_delta=${d}dB: ship the image without fsr2-nocuda"; fi
 }
 
 row_9() {
     mkdir -p "$OUT"
-    local on_log off_log on_cpu off_cpu gain x status=PASS
+    local on_log off_log on_cpu off_cpu gain x status=PASS rc
     on_log="$OUT/hwdec-on.log"; off_log="$OUT/hwdec-off.log"
     cmd_run_hw "$(clip 1080)" "$(chain_hwdec 1920 1080)" "$OUT/hwdec-on.mkv"
-    "${CMD[@]}" >/dev/null 2>"$on_log" || { record 9 FAIL "hardware decode chain failed: $(tail -1 "$on_log")"; return; }
+    ff_exec >/dev/null 2>"$on_log" || { rc=$?; record 9 FAIL "$(why "$rc" "hardware decode chain failed: $(tail -1 "$on_log")")"; return; }
     ! grep -q 'Conversion failed' "$on_log" || status=FAIL
     cmd_run "$(clip 1080)" "$(chain_shader 1920 1080)" "$OUT/hwdec-off.mkv"
-    "${CMD[@]}" >/dev/null 2>"$off_log" || { record 9 FAIL "software chain failed"; return; }
+    ff_exec >/dev/null 2>"$off_log" || { rc=$?; record 9 FAIL "$(why "$rc" "software chain failed")"; return; }
     on_cpu=$(tr '\r' '\n' <"$on_log" | awk '/^bench:/ { for (i = 1; i <= NF; i++) if ($i ~ /^utime=/) { v = $i; sub(/utime=/, "", v); sub(/s/, "", v); print v } }' | tail -1)
     off_cpu=$(tr '\r' '\n' <"$off_log" | awk '/^bench:/ { for (i = 1; i <= NF; i++) if ($i ~ /^utime=/) { v = $i; sub(/utime=/, "", v); sub(/s/, "", v); print v } }' | tail -1)
     gain=$(awk -v a="${on_cpu:-0}" -v b="${off_cpu:-0}" 'BEGIN { printf "%.1f\n", (b > 0 ? (b - a) / b * 100 : 0) }')
-    x=$(xpsnr_y "$OUT/hwdec-on.mkv" "$OUT/hwdec-off.mkv") || { record 9 FAIL "xpsnr failed (hwdec-on against hwdec-off)"; return; }
+    x=$(xpsnr_y "$OUT/hwdec-on.mkv" "$OUT/hwdec-off.mkv") || { rc=$?; record 9 FAIL "xpsnr failed ($(why "$rc" "hwdec-on against hwdec-off"))"; return; }
     ge "$gain" "$HWDEC_CPU_GAIN" || status=FAIL
     ge "$x" "$HWDEC_XPSNR_MIN" || status=FAIL
     record 9 "$status" "cpu_gain=${gain}% xpsnr_on_vs_off=${x}dB (the video-engine-busy and command-identical-when-off checks are made on the served session, row 12)"
@@ -685,9 +713,9 @@ row_10() {
 
 row_11() {
     [[ "${BENCH_PLEX_TRANSCODING:-}" == 1 ]] || { record 11 SKIP "set BENCH_PLEX_TRANSCODING=1 while one Plex hardware transcode runs"; return; }
-    local fps ow oh
-    read -r ow oh <<<"$(scaled_dims "$(clip 1080)" 1080 3840 2160)"
-    fps=$(run_fps "$(clip 1080)" "$(chain_shader "$ow" "$oh")") || { record 11 FAIL "ffmpeg failed"; return; }
+    local fps ow oh rc
+    read -r ow oh <<<"$(master_dims "$(clip 2160)" 3840 2160)"
+    fps=$(run_fps "$(clip 1080)" "$(chain_shader "$ow" "$oh")") || { rc=$?; record 11 FAIL "$(why "$rc" "ffmpeg failed")"; return; }
     if ge "$fps" "$FPS_R11"; then record 11 PASS "fps=$fps under contention"; else record 11 FAIL "fps=$fps under contention"; fi
 }
 
@@ -719,7 +747,7 @@ row_13() {
 
 # ---- main ------------------------------------------------------------------------------------------
 
-usage() { sed -n '2,13p;21,42p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,13p;21,43p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -736,6 +764,7 @@ done
 [[ ${#ROWS[@]} -gt 0 ]] || ROWS=("${ALL_ROWS[@]}")
 for r in "${ROWS[@]}"; do row_title "$r" >/dev/null || die "no such row: $r (rows are 1 to 13)"; done
 [[ "$RUNS" =~ ^[1-9][0-9]*$ ]] || die "BENCH_RUNS must be a positive integer, got: $RUNS"
+[[ "$RUN_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || die "BENCH_RUN_TIMEOUT must be a positive integer (seconds), got: $RUN_TIMEOUT"
 case "$NEURAL_LEVEL" in
     realesr-anime-x2 | realesr-anime-x4 | realesr-general-x4) ;;
     *) die "BENCH_NEURAL_LEVEL must be realesr-anime-x2, realesr-anime-x4 or realesr-general-x4, got: $NEURAL_LEVEL" ;;
@@ -753,7 +782,7 @@ elif [[ "${BENCH_CONFIRM_NO_GATES:-}" != 1 ]]; then
     die "--no-gates skips the quiet-box checks (no vzdump, no Plex or production transcode, no memory pressure): set BENCH_CONFIRM_NO_GATES=1 to say you have made them"
 fi
 FFPROBE="$(dirname "$STOCK_FFMPEG")/ffprobe"
-need "$PATCHED_FFMPEG"; need "$FFPROBE"; need curl; need jq; need awk
+need "$PATCHED_FFMPEG"; need "$FFPROBE"; need curl; need jq; need awk; need timeout
 [[ -d "$CLIPS" ]] || die "no clips directory: $CLIPS"
 mkdir -p "$OUT"
 # The list is captured, then searched: `-filters | grep -q` lets grep quit at its match, the writer takes

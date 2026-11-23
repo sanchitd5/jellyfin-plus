@@ -233,6 +233,7 @@ def test_plan_and_refusals(tmp):
 
 JQ = shutil.which("jq")
 REAL_DATE = shutil.which("date")
+REAL_TIMEOUT = shutil.which("timeout")
 TOKEN = "tok-SECRET-4242"
 
 # Used only when this machine has no jq: it answers the exact filters bench-intel.sh sends and nothing
@@ -333,17 +334,22 @@ case "$*" in
     exit 0;;
 *xpsnr=*)
     [ "${FAKE_XPSNR_FAIL:-}" = 1 ] && exit 1
-    case "$*" in *shader.mkv*) echo "XPSNR y: 40.0 u: 40.0 v: 40.0" >&2;; *) echo "XPSNR y: 30.0 u: 30.0 v: 30.0" >&2;; esac
+    [ "${FAKE_XPSNR_HANG:-}" = 1 ] && exec sleep 4
+    # real ffmpeg 9 prints two spaces after XPSNR and between the planes: `XPSNR  y: 14.4167  u: 30.1  v: 30.2`
+    case "$*" in *shader.mkv*) echo "[Parsed_xpsnr_0 @ 0x1] XPSNR  y: 40.0000  u: 40.0000  v: 40.0000" >&2;; *) echo "[Parsed_xpsnr_0 @ 0x1] XPSNR  y: 30.0000  u: 30.0000  v: 30.0000" >&2;; esac
     exit 0;;
 *-benchmark*)
     [ "${FAKE_FFMPEG_FAIL:-}" = 1 ] && exit 1
+    [ "${FAKE_FFMPEG_HANG:-}" = 1 ] && exec sleep 4
     printf 'frame=  240 fps=120\rbench: utime=1.0s stime=0.1s rtime=2.0s\n' >&2;;
+*-loop*)
+    [ "${FAKE_FFMPEG_HANG:-}" = 1 ] && exec sleep 4;;
 esac
 exit 0
 '''
 
-# Width and height per clip: the tears masters are letterboxed (1920x858 at 1080p), wide_ is a 16:9 title, any
-# other clip is unreadable.
+# Width and height per clip: the tears masters are letterboxed (1920x858 at 1080p, 3840x1714 at 2160p: NOT the
+# 1080p shape doubled, which is 3840x1716), wide_ is a 16:9 title, any other clip is unreadable.
 FFPROBE_STUB = r'''#!/bin/sh
 case "$*" in
 *r_frame_rate*) echo 24/1;;
@@ -352,7 +358,9 @@ case "$*" in
     *tears_360p*) echo 640,286;;
     *tears_720p* | *pan_720p*) echo 1280,572;;
     *tears_1080p* | *pan_1080p*) echo 1920,858;;
+    *tears_2160p*) echo 3840,1714;;
     *wide_360p*) echo 640,360;;
+    *wide_1080p*) echo 1920,1080;;
     *) exit 1;;
     esac;;
 *height,codec_name*) echo h264,1080;;
@@ -612,14 +620,16 @@ def test_mutants(tmp):
         ("tz-hard-coded", 'TZ="$BLOCK_TZ" date', "TZ=Australia/Melbourne date", window_failures),
         ("windows-ignored", 'BLOCK_WINDOWS="${BENCH_BLOCK_WINDOWS:-0100-0700,1630-1830}"', 'BLOCK_WINDOWS="0100-0700,1630-1830"', window_failures),
         ("malformed-accepted", "^[0-9]{4}-[0-9]{4}(,[0-9]{4}-[0-9]{4})*$", "^[0-9-]+(,[0-9-]+)*$", window_failures),
-        ("run-fps-lost-failure", '|| { echo 0; rm -f "$log"; return 1; }', "|| true", runfps_failures),
+        ("run-fps-lost-failure", '|| { rc=$?; echo 0; rm -f "$log"; return "$rc"; }', "|| true", runfps_failures),
         ("token-on-argv", 'curl -fsS --config - "$@" "$JF_URL$p"',
          'curl -fsS -H "Authorization: MediaBrowser Token=\\"$JF_TOKEN\\"" "$@" "$JF_URL$p"', token_failures),
         ("legacy-header", 'Authorization: MediaBrowser Token=\\\\"%s\\\\"', "X-Emby-Token: %s", token_failures),
-        ("xpsnr-zero", 'c=$(xpsnr_y "$1" "$3") || return 1\n    b=$(xpsnr_y "$2" "$3") || return 1',
+        ("xpsnr-zero", 'c=$(xpsnr_y "$1" "$3") || return $?\n    b=$(xpsnr_y "$2" "$3") || return $?',
          'c=$(xpsnr_y "$1" "$3" || echo 0); b=$(xpsnr_y "$2" "$3" || echo 0)', xpsnr_failures),
         ("item-error-swallowed", 'ITEM_ERR="item lookup HTTP $API_CODE"; return 1;', "return 0;", item_failures),
         ("dims-nominal", "NF >= 2 && $1 > 0 && $2 > 0", "0", size_failures),
+        ("no-timeout", 'timeout --kill-after=10 "$RUN_TIMEOUT" "${CMD[@]}"', '"${CMD[@]}"', timeout_failures),
+        ("row5-full-length", "ORT_FRAMES=48", "ORT_FRAMES=", row5_budget_failures),
     ]:
         path = mutant_dir(tmp, name, old, new)
         check(f"mutant {name} is caught by its behaviour check", bool(fn(path, tmp, "mut-" + name)))
@@ -1179,14 +1189,14 @@ def pan_clips(w):
 
 
 def size_failures(script, tmp, tag):
-    """Output sizes follow the master's own (letterboxed) shape, never the nominal 16:9 size."""
+    """Output sizes are the reference master's own width x height (ffprobe of the master at the target height), never the nominal 16:9 size and never the source clip's shape scaled (3840x1716 for a 3840x1714 master)."""
     bad = []
     for row, title, clip, ow, oh in [
         (2, "tears", "tears_360p", 1920, 858),
         (3, "tears", "tears_720p", 1920, 858),
-        (4, "tears", "tears_1080p", 3840, 1716),
+        (4, "tears", "tears_1080p", 3840, 1714),
         (8, "tears", "pan_720p", 1920, 858),
-        (11, "tears", "tears_1080p", 3840, 1716),
+        (11, "tears", "tears_1080p", 3840, 1714),
         (2, "wide", "wide_360p", 1920, 1080),  # a 16:9 clip keeps 16:9: the 858 is derived, not fixed
         (4, "unreadable", "unreadable_1080p", 3840, 2160),  # ffprobe fails: the nominal size, not a crash
     ]:
@@ -1221,6 +1231,75 @@ def xpsnr_failures(script, tmp, tag):
         st, detail = results(out).get(row, ("", ""))
         if st != "PASS" or "xpsnr_delta=+10.00dB" not in detail:
             bad.append(f"good-row{row}:{st}:{detail[:60]}")
+    return bad
+
+
+def timeout_stub(w):
+    """A `timeout` that logs its argv (FAKE_TIMEOUT_LOG) and then really times the command out."""
+    d = os.path.join(w.root, "tbin")
+    os.makedirs(d)
+    p = os.path.join(d, "timeout")
+    open(p, "w").write('#!/bin/sh\necho "$*" >> "$FAKE_TIMEOUT_LOG"\nexec "$REAL_TIMEOUT" "$@"\n')
+    os.chmod(p, 0o755)
+    w.env["PATH"] = d + os.pathsep + w.env["PATH"]
+    w.env["REAL_TIMEOUT"] = REAL_TIMEOUT or "timeout"
+    w.env["FAKE_TIMEOUT_LOG"] = os.path.join(w.root, "timeout.log")
+    return w.env["FAKE_TIMEOUT_LOG"]
+
+
+def timeout_failures(script, tmp, tag):
+    """Every measured ffmpeg runs under `timeout --kill-after=10 <BENCH_RUN_TIMEOUT, default 240>`, and a run that
+    times out is a FAIL that says `timeout after <N>s` (for the xpsnr runs too), never a 0 or a hang."""
+    bad = []
+    open(os.path.join(tmp, "still_720p.png"), "w").close()
+    for label, extra, want in (("default", {}, "240"), ("set", {"BENCH_RUN_TIMEOUT": "77"}, "77")):
+        w = World(tmp, f"{tag}-{label}", extra=dict(extra, BENCH_TITLE="tears", BENCH_PLEX_TRANSCODING="1", BENCH_ORT_MODEL="/m/model.onnx"))
+        pan_clips(w)
+        open(os.path.join(w.clips, "still_720p.png"), "w").close()
+        log = timeout_stub(w)
+        w.run(["--rows", "2,5,7,8,9,11"], script=script)
+        ff = [l for l in open(os.path.join(w.root, "ffmpeg.log")).read().splitlines() if "-filters" not in l]
+        tl = open(log).read().splitlines() if os.path.exists(log) else []
+        if not ff or len(tl) != len(ff):
+            bad.append(f"{label}:{len(tl)} timeouts for {len(ff)} ffmpeg runs")
+        for l in tl:
+            if not l.startswith(f"--kill-after=10 {want} " + os.path.join(w.stubs, "ffmpeg") + " "):
+                bad.append(f"{label}:{l[:60]}")
+                break
+    for rows, extra, hang in (("2,5,7,8,9,11", {}, {"FAKE_FFMPEG_HANG": "1"}), ("2,3,4,8,9", {}, {"FAKE_XPSNR_HANG": "1"})):
+        w = World(tmp, f"{tag}-hang-{hang and list(hang)[0]}", extra=dict(extra, BENCH_RUN_TIMEOUT="1", BENCH_PLEX_TRANSCODING="1", BENCH_ORT_MODEL="/m/model.onnx"))
+        pan_clips(w)
+        open(os.path.join(w.clips, "still_720p.png"), "w").close()
+        rc, out, err = w.run(["--rows", rows], script=script, **hang)
+        res = results(out)
+        for row in map(int, rows.split(",")):
+            st, detail = res.get(row, ("", ""))
+            if st != "FAIL" or "timeout after 1s" not in detail:
+                bad.append(f"{list(hang)[0]}-row{row}:{st}:{detail[:60]}")
+    rc, out, err = run(script, ["--no-gates", "--dry-run"], clean_env({"BENCH_RUN_TIMEOUT": "soon", "BENCH_CONFIRM_NO_GATES": "1"}))
+    if rc != 2 or "BENCH_RUN_TIMEOUT" not in err:
+        bad.append(f"bad-timeout-accepted:{rc}")
+    return bad
+
+
+def row5_budget_failures(script, tmp, tag):
+    """Row 5 (Real-ESRGAN x2 on an A380, ~1-2 fps) runs once per clip and stops after 48 frames, whatever
+    BENCH_RUNS says; no other row is cut short."""
+    bad = []
+    w = World(tmp, tag, extra={"BENCH_RUNS": "3", "BENCH_ORT_MODEL": "/m/model.onnx", "BENCH_JELLYFIN_TOKEN": ""})
+    w.run(["--rows", "2,5"], script=script)
+    runs = ffmpeg_runs(w)
+    ort = [l for l in runs if "ort=" in l]
+    if len(ort) != 2 or any(not re.search(r" -frames:v 48 ", l) for l in ort) or {("tears_360p" in l, "tears_720p" in l) for l in ort} != {(True, False), (False, True)}:
+        bad.append(f"ort:{len(ort)}:{[l[-60:] for l in ort]}")
+    if any("-frames:v" in l for l in runs if "ort=" not in l):
+        bad.append("frames-limit-on-another-row")
+    if len([l for l in runs if "tears_360p" in l and "ort=" not in l]) < 3:
+        bad.append("row2-runs-cut")
+    rc, out, err = run(script, ["--dry-run", "--rows", "5"], clean_env({"BENCH_ORT_MODEL": "/m/model.onnx"}))
+    cmds = [l for l in out.splitlines() if l.startswith("plan: row 5 cmd: ") and "ort=" in l]
+    if len(cmds) != 2 or any(" -frames:v 48 " not in l for l in cmds):
+        bad.append("plan-row5")
     return bad
 
 
@@ -1297,6 +1376,10 @@ def test_hermetic_api(tmp):
     check("rows 2, 3, 4, 8 and 11 scale to the master's letterboxed size, a 16:9 clip keeps 16:9", not bad, str(bad))
     bad = xpsnr_failures(BENCH, tmp, "xpsnr")
     check("a failed xpsnr is FAIL 'xpsnr failed' on rows 2, 3, 4, 8 and 9, never +0.00 dB", not bad, str(bad))
+    bad = timeout_failures(BENCH, tmp, "timeouts")
+    check("every measured ffmpeg runs under timeout --kill-after=10 (BENCH_RUN_TIMEOUT, default 240) and a timeout is FAIL 'timeout after Ns'", not bad, str(bad))
+    bad = row5_budget_failures(BENCH, tmp, "row5-budget")
+    check("row 5 runs once per clip and stops after 48 frames; other rows are not cut", not bad, str(bad))
     bad = item_failures(BENCH, tmp, "items")
     check("an item lookup HTTP error is its own FAIL, distinct from 'not in the library'", not bad, str(bad))
 
