@@ -181,6 +181,15 @@ namespace Jellyfin.Plugin.Plus.Patcher
         /// <summary>Why that encoder, in particular whether a configured encoder was refused.</summary>
         public string EncoderReason { get; set; }
 
+        /// <summary>
+        /// The non-sensitive GPU summary as the plugin saw it when this session's command was
+        /// built: vendor, encoder family, whether it was detected, whether the CUDA-only levels and
+        /// OpenVINO are available. Never the render node, PCI ids, setting or reason: this record
+        /// is served by a route any authenticated user can reach. REPORT ONLY: nothing read it to
+        /// build the command. Null only when the session was recorded by a build that predates the field.
+        /// </summary>
+        public GpuSummary Gpu { get; set; }
+
         /// <summary>applied | not-requested | off-by-client | concurrency-cap | subtitle-burn-in | stream-copy | disabled | ineligible.</summary>
         public string Status { get; set; }
 
@@ -578,6 +587,11 @@ namespace Jellyfin.Plugin.Plus.Patcher
                         : (Settings?.GpuResidentEncode == true ? "Vulkan (GPU-resident)" : "Vulkan"),
                 Status = status,
                 Reason = reason,
+
+                // Report only: read for the record and for no decision. The summary, not the full
+                // record: GET Session/{id} is not elevation-gated. It never throws, never probes
+                // and is one shared instance, so this costs the transcode path a cached read.
+                Gpu = GpuDetector.CurrentSummary(Settings?.GpuVendor, Settings?.NeuralModelDirectory),
             };
 
             // GetVideoEncoder and GetVideoProcessingFilterParam are separate call sites and

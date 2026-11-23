@@ -31,6 +31,7 @@ setting, a control in the page, or "remove the plugin or script".
 | GPU enhancement of transcodes (14 axes) | Both | Enhance panel in the player; transcodes are upscaled, sharpened, denoised on the GPU | Master switch `Enabled` (default true). With `RequireClientOptIn` false (the default) every eligible transcode is enhanced using the dashboard defaults; the viewer can pick Off in the panel |
 | Live apply and A/B swap | Both | Changing a setting mid-playback switches streams without a gap | On. If the swap patch cannot install, live apply falls back to tear-down-and-restart |
 | Direct-play override | Server patch | Eligible direct-play sessions become GPU transcodes on every client | Off. Setting `ForceTranscodeForDirectPlay` |
+| GPU vendor detection (report only) | Both | The dashboard status line, the player probe (`Levels.Gpu`) and each Recent session say which GPU vendor the server has and what that vendor's chain could use. Changes no command line or level | On; setting `GpuVendor` (`auto` default, `nvidia`, `intel`, `none`) changes what is reported, nothing else |
 | Tag search | Server patch | Search also matches item tags (substring) | On, no switch |
 | Wildcard search (`*` and `?`) | Server patch | `red*car` finds names and tags with "red" followed later by "car"; `?` is exactly one character | On, no switch; a term without `*` or `?` is searched as before |
 | Search index (FTS5 trigram) | Server patch + plugin services | Name and tag search answered from an index: provider step about 36 ms to 3 ms on an 80k-item library | On; falls back to the plain query whenever the index is missing, stale or unsupported; see section 7.6 |
@@ -140,6 +141,29 @@ leaves direct play alone), and a chosen stage (client sets `EnableDirectPlay=fal
 `web/src/controller/network.js` `forceTranscodeBody`). Clients without the script are not enhanced
 unless `ForceTranscodeForDirectPlay` is on (section 7.1).
 
+**GPU vendor (report only).** `src/patcher/Transcoding/GpuVendor.cs` finds the GPU and builds a
+capability record: `Vendor` (`nvidia`, `intel`, `none`), `Setting`, `Detected`, `RenderNode`,
+`EncoderFamily` (`nvenc`, `vaapi`, `software`), `DecodeType` (`cuda`, `vaapi`, `none`),
+`CudaOnlyLevelsAvailable`, `OpenVinoAvailable`, `Reason`, `Devices`. Detection reads
+`/sys/class/drm/renderD*/device/vendor` (`0x10de` NVIDIA, `0x8086` Intel) for every render node that
+has a `/dev/dri` entry; `/proc/driver/nvidia`, then `nvidia-smi -L` (only if nothing else answered),
+find an NVIDIA GPU that has no render node. The machine is asked by a background probe started when
+the patches are applied (`CachedProbe<T>`, `src/patcher/CachedProbe.cs`: the transcode path only reads
+the cached answer and never spawns `nvidia-smi`); an answer that found no supported GPU is retried
+every 60 s, one that found one is kept. `GpuVendor`
+`auto` picks NVIDIA first when it is present, so an existing install is unchanged; `nvidia`, `intel`
+and `none` override detection, and a vendor chosen but not found reports `Detected` false and no
+capability. **Nothing reads the record to decide anything:** `HwaccelArgs`, `BuildChain` and
+`EncoderFor` return the same strings whatever `GpuVendor` is. The full record is on `Gpu` of
+`GET /JellyfinPlus/Status` (administrator only; the dashboard's status line). Every other route, which
+any authenticated user reaches, carries only the summary (`Vendor`, `Detected`, `EncoderFamily`,
+`CudaOnlyLevelsAvailable`, `OpenVinoAvailable`): `Levels.Gpu` on the probe, and `Gpu` on each
+`SessionRecord` (so `Record.Gpu`, and flat `Gpu`, on `GET /JellyfinPlus/Session/{id}`), with no
+render-node path, PCI id, setting or reason. The plan for
+making it matter (Intel encode, Vulkan device from the render node, OpenVINO, decode) is
+[GPU_VENDORS.md](docs/architecture/GPU_VENDORS.md). Tests: `scripts/test-gpu-vendor.sh <jfbin>`
+(compiles the real patcher sources; not run in CI, needs the server's DLLs).
+
 **Fallback.** `shim/jellyfin-ffmpeg-upscale` is a Python wrapper that rewrites the command without
 Harmony. The plugin tells it to stand down while the patches are active, by writing
 `plugin_patch_active` and the main settings into `/etc/jellyfin-upscale.json` if that file exists
@@ -148,7 +172,7 @@ Harmony. The plugin tells it to stand down while the patches are active, by writ
 **Defaults to know.** From `src/Configuration/PluginConfiguration.cs`: `Enabled` true, `TargetHeight`
 1080, `MaxTargetHeight` 2160, `SrLevel` `fsrcnnx`, `MaxConcurrent` 4, `MaxConcurrentSwaps` 4,
 `RequireClientOptIn` false, `ForceTranscode` false, `ForceTranscodeForDirectPlay` false, `Encoder`
-`hevc_nvenc`, `MinScaleFactor` 1.15, `SrMinScaleFactor` 1.60, `MaxSourceHeight` 1440. Deblur, denoise,
+`hevc_nvenc`, `GpuVendor` `auto`, `MinScaleFactor` 1.15, `SrMinScaleFactor` 1.60, `MaxSourceHeight` 1440. Deblur, denoise,
 deblock, neural, game, refine and chroma defaults are all `off`. The README configuration table lists
 `MaxConcurrent` 2 and `RequireClientOptIn` true; the code says 4 and false.
 
@@ -1560,8 +1584,8 @@ All under the Jellyfin API root. "Administrator" is the `RequiresElevation` poli
 
 | Method and path | Auth | Purpose |
 |---|---|---|
-| `GET /JellyfinPlus/Status` | Administrator | Patch status (`PatchActive`, `PatchStatus`), shim sync result and recent sessions. Used by the dashboard page. |
-| `GET /JellyfinPlus/Session/{playSessionId}` | Any authenticated user | What the server actually did for one play session. The id `probe` returns the capability lists with no session (used by the client probe); `dashboard` is used by the config page. A session recorded for a different user is reported as unknown. If either side has no user id (for example an API key), it answers as before the check existed. |
+| `GET /JellyfinPlus/Status` | Administrator | Patch status (`PatchActive`, `PatchStatus`), the full GPU capability record (`Gpu`, with devices and reason), shim sync result and recent sessions. Used by the dashboard page. |
+| `GET /JellyfinPlus/Session/{playSessionId}` | Any authenticated user | What the server actually did for one play session. The id `probe` returns the capability lists with no session (used by the client probe; the lists include `Levels.Gpu`, the non-sensitive GPU summary); `dashboard` is used by the config page. A session recorded for a different user is reported as unknown. If either side has no user id (for example an API key), it answers as before the check existed. |
 | `GET /JellyfinPlus/FilterCache/Status` | Administrator | Per-library, per-kind cache state: built time, key counts, dirty flag, run state, last error, and outcome counters. |
 | `POST /JellyfinPlus/FilterCache/Rebuild?force=true` | Administrator | Starts a background rebuild and returns 202 with the status JSON. `force` (default true) rebuilds every library, not only stale ones. 409 when a rebuild is running or the cache is not ready. |
 | `GET /JellyfinPlus/Tags/Categories[?parentId=..&userId=..]` | Any authenticated user (another user's `userId`: administrators only) | Smart tag categories over the user's visible items (section 3): `[{id, label, kind, prefix?, primary, coverage, tags: [{name, label, count}]}]`. 404 for a parent the user cannot see. Cached per user, access digest and parent; kept warm in the background (section 3). |

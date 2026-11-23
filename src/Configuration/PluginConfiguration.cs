@@ -162,6 +162,17 @@ namespace Jellyfin.Plugin.Plus.Configuration
         /// </summary>
         public string Encoder { get; set; } = "hevc_nvenc";
 
+        /// <summary>
+        /// Which GPU vendor the plugin treats this server as having: auto, nvidia, intel or none.
+        /// Auto detects it from /sys/class/drm/renderD*/device/vendor (0x10de NVIDIA, 0x8086 Intel),
+        /// with /proc/driver/nvidia or nvidia-smi as the tie-breaker, and picks NVIDIA first when
+        /// both are present, so an install that already works is unchanged. REPORT ONLY for now:
+        /// the value feeds the GPU capability record shown on the dashboard, the probe and the
+        /// session record, and no command line depends on it yet. See
+        /// docs/architecture/GPU_VENDORS.md.
+        /// </summary>
+        public string GpuVendor { get; set; } = "auto";
+
         /// <summary>Turn a would-be video stream copy into a real transcode even without a session request.</summary>
         public bool ForceTranscode { get; set; }
 

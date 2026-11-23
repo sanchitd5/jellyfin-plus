@@ -1,0 +1,50 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Test harness for the GPU vendor detection and for "report only". It compiles the REAL patcher
+       sources (every .cs under src/patcher) into one assembly with a Main, so the tests reach the
+       internal UpscaleEngine and Plan exactly as production does, against the server's own DLLs:
+
+           scripts/test-gpu-vendor.sh <dir holding MediaBrowser.*.dll, the server's /usr/lib/jellyfin/bin>
+
+       The reference list repeats src/patcher/Jellyfin.Plugin.Plus.Patcher.csproj on purpose: a
+       harness that references the shipped project would need InternalsVisibleTo in the shipped
+       assembly. If a reference is added there, add it here. Private is true here (false in the
+       shipped project, where Jellyfin supplies the assemblies) so the DLLs are copied beside the
+       harness and it can run on a machine that is not the server. -->
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <AssemblyName>GpuVendorHarness</AssemblyName>
+    <RootNamespace>Jellyfin.Plugin.Plus.Patcher.Harness</RootNamespace>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <NoWarn>CA1707;CS1591</NoWarn>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="Program.cs" />
+    <Compile Include="../../src/patcher/**/*.cs" Exclude="../../src/patcher/obj/**;../../src/patcher/bin/**" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <PackageReference Include="Lib.Harmony" Version="2.4.2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="MediaBrowser.Common"><HintPath>$(JellyfinBin)/MediaBrowser.Common.dll</HintPath><Private>true</Private></Reference>
+    <Reference Include="MediaBrowser.Controller"><HintPath>$(JellyfinBin)/MediaBrowser.Controller.dll</HintPath><Private>true</Private></Reference>
+    <Reference Include="MediaBrowser.Model"><HintPath>$(JellyfinBin)/MediaBrowser.Model.dll</HintPath><Private>true</Private></Reference>
+    <Reference Include="Jellyfin.Data"><HintPath>$(JellyfinBin)/Jellyfin.Data.dll</HintPath><Private>true</Private></Reference>
+    <Reference Include="MediaBrowser.MediaEncoding"><HintPath>$(JellyfinBin)/MediaBrowser.MediaEncoding.dll</HintPath><Private>true</Private></Reference>
+    <Reference Include="Jellyfin.Database.Implementations"><HintPath>$(JellyfinBin)/Jellyfin.Database.Implementations.dll</HintPath><Private>true</Private></Reference>
+    <Reference Include="Jellyfin.Extensions"><HintPath>$(JellyfinBin)/Jellyfin.Extensions.dll</HintPath><Private>true</Private></Reference>
+    <Reference Include="Microsoft.EntityFrameworkCore"><HintPath>$(JellyfinBin)/Microsoft.EntityFrameworkCore.dll</HintPath><Private>true</Private></Reference>
+    <Reference Include="Microsoft.EntityFrameworkCore.Relational"><HintPath>$(JellyfinBin)/Microsoft.EntityFrameworkCore.Relational.dll</HintPath><Private>true</Private></Reference>
+    <Reference Include="Microsoft.EntityFrameworkCore.Abstractions"><HintPath>$(JellyfinBin)/Microsoft.EntityFrameworkCore.Abstractions.dll</HintPath><Private>true</Private></Reference>
+    <Reference Include="SkiaSharp"><HintPath>$(JellyfinBin)/SkiaSharp.dll</HintPath><Private>true</Private></Reference>
+  </ItemGroup>
+
+</Project>

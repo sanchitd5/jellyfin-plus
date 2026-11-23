@@ -431,6 +431,18 @@
                         Video encoder for transcodes this plugin enhances, including ones it forces out of a stream copy. Blank or auto follows the codec the client negotiated. A named encoder (hevc_nvenc, h264_nvenc, ...) is used only if this ffmpeg has it and the client said it can play that codec; otherwise the negotiated codec is kept and Recent sessions shows why. Default hevc_nvenc.
                     </div>
                     </div>
+
+                    <div class="selectContainer">
+                        <select is="emby-select" id="GpuVendor" data-config="GpuVendor" data-kind="select" data-default="auto" label="GPU vendor">
+                            <option value="auto">Auto - detect (NVIDIA first when both are present)</option>
+                            <option value="nvidia">NVIDIA</option>
+                            <option value="intel">Intel</option>
+                            <option value="none">None</option>
+                        </select>
+                        <div class="fieldDescription">
+                        Which GPU vendor this server is treated as having. Auto reads the vendor of each render node (/sys/class/drm/renderD*/device/vendor), with /proc/driver/nvidia or nvidia-smi as the tie-breaker, and picks NVIDIA when it is present, so an install that already works is unchanged. For now this only changes what is reported: the line at the top of this page, the player probe and Recent sessions say what was found. It does not change any ffmpeg command or encoder. Default Auto.
+                    </div>
+                    </div>
                     </div>
                 </section>
 
@@ -785,6 +797,15 @@
                 }).join('<br />');
             }
 
+            // What was found, as the server reports it. Absent while the patches are inactive, and
+            // then nothing is said rather than a guess.
+            function gpuText(g) {
+                if (!g) { return ''; }
+                var found = g.Vendor === 'none' ? 'no supported GPU' : g.Vendor + (g.Detected ? '' : ' (chosen, not found)');
+                var node = g.RenderNode ? ', render node ' + g.RenderNode : '';
+                return ' GPU: ' + found + node + ' (' + g.Reason + ').';
+            }
+
             function loadStatus(page) {
                 ApiClient.ajax({
                     type: 'GET',
@@ -792,7 +813,7 @@
                     dataType: 'json'
                 }).then(function (s) {
                     page.querySelector('#patchStatus').textContent =
-                        'Filter injection: ' + s.PatchStatus + '. FFmpeg shim: ' + s.ShimSync + '.';
+                        'Filter injection: ' + s.PatchStatus + '. FFmpeg shim: ' + s.ShimSync + '.' + gpuText(s.Gpu);
                     var rows = (s.Sessions || []).map(function (a) {
                         // EncoderReason is a column of its own rather than a title attribute:
                         // a tooltip is invisible to touch and to the keyboard, so the reason a

@@ -87,6 +87,14 @@ namespace Jellyfin.Plugin.Plus.Patcher
         /// </summary>
         public string Encoder { get; set; } = "hevc_nvenc";
 
+        /// <summary>
+        /// The GPU vendor to treat this server as having: auto, nvidia, intel, none. Mirrors
+        /// PluginConfiguration.GpuVendor. Read only by GpuDetector, to build the capability record
+        /// the probe, the status route and the session record report; nothing else in the engine
+        /// reads it, so no ffmpeg command line changes with it (docs/architecture/GPU_VENDORS.md).
+        /// </summary>
+        public string GpuVendor { get; set; } = "auto";
+
         public bool ForceTranscode { get; set; }
 
         /// <summary>
