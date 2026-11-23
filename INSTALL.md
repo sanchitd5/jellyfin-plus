@@ -53,6 +53,18 @@ sudo -u jellyfin /usr/lib/jellyfin-ffmpeg/ffmpeg -hide_banner -loglevel error \
 If that prints `OK`, the hard part of your environment is already right. If it fails on permissions,
 add the service user to the `video` and `render` groups.
 
+**On an Intel GPU** (Arc/ANV), libplacebo's multi-planar YUV output comes back green, so it outputs
+RGBA and the CPU converts to yuv420p. Name your render node in `render_node` and use the same chain
+with this tail and `hevc_qsv`:
+
+```bash
+sudo -u jellyfin /usr/lib/jellyfin-ffmpeg/ffmpeg -hide_banner -loglevel error \
+  -init_hw_device drm=dr:/dev/dri/renderD128 -init_hw_device vulkan=vk@dr -filter_hw_device vk \
+  -f lavfi -i testsrc=size=1280x720:rate=30 -t 2 \
+  -vf "format=yuv420p,hwupload,libplacebo=w=1920:h=1080:upscaler=ewa_lanczos:format=rgba,hwdownload,format=rgba,scale=out_color_matrix=bt709:out_range=tv,format=yuv420p" \
+  -c:v hevc_qsv -f null - && echo OK
+```
+
 ---
 
 ## 1. Install the shaders
@@ -61,10 +73,12 @@ add the service user to the `video` and `render` groups.
 sudo ./scripts/install-shaders.sh
 ```
 
-This fetches FSRCNNX (igv, LGPL-3.0-or-later) and Anime4K (bloc97, MIT) from their upstream
-releases, derives the RCAS sharpening shaders from AMD's FSR (MIT, via agyild's mpv port) using
-`shaders/make-rcas.sh`, and installs this project's CAS shaders as a rollback path. Nothing upstream
-is vendored, so each licence stays attached to the file it belongs to.
+This fetches FSRCNNX (igv release 1.1, LGPL-3.0-or-later), Anime4K (bloc97, MIT, pinned to commit
+`4029bf7`), NVIDIA Image Scaling (agyild's mpv port, MIT), SSimSuperRes, KrigBilateral, RAVU-Zoom and
+CuNNy, and derives the RCAS sharpening shaders from AMD's FSR (MIT, via agyild's mpv port) using
+`shaders/make-rcas.sh`. Nothing upstream is vendored, so each licence stays attached to the file it
+belongs to. It does not install this project's own CAS shaders (`shaders/`, the rollback levels
+`cas-low`/`cas-medium`/`cas-high`): copy those in yourself if you want that path.
 
 Result, in `/usr/share/jellyfin-shaders/`:
 
@@ -72,11 +86,15 @@ Result, in `/usr/share/jellyfin-shaders/`:
 FSRCNNX_x2_8-0-4-1.glsl        FSRCNNX_x2_16-0-4-1.glsl
 Anime4K_Upscale_CNN_x2_S.glsl  Anime4K_Upscale_CNN_x2_M.glsl
 RCAS-2.0.glsl  RCAS-1.7.glsl  RCAS-1.4.glsl
-CAS-low.glsl   CAS-medium.glsl  CAS-high.glsl
+NVScaler.glsl  NVSharpen-0.25.glsl  NVSharpen-0.65.glsl
+SSimSuperRes.glsl  KrigBilateral.glsl  ravu-zoom-r3.glsl
+CuNNy-fast-SOFT-Q.glsl  CuNNy-4x16-SOFT-Q.glsl  CuNNy-4x32-SOFT-Q.glsl  CuNNy-4x16-DS-Q.glsl
 ```
 
-The installer verifies the fetched FSR file carries AMD's version string and MIT header before
-deriving anything. `FSR_GLSL=/path/to/FSR.glsl` installs from a local copy for an offline build.
+The FSRCNNX, Anime4K and NIS files are checked against a pinned sha256, and every file against its
+licence and hook markers; a mismatch stops the install. The installer ends by checking that every file
+above exists. `FSR_GLSL=/path/to/FSR.glsl` installs from a local copy for an offline build, and
+`FSRCNNX_DIR`, `ANIME4K_DIR`, `NIS_DIR` and `CUNNY_DIR` do the same for their families (the sha256 still applies).
 
 The directory must be readable by the Jellyfin service user.
 
@@ -211,6 +229,15 @@ Dashboard → Plugins → **Jellyfin Plus**. Sensible starting point:
 - `SrMinScaleFactor` = 1.60 — below this ratio the SR network is skipped, because fixed-2x networks
   measure at or below plain scaling there. Sharpening and denoise still run
 - `MaxConcurrent` = 2 to start, raise once you have watched real GPU load
+- `NeuralMaxSourceHeight` = 0 (the default). Only for an Intel GPU with the OpenVINO build of the ort
+  filter (docs/filters/NEURAL.md, "Building for Intel"): 480 sends sources of 480p and below to a
+  neural level and everything taller to the shader path. It is the recommended value and it is not
+  measured on any Intel GPU, so set `NeuralLevel` to `realesr-anime-x2`, watch the GPU, and leave it 0
+  until you have measured one
+- `IntelHardwareDecode` = off (the default). Experimental, Intel GPU only, and it needs the patched
+  ffmpeg build: decodes on the GPU instead of the CPU for 8-bit SDR h264 and hevc when the plan has no
+  CPU-side step, and falls back to software decode (with the reason in the session record) otherwise.
+  Not verified on an Intel card yet; leave it off unless you are testing it and can watch a served segment
 - `RequireClientOptIn` = true, so nothing is enhanced until a viewer asks
 - `ForceTranscodeForDirectPlay` = false until you have read what it costs
 
@@ -282,6 +309,12 @@ Two traps:
 
 The shim stands down automatically while the plugin's patches are active
 (`plugin_patch_active: true` in `/etc/jellyfin-upscale.json`).
+
+On Kubernetes with an Intel Arc, `docker/intel/Dockerfile` does these steps at image build time
+instead (read-only root filesystem, shim and web inject baked in); see
+`docs/architecture/GPU_VENDORS.md`, 5.8 for the layout, the mounts the Deployment needs and
+`scripts/bench-intel.sh`, the end-to-end matrix. The image is for the person who built it: it links
+GPL components and is never published.
 
 ---
 
