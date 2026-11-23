@@ -9,16 +9,12 @@ using MediaBrowser.Model.Dlna;
 
 namespace Jellyfin.Plugin.Plus.Patcher.Harness
 {
-    /// <summary>An in-memory machine for the detection decision: nodes, a driver flag, nvidia-smi.</summary>
+    /// <summary>An in-memory machine for the detection decision: nodes and whether the container holds an NVIDIA device.</summary>
     internal sealed class FakeGpuEnvironment : IGpuEnvironment
     {
         public List<KeyValuePair<string, string>> Nodes = new List<KeyValuePair<string, string>>();
 
-        public bool DriverLoaded;
-
-        public bool SmiLists;
-
-        public int SmiCalls;
+        public bool NvidiaDevice;
 
         public HashSet<string> Files = new HashSet<string>();
 
@@ -28,13 +24,7 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
 
         public string DevicePath(string node) => "/dev/dri/" + node;
 
-        public bool NvidiaDriverLoaded() => DriverLoaded;
-
-        public bool NvidiaSmiLists()
-        {
-            SmiCalls++;
-            return SmiLists;
-        }
+        public bool NvidiaDevicePresent() => NvidiaDevice;
 
         public bool FileExists(string path) => Files.Contains(path);
     }
@@ -204,22 +194,35 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
             Equal("auto, only an AMD node: none", "none", amd.Vendor);
             Check("an AMD node is still listed", amd.Devices.Count == 1 && amd.Devices[0].Vendor == null);
 
-            // NVIDIA without a render node (no nvidia_drm): the tie-breakers decide.
-            var driver = Machine("renderD128", "0x8086");
-            driver.DriverLoaded = true;
-            var viaDriver = GpuDetector.Resolve("auto", Models, driver);
-            Equal("tie-breaker /proc/driver/nvidia beats an Intel node", "nvidia", viaDriver.Vendor);
-            Check("tie-breaker: no render node reported for it", viaDriver.RenderNode == null && viaDriver.Detected);
-            Check("tie-breaker: nvidia-smi not run when the driver answered", driver.SmiCalls == 0);
+            // NVIDIA without a render node (no nvidia_drm): an NVIDIA device in the container decides.
+            // /proc/driver/nvidia and nvidia-smi are the host's and no longer count (rev-ml3y9), so an
+            // Intel-only pod on a mixed host is Intel: the fake carries no such signal at all.
+            var intelOnly = GpuDetector.Resolve("auto", Models, Machine("renderD128", "0x8086"));
+            Equal("Intel-only pod on a host with the NVIDIA driver: intel", "intel", intelOnly.Vendor);
+            Equal("Intel-only pod on a host with the NVIDIA driver: renderD128", "/dev/dri/renderD128", intelOnly.RenderNode);
+            Check("Intel-only pod on a host with the NVIDIA driver: detected, no CUDA-only levels", intelOnly.Detected && !intelOnly.CudaOnlyLevelsAvailable);
+            Check("Intel-only pod: the reason does not claim NVIDIA", !intelOnly.Reason.Contains("NVIDIA GPU found"));
 
-            var smi = Machine();
-            smi.SmiLists = true;
-            Equal("tie-breaker nvidia-smi alone finds NVIDIA", "nvidia", GpuDetector.Resolve("auto", Models, smi).Vendor);
-            Check("tie-breaker nvidia-smi asked once", smi.SmiCalls == 1);
+            var deviceOnly = Machine();
+            deviceOnly.NvidiaDevice = true;
+            var viaDevice = GpuDetector.Resolve("auto", Models, deviceOnly);
+            Equal("NVIDIA device, no node: nvidia", "nvidia", viaDevice.Vendor);
+            Check("NVIDIA device, no node: detected, no render node reported", viaDevice.Detected && viaDevice.RenderNode == null);
+            Check("NVIDIA device, no node: CUDA-only levels", viaDevice.CudaOnlyLevelsAvailable);
+            Check("NVIDIA device, no node: the reason names the device", viaDevice.Reason.Contains("/dev/nvidia"));
 
-            var node = Machine("renderD128", "0x10de");
-            GpuDetector.Resolve("auto", Models, node);
-            Check("nvidia-smi not run when a node answered", node.SmiCalls == 0);
+            var deviceAndIntel = Machine("renderD128", "0x8086");
+            deviceAndIntel.NvidiaDevice = true;
+            var deviceBoth = GpuDetector.Resolve("auto", Models, deviceAndIntel);
+            Equal("NVIDIA device plus an Intel node: NVIDIA first", "nvidia", deviceBoth.Vendor);
+            Check("NVIDIA device plus an Intel node: no render node reported", deviceBoth.RenderNode == null);
+            Check("NVIDIA device plus an Intel node: the reason names the unused Intel GPU", deviceBoth.Reason.Contains("Intel"));
+            Equal("NVIDIA device plus an Intel node: intel setting still wins", "intel", GpuDetector.Resolve("intel", Models, deviceAndIntel).Vendor);
+
+            var deviceAndNode = Machine("renderD128", "0x8086", "renderD129", "0x10de");
+            deviceAndNode.NvidiaDevice = true;
+            var deviceNodeCap = GpuDetector.Resolve("auto", Models, deviceAndNode);
+            Equal("NVIDIA device plus an NVIDIA node: the node is reported", "/dev/dri/renderD129", deviceNodeCap.RenderNode);
 
             var chosenMissing = GpuDetector.Resolve("nvidia", Models, Machine("renderD128", "0x8086"));
             Equal("nvidia chosen but absent: still nvidia (the setting wins)", "nvidia", chosenMissing.Vendor);
@@ -249,21 +252,33 @@ namespace Jellyfin.Plugin.Plus.Patcher.Harness
                 Fake(drm, "renderD130", "0x10de\n", dev, false);
                 Directory.CreateDirectory(Path.Combine(drm, "card0"));
 
-                var env = new SystemGpuEnvironment(drm, dev, Path.Combine(root, "proc", "driver", "nvidia"), () => false);
+                string devRoot = Path.Combine(root, "dev");
+                var env = new SystemGpuEnvironment(drm, dev, devRoot);
                 var nodes = env.RenderNodes();
                 Check("sysfs reader lists nodes that have a /dev entry, in numeric order, and not card0",
                     nodes.Count == 3 && nodes[0] == "renderD128" && nodes[1] == "renderD129" && nodes[2] == "renderD1000", string.Join(",", nodes));
                 Equal("sysfs reader trims the vendor id", "0x8086", env.ReadVendorId("renderD128"));
                 Check("sysfs reader: unreadable vendor is null", env.ReadVendorId("renderD999") == null);
-                Check("sysfs reader: no /proc/driver/nvidia", !env.NvidiaDriverLoaded());
+
+                // The host's procfs is visible in every pod; only a device node in the container counts.
                 Directory.CreateDirectory(Path.Combine(root, "proc", "driver", "nvidia"));
-                Check("sysfs reader: /proc/driver/nvidia present", env.NvidiaDriverLoaded());
+                File.WriteAllText(Path.Combine(devRoot, "nvidia-uvm"), string.Empty);
+                File.WriteAllText(Path.Combine(devRoot, "nvidia-caps"), string.Empty);
+                Check("device reader: /proc/driver/nvidia and /dev/nvidia-uvm alone are not an NVIDIA device", !env.NvidiaDevicePresent());
+                File.WriteAllText(Path.Combine(devRoot, "nvidia0"), string.Empty);
+                Check("device reader: /dev/nvidia0 counts", env.NvidiaDevicePresent());
+                File.Delete(Path.Combine(devRoot, "nvidia0"));
+                File.WriteAllText(Path.Combine(devRoot, "nvidiactl"), string.Empty);
+                Check("device reader: /dev/nvidiactl counts", env.NvidiaDevicePresent());
+                File.Delete(Path.Combine(devRoot, "nvidiactl"));
+                Check("device reader: back to none", !env.NvidiaDevicePresent());
 
-                var cap = GpuDetector.Resolve("auto", Models, env);
-                Equal("fake sysfs tree, auto: NVIDIA first", "nvidia", cap.Vendor);
-                Equal("fake sysfs tree, auto: its node", Path.Combine(dev, "renderD129"), cap.RenderNode);
+                var capNoDevice = GpuDetector.Resolve("auto", Models, env);
+                Equal("fake sysfs tree, no NVIDIA device: its NVIDIA render node still counts", "nvidia", capNoDevice.Vendor);
+                Equal("fake sysfs tree, auto: its node", Path.Combine(dev, "renderD129"), capNoDevice.RenderNode);
 
-                var missing = new SystemGpuEnvironment(Path.Combine(root, "nope"), dev, Path.Combine(root, "nope2"), () => false);
+                var missing = new SystemGpuEnvironment(Path.Combine(root, "nope"), dev, Path.Combine(root, "nope2"));
+                Check("no device root at all: no NVIDIA device, not an error", !missing.NvidiaDevicePresent());
                 Check("no sysfs at all: empty, not an error", missing.RenderNodes().Count == 0);
                 Equal("no sysfs at all: none", "none", GpuDetector.Resolve("auto", Models, missing).Vendor);
             }

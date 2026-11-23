@@ -87,10 +87,13 @@ a harness on its own).
    `renderD1000`).
 2. **Vendor.** `/sys/class/drm/renderD*/device/vendor`, read as the kernel prints it:
    `0x10de` is NVIDIA, `0x8086` is Intel. Anything else is listed with no vendor and is not claimed.
-3. **Tie-breakers for NVIDIA.** The proprietary driver often exposes no render node (no
+3. **NVIDIA device in the container.** The proprietary driver often exposes no render node (no
    `nvidia_drm` modeset), so an NVIDIA server can show no `0x10de` node at all. NVIDIA is also
-   present when `/proc/driver/nvidia` exists, and, only if neither of those answered, when
-   `nvidia-smi -L` runs and lists a GPU (3 s limit, run once).
+   present when the container has `/dev/nvidiactl` or `/dev/nvidia[0-9]*` (`nvidia-uvm` and
+   `nvidia-caps` do not count). `/proc/driver/nvidia` and `nvidia-smi` are deliberately **not**
+   used: `/proc/driver` is the host kernel's procfs, visible in every pod, so an Intel-only pod on a
+   host that also carries an NVIDIA card was called NVIDIA, and ffmpeg then died on
+   `hwmap=derive_device=cuda`.
 4. **Cached.** The machine is asked once per process: a GPU does not appear mid-run, and the
    transcode path must not spawn a process per session. The record is rebuilt from the cached
    inventory on each call, so a change to the setting applies at the next session.
@@ -102,7 +105,7 @@ a harness on its own).
 
 | Value | Meaning |
 |---|---|
-| `auto` | NVIDIA when it is present (node, `/proc/driver/nvidia`, or `nvidia-smi`), else Intel when an Intel render node is present, else `none`. NVIDIA first, so an existing install, and one that gains an Intel card later, behaves as before. |
+| `auto` | NVIDIA when it is present (an NVIDIA render node, or an NVIDIA device in the container), else Intel when an Intel render node is present, else `none`. NVIDIA first, so an existing install, and one that gains an Intel card later, behaves as before. |
 | `nvidia`, `intel` | The setting wins over detection. If that vendor was not found the record says so (`Detected` false) and offers no capability. |
 | `none` | No vendor-specific path is offered. |
 
@@ -172,7 +175,8 @@ running Jellyfin. It checks:
 
 - the vendor-id mapping (`0x10de`, `0x8086`, case, prefix, padding, AMD not claimed);
 - the decision: NVIDIA first on a mixed box, each explicit setting, a chosen vendor that is absent,
-  the tie-breakers (driver, `nvidia-smi`) and that `nvidia-smi` is not run when something answered,
+  the NVIDIA-device rule (an Intel-only pod with the host's `/proc/driver/nvidia` is Intel; a
+  `/dev/nvidia0` or `/dev/nvidiactl` is NVIDIA, with today's precedence over Intel unchanged),
   the OpenVINO provider file, an unrecognised setting;
 - the real sysfs reader against a fake sysfs tree, including a node with no `/dev` entry and numeric
   node order;
