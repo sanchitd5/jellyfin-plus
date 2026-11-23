@@ -1,0 +1,6 @@
+pos:	0
+flags:	02000002
+mnt_id:	15
+ino:	1054
+eventfd-count:	0
+eventfd-id:	3
