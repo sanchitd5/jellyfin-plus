@@ -41,9 +41,12 @@
 #   BENCH_NEURAL_LEVEL    the neural level row 6 asks for      realesr-anime-x2 (realesr-anime-x2|realesr-anime-x4|realesr-general-x4)
 #   BENCH_BLOCK_WINDOWS   the gate's blocked clock windows, HHMM-HHMM comma list, start included, end not   0100-0700,1630-1830
 #   BENCH_TZ              the zone those windows are read in    Australia/Melbourne
+#   BENCH_PROC            the /proc row 10 looks for the transcode in (the Jellyfin pod's is not this pod's)   /proc
 #
 # Clips: <title>_{360,720,1080,2160}p.mkv lossless masters (the 360/720/1080 are `scale=flags=area`
 # from the 2160p one), still_720p.png (one frame), pan_720p.mkv and pan_1080p.mkv (a panning cut).
+# Row 9 needs an H.264 1080p clip, <title>_1080p_h264.mkv: VA-API cannot decode the FFV1 masters. When $BENCH_CLIPS
+# has none, the run cuts one from the lossless 1080p master into $BENCH_OUT once and reuses it.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
@@ -74,6 +77,7 @@ PSI_FILE="${BENCH_PSI_FILE:-/proc/pressure/memory}"
 NEURAL_LEVEL="${BENCH_NEURAL_LEVEL:-realesr-anime-x2}"
 BLOCK_TZ="${BENCH_TZ:-Australia/Melbourne}"
 BLOCK_WINDOWS="${BENCH_BLOCK_WINDOWS:-0100-0700,1630-1830}"
+PROC="${BENCH_PROC:-/proc}"
 
 ALL_ROWS=(1 2 3 4 5 6 7 8 9 10 11 12 13)
 DRY=0
@@ -114,8 +118,8 @@ row_must() {
         6)  echo "NeuralMaxSourceHeight=480: a 720p source goes to the shader path and the record says why" ;;
         7)  echo "after the first ceil(8*scale^2) frames: mean consecutive-frame luma difference<=0.5, per-frame max<=16 in 99% of frames; FSRCNNX control exactly 0" ;;
         8)  echo "xpsnr on the panning cut >= bicubic (a miss means the image ships without fsr2-nocuda: a result, not a blocker)" ;;
-        9)  echo "on: -hwaccel vaapi and hwmap=derive_device=vulkan, no 'Conversion failed!', video engine busy, cpu time per frame >=30% lower, xpsnr(on,off)>=50dB; off: command identical to a build without hardware decode" ;;
-        10) echo "h264_qsv/hevc_qsv chosen; the served segment's codec matches; encoderSessions counts the session; /Gpu/Load within +-10 points of the fdinfo figure" ;;
+        9)  echo "on, an H.264 1080p source: -hwaccel vaapi, download and upload into libplacebo (the zero-copy hwmap=derive_device=vulkan is tried once and its failure recorded, not failed on), no 'Conversion failed!', video engine busy, cpu time per frame >=30% lower, xpsnr(on,off)>=50dB; off: command identical to a build without hardware decode" ;;
+        10) echo "h264_qsv/hevc_qsv chosen; the served segment's codec matches; encoderSessions counts the session; /Gpu/Load (primed, read again >=5 s later) within +-10 points of the fdinfo figure when the transcode is visible to the bench pod, else MANUAL with the plugin's figure" ;;
         11) echo "one stream holds fps>=36 while one Plex hardware transcode runs" ;;
         12) echo "forced transcode at each target height: ffprobe shows the target height and a QSV codec; the transcode log carries the expected filter" ;;
         13) echo "browser, after a hard reload: Enhance menu, window.__jellyfinPlus.installed===true; 5 min at two levels plus one 2160p output, two seeks, no stall over 2s" ;;
@@ -137,18 +141,30 @@ STILL_PEAK_PCT=99
 HWDEC_CPU_GAIN=30
 HWDEC_XPSNR_MIN=50
 LOAD_TOLERANCE=10
+LOAD_WAIT=5
 
 clip() { echo "$CLIPS/${TITLE}_${1}p.mkv"; }
+# Row 9's source: VA-API cannot decode the FFV1 masters, so it reads an H.264 1080p clip. The one in $CLIPS when
+# there is one, else the one this run cuts (once) into $OUT.
+hwdec_clip() {
+    if [[ -f "$CLIPS/${TITLE}_1080p_h264.mkv" ]]; then echo "$CLIPS/${TITLE}_1080p_h264.mkv"; else echo "$OUT/${TITLE}_1080p_h264.mkv"; fi
+}
 
 # ---- command builders: fill CMD; the plan prints it and the run executes it, so they cannot differ ---
 
 INIT=(-init_hw_device "drm=dr:$NODE" -init_hw_device "vulkan=vk@dr" -filter_hw_device vk)
 
-chain_shader() { echo "format=yuv420p,hwupload,libplacebo=w=$1:h=$2:upscaler=ewa_lanczos:custom_shader_path=$SHADER,hwdownload,format=yuv420p"; }
+# ANV's YUV output from libplacebo is broken (green frames, measured): the Intel chains have libplacebo write RGBA,
+# download it and convert to yuv420p on the CPU. That is what production will run, so the bench measures it.
+RGBA_END="format=rgba,hwdownload,format=rgba,format=yuv420p"
+chain_shader() { echo "format=yuv420p,hwupload,libplacebo=w=$1:h=$2:upscaler=ewa_lanczos:custom_shader_path=$SHADER:$RGBA_END"; }
 chain_bicubic() { echo "scale=$1:$2:flags=bicubic,format=yuv420p"; }
 chain_ort() { echo "format=yuv420p,format=gbrpf32le,ort=model=${ORT_MODEL:-MODEL}:device=openvino,format=yuv420p,hwupload,libplacebo=w=$1:h=$2,hwdownload,format=yuv420p"; }
-chain_fsr2() { echo "format=yuv420p,format=gbrpf32le,fsr2=w=$1:h=$2${FSR2_OPTS:+:$FSR2_OPTS},format=yuv420p,hwupload,libplacebo=w=$1:h=$2,hwdownload,format=yuv420p"; }
-chain_hwdec() { echo "setparams=range=tv,hwmap=derive_device=vulkan,libplacebo=w=$1:h=$2:upscaler=ewa_lanczos:custom_shader_path=$SHADER,hwdownload,format=nv12"; }
+chain_fsr2() { echo "format=yuv420p,format=gbrpf32le,fsr2=w=$1:h=$2${FSR2_OPTS:+:$FSR2_OPTS},format=yuv420p,hwupload,libplacebo=w=$1:h=$2:$RGBA_END"; }
+# chain_hwdec: VA-API frames downloaded, uploaded to Vulkan, libplacebo: the path that works on this ANV.
+chain_hwdec() { echo "hwdownload,format=nv12,hwupload,libplacebo=w=$1:h=$2:upscaler=ewa_lanczos:custom_shader_path=$SHADER:$RGBA_END"; }
+# chain_zerocopy: the VA-API frames mapped straight into Vulkan; fails with VK_ERROR_DEVICE_LOST on this ANV.
+chain_zerocopy() { echo "setparams=range=tv,hwmap=derive_device=vulkan,libplacebo=w=$1:h=$2:upscaler=ewa_lanczos:custom_shader_path=$SHADER:$RGBA_END"; }
 
 # cmd_run <clip> <chain> [output] [frames]: a measured run; output omitted = discard (-f null), else lossless
 # ffv1; frames given = stop after that many frames (-frames:v).
@@ -163,6 +179,10 @@ cmd_run_hw() {
          -init_hw_device "vaapi=va:$NODE" -init_hw_device "vulkan=vk@va" -hwaccel vaapi -hwaccel_output_format vaapi -filter_hw_device vk
          -i "$1" -vf "$2" -an)
     if [[ -n "${3:-}" ]]; then CMD+=(-c:v ffv1 "$3"); else CMD+=(-f null -); fi
+}
+# cmd_h264_cut <dst>: the H.264 1080p source of row 9 from the lossless 1080p master, with the stock ffmpeg.
+cmd_h264_cut() {
+    CMD=("$STOCK_FFMPEG" -hide_banner -nostdin -y -i "$(clip 1080)" -c:v libx264 -crf 12 -preset fast -an "$1")
 }
 # cmd_xpsnr <candidate> <master> <stats>: XPSNR of the candidate against the master.
 cmd_xpsnr() {
@@ -224,10 +244,12 @@ print_plan() {
             8)  cmd_run "$CLIPS/pan_720p.mkv" "$(chain_fsr2 1920 1080)" "$OUT/pan-fsr2.mkv"; plan_cmd 8
                 cmd_run "$CLIPS/pan_720p.mkv" "$(chain_bicubic 1920 1080)" "$OUT/pan-bicubic.mkv"; plan_cmd 8
                 echo "plan: row 8 threshold: xpsnr(fsr2)>=xpsnr(bicubic)" ;;
-            9)  cmd_run_hw "$(clip 1080)" "$(chain_hwdec 1920 1080)" "$OUT/hwdec-on.mkv"; plan_cmd 9
-                cmd_run "$(clip 1080)" "$(chain_shader 1920 1080)" "$OUT/hwdec-off.mkv"; plan_cmd 9
+            9)  if [[ ! -f "$(hwdec_clip)" ]]; then cmd_h264_cut "${OUT}/${TITLE}_1080p_h264.part.mkv"; printf 'plan: row 9 prep cmd: %s\n' "${CMD[*]}"; fi
+                cmd_run_hw "$(hwdec_clip)" "$(chain_hwdec 1920 1080)" "$OUT/hwdec-on.mkv"; plan_cmd 9
+                cmd_run "$(hwdec_clip)" "$(chain_shader 1920 1080)" "$OUT/hwdec-off.mkv"; plan_cmd 9
+                cmd_run_hw "$(hwdec_clip)" "$(chain_zerocopy 1920 1080)"; printf 'plan: row 9 zero-copy cmd: %s\n' "${CMD[*]}"
                 echo "plan: row 9 threshold: cpu gain>=${HWDEC_CPU_GAIN}% xpsnr(on,off)>=${HWDEC_XPSNR_MIN}dB no 'Conversion failed!'" ;;
-            10) echo "plan: row 10 cmd: forced transcode through $JF_URL, ffprobe the segment codec, compare $JF_URL/JellyfinPlus/Gpu/Load with the fdinfo figure"
+            10) echo "plan: row 10 cmd: forced transcode through $JF_URL, ffprobe the segment codec, prime $JF_URL/JellyfinPlus/Gpu/Load, read it again ${LOAD_WAIT}s later and compare with the fdinfo figure when the transcode is visible to the bench pod"
                 echo "plan: row 10 threshold: |load - fdinfo| <= $LOAD_TOLERANCE points" ;;
             11) cmd_run "$(clip 1080)" "$(chain_shader 3840 2160)"; plan_cmd 11
                 echo "plan: row 11 threshold: fps>=$FPS_R11 with BENCH_PLEX_TRANSCODING=1" ;;
@@ -306,7 +328,7 @@ check_gates() {
 # i915 exposes drm-engine-<class>: N ns; xe exposes drm-cycles-<class> and drm-total-cycles-<class>.
 fdinfo_sample() {
     local f
-    for f in /proc/"$1"/fdinfo/*; do
+    for f in "$PROC/$1"/fdinfo/*; do
         awk '
             /^drm-client-id:/ { id = $2 }
             /^drm-engine-capacity-/ { next }
@@ -328,12 +350,15 @@ fdinfo_busy() { # pid seconds
         }' <(echo "$a") <(echo "$b")
 }
 
-# The pid of the patched ffmpeg a session is running (the shim routes to it), from /proc: no procps needed.
+# The pid of the ffmpeg a session is running, from /proc: no procps needed. Either binary: the patched
+# jellyfin-ffmpeg-oidn, or the stock jellyfin-ffmpeg a chain without a patched filter runs. Matched on argv[0], so
+# this grep's own command line is never a hit. Prints nothing when this pod's /proc has no such process (a
+# transcode in the Jellyfin pod is not in the bench pod's /proc).
 ffmpeg_pid() {
     local p
-    for p in /proc/[0-9]*; do
-        if tr '\0' ' ' <"$p/cmdline" 2>/dev/null | grep -q 'jellyfin-ffmpeg-oidn/ffmpeg'; then
-            echo "${p#/proc/}"
+    for p in "$PROC"/[0-9]*; do
+        if tr '\0' ' ' <"$p/cmdline" 2>/dev/null | grep -qE '^[^ ]*jellyfin-ffmpeg(-oidn)?/ffmpeg( |$)'; then
+            echo "${p#"$PROC"/}"
             return 0
         fi
     done
@@ -501,12 +526,12 @@ row_1() {
     if [[ -z "$bad" ]]; then record 1 PASS "vendor intel, $NODE, fsr2 offered, no NVIDIA-only level offered$why"; else record 1 FAIL "$bad"; fi
 }
 
-xpsnr_delta() { # candidate bicubic master -> candidate minus bicubic, in dB; non-zero (xpsnr_y's status) when either score is missing
+xpsnr_delta() { # candidate bicubic master -> candidate minus bicubic, in dB, signed (+1.25, -0.40: callers print it as is); non-zero (xpsnr_y's status) when either score is missing
     local c b
     # explicit: inside a caller's `d=$(...) || ...` errexit is off, so a failed score would not stop this
     c=$(xpsnr_y "$1" "$3") || return $?
     b=$(xpsnr_y "$2" "$3") || return $?
-    awk -v c="$c" -v b="$b" 'BEGIN { printf "%.2f\n", c - b }'
+    awk -v c="$c" -v b="$b" 'BEGIN { printf "%+.2f\n", c - b }'
 }
 
 shader_row() { # row src-height dst-w dst-h fps-min xpsnr-min [e2e]; dst-w/dst-h are the 16:9 nominal, the dst-h master's own shape decides the real size
@@ -521,7 +546,7 @@ shader_row() { # row src-height dst-w dst-h fps-min xpsnr-min [e2e]; dst-w/dst-h
     detail="fps=$fps"
     d=$(xpsnr_delta "$OUT/r$row-shader.mkv" "$OUT/r$row-bicubic.mkv" "$(clip "$h")") || xrc=$?
     if [[ "$xrc" == 0 ]]; then
-        detail+=" xpsnr_delta=+${d}dB"
+        detail+=" xpsnr_delta=${d}dB"
         ge "$d" "$xmin" || status=FAIL
     else
         detail+=" xpsnr failed ($(why "$xrc" "ffmpeg xpsnr of the ${ow}x${oh} outputs against $(clip "$h")"))"
@@ -665,50 +690,110 @@ row_8() {
     cmd_run "$CLIPS/pan_720p.mkv" "$(chain_bicubic "$ow" "$oh")" "$OUT/pan-bicubic.mkv"; ff_exec >/dev/null 2>&1 || rc=$?
     timed_out "$rc" && { record 8 FAIL "$(why "$rc" "")"; return; }
     d=$(xpsnr_delta "$OUT/pan-fsr2.mkv" "$OUT/pan-bicubic.mkv" "$CLIPS/pan_1080p.mkv") || { rc=$?; record 8 FAIL "xpsnr failed ($(why "$rc" "the ${ow}x${oh} outputs against $CLIPS/pan_1080p.mkv"))"; return; }
-    if ge "$d" 0; then record 8 PASS "xpsnr_delta=+${d}dB"; else record 8 FAIL "xpsnr_delta=${d}dB: ship the image without fsr2-nocuda"; fi
+    if ge "$d" 0; then record 8 PASS "xpsnr_delta=${d}dB"; else record 8 FAIL "xpsnr_delta=${d}dB: ship the image without fsr2-nocuda"; fi
+}
+
+# hwdec_source: the H.264 1080p clip row 9 reads, cut once from the lossless master when there is none. Called
+# directly; sets HWDEC_SRC, or returns 1 with HWDEC_ERR.
+HWDEC_SRC=""
+HWDEC_ERR=""
+hwdec_source() {
+    local part="$OUT/${TITLE}_1080p_h264.part.mkv" rc=0 log
+    HWDEC_SRC="$(hwdec_clip)"; HWDEC_ERR=""
+    [[ -f "$HWDEC_SRC" ]] && return 0
+    log=$(mktemp)
+    rm -f "$part"
+    cmd_h264_cut "$part"
+    ff_exec >/dev/null 2>"$log" || rc=$?
+    if [[ "$rc" == 0 ]]; then
+        mv "$part" "$HWDEC_SRC" || rc=1
+    fi
+    if [[ "$rc" != 0 ]]; then
+        HWDEC_ERR="$(why "$rc" "cannot cut the H.264 source from $(clip 1080): $(tail -1 "$log")")"
+        rm -f "$part" "$log"
+        return 1
+    fi
+    rm -f "$log"
+}
+
+# zerocopy_note: one attempt at the zero-copy VA-API to Vulkan path (hwmap), discarded output. It is expected to
+# fail on this ANV with VK_ERROR_DEVICE_LOST: that is recorded as the reason, and is never the row's failure.
+zerocopy_note() {
+    local log rc=0 reason
+    log=$(mktemp)
+    cmd_run_hw "$HWDEC_SRC" "$(chain_zerocopy 1920 1080)"
+    ff_exec >/dev/null 2>"$log" || rc=$?
+    if [[ "$rc" == 0 ]]; then
+        echo "zerocopy=ok"
+    else
+        reason=$(tr '\r' '\n' <"$log" | grep -oE 'VK_ERROR_[A-Z_]+' | head -1 || true)
+        [[ -n "$reason" ]] || reason=$(tr '\r' '\n' <"$log" | grep -v 'Conversion failed' | awk 'NF { l = $0 } END { print l }')
+        echo "zerocopy=FAIL($(why "$rc" "${reason:-exit $rc}"))"
+    fi
+    rm -f "$log"
 }
 
 row_9() {
     mkdir -p "$OUT"
-    local on_log off_log on_cpu off_cpu gain x status=PASS rc
+    local on_log off_log on_cpu off_cpu gain x status=PASS rc zc
     on_log="$OUT/hwdec-on.log"; off_log="$OUT/hwdec-off.log"
-    cmd_run_hw "$(clip 1080)" "$(chain_hwdec 1920 1080)" "$OUT/hwdec-on.mkv"
+    hwdec_source || { record 9 FAIL "$HWDEC_ERR"; return; }
+    # the working path: VA-API decode, download, upload to Vulkan, libplacebo to RGBA (the Intel chains' end)
+    cmd_run_hw "$HWDEC_SRC" "$(chain_hwdec 1920 1080)" "$OUT/hwdec-on.mkv"
     ff_exec >/dev/null 2>"$on_log" || { rc=$?; record 9 FAIL "$(why "$rc" "hardware decode chain failed: $(tail -1 "$on_log")")"; return; }
     ! grep -q 'Conversion failed' "$on_log" || status=FAIL
-    cmd_run "$(clip 1080)" "$(chain_shader 1920 1080)" "$OUT/hwdec-off.mkv"
+    # the control reads the same H.264 clip with software decode, so the CPU and quality comparison is like for like
+    cmd_run "$HWDEC_SRC" "$(chain_shader 1920 1080)" "$OUT/hwdec-off.mkv"
     ff_exec >/dev/null 2>"$off_log" || { rc=$?; record 9 FAIL "$(why "$rc" "software chain failed")"; return; }
+    zc=$(zerocopy_note)
     on_cpu=$(tr '\r' '\n' <"$on_log" | awk '/^bench:/ { for (i = 1; i <= NF; i++) if ($i ~ /^utime=/) { v = $i; sub(/utime=/, "", v); sub(/s/, "", v); print v } }' | tail -1)
     off_cpu=$(tr '\r' '\n' <"$off_log" | awk '/^bench:/ { for (i = 1; i <= NF; i++) if ($i ~ /^utime=/) { v = $i; sub(/utime=/, "", v); sub(/s/, "", v); print v } }' | tail -1)
     gain=$(awk -v a="${on_cpu:-0}" -v b="${off_cpu:-0}" 'BEGIN { printf "%.1f\n", (b > 0 ? (b - a) / b * 100 : 0) }')
-    x=$(xpsnr_y "$OUT/hwdec-on.mkv" "$OUT/hwdec-off.mkv") || { rc=$?; record 9 FAIL "xpsnr failed ($(why "$rc" "hwdec-on against hwdec-off"))"; return; }
+    x=$(xpsnr_y "$OUT/hwdec-on.mkv" "$OUT/hwdec-off.mkv") || { rc=$?; record 9 FAIL "xpsnr failed ($(why "$rc" "hwdec-on against hwdec-off")) $zc"; return; }
     ge "$gain" "$HWDEC_CPU_GAIN" || status=FAIL
     ge "$x" "$HWDEC_XPSNR_MIN" || status=FAIL
-    record 9 "$status" "cpu_gain=${gain}% xpsnr_on_vs_off=${x}dB (the video-engine-busy and command-identical-when-off checks are made on the served session, row 12)"
+    record 9 "$status" "cpu_gain=${gain}% xpsnr_on_vs_off=${x}dB source=$(basename "$HWDEC_SRC") $zc (the video-engine-busy and command-identical-when-off checks are made on the served session, row 12)"
 }
 
 row_10() {
     have_api || { no_api 10 "no Jellyfin API"; return; }
-    local id codec load fd status=PASS stream_err=""
+    local id codec load fd fdnote status=PASS stream_err="" pid
     item_id "${TITLE}_1080p.mkv" || { record 10 FAIL "$ITEM_ERR"; return; }
     id="$ITEM_ID"
     mkdir -p "$OUT"
-    rm -f "$OUT/r10-load" "$OUT/r10-fd"
-    # Sampled while the stream's segments are being produced; both read the same window.
-    ( sleep 4; api /JellyfinPlus/Gpu/Load | jq -r '.gpuBusyPercent // empty' >"$OUT/r10-load" ) &
-    ( sleep 4; pid=$(ffmpeg_pid); [[ -z "$pid" ]] || fdinfo_busy "$pid" 3 | sort -k2 -nr | awk 'NR == 1 { print $2 }' >"$OUT/r10-fd" ) &
+    rm -f "$OUT/r10-load" "$OUT/r10-fd" "$OUT/r10-pid"
+    # Sampled while the stream's segments are being produced; both read the same LOAD_WAIT window. The plugin computes
+    # a figure over the time since its last call and caches it (the first call has no baseline): a priming call
+    # starts the window, the reading comes >= LOAD_WAIT s later.
+    ( sleep 2; api /JellyfinPlus/Gpu/Load >/dev/null 2>&1 || true
+      sleep "$LOAD_WAIT"; api /JellyfinPlus/Gpu/Load | jq -r '.gpuBusyPercent // empty' >"$OUT/r10-load" ) &
+    ( sleep 2; pid=$(ffmpeg_pid)
+      if [[ -n "$pid" ]]; then
+          echo "$pid" >"$OUT/r10-pid"
+          fdinfo_busy "$pid" "$LOAD_WAIT" | sort -k2 -nr | awk 'NR == 1 { print $2 }' >"$OUT/r10-fd"
+      fi ) &
     api_stream "$id" 1080 "sr=fsrcnnx" || stream_err="$STREAM_ERR"
     wait
     [[ -z "$stream_err" ]] || { record 10 FAIL "stream: $stream_err"; return; }
     load=$(cat "$OUT/r10-load" 2>/dev/null || true)
     fd=$(cat "$OUT/r10-fd" 2>/dev/null || true)
+    pid=$(cat "$OUT/r10-pid" 2>/dev/null || true)
     codec=$("$FFPROBE" -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "${STREAM_SEG:-/dev/null}" 2>/dev/null || true)
     case "$codec" in h264 | hevc) ;; *) status=FAIL ;; esac
+    # The transcode runs in the Jellyfin pod, whose /proc this pod cannot read: then the plugin's figure is all there is.
+    if [[ -z "$pid" ]]; then
+        fdnote="fdinfo=not visible from the bench pod"
+    elif [[ -z "$fd" ]]; then
+        fdnote="fdinfo_busy=none (pid $pid has no DRM client)"
+    else
+        fdnote="fdinfo_busy=$fd"
+    fi
     if [[ -n "$load" && -n "$fd" ]]; then
         awk -v a="$load" -v b="$fd" -v t="$LOAD_TOLERANCE" 'BEGIN { d = a - b; if (d < 0) d = -d; exit !(d <= t) }' || status=FAIL
     else
         [[ "$status" == PASS ]] && status=MANUAL
     fi
-    record 10 "$status" "segment_codec=${codec:-none} gpuBusyPercent=${load:-none} fdinfo_busy=${fd:-none}"
+    record 10 "$status" "segment_codec=${codec:-none} gpuBusyPercent=${load:-none} $fdnote"
 }
 
 row_11() {
@@ -747,7 +832,7 @@ row_13() {
 
 # ---- main ------------------------------------------------------------------------------------------
 
-usage() { sed -n '2,13p;21,43p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,13p;21,44p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in

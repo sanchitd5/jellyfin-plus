@@ -47,7 +47,9 @@ OUT = "/clips/bench-out"
 
 
 def shader(w, h):
-    return f"format=yuv420p,hwupload,libplacebo=w={w}:h={h}:upscaler=ewa_lanczos:custom_shader_path={SHADER},hwdownload,format=yuv420p"
+    # ANV's YUV output from libplacebo is broken (green frames): the Intel chains end in RGBA and convert on the CPU
+    return (f"format=yuv420p,hwupload,libplacebo=w={w}:h={h}:upscaler=ewa_lanczos:custom_shader_path={SHADER}:"
+            f"format=rgba,hwdownload,format=rgba,format=yuv420p")
 
 
 def bicubic(w, h):
@@ -55,9 +57,23 @@ def bicubic(w, h):
 
 
 FSR2_CHAIN = ("format=yuv420p,format=gbrpf32le,fsr2=w=1920:h=1080,format=yuv420p,hwupload,"
-              "libplacebo=w=1920:h=1080,hwdownload,format=yuv420p")
-HWDEC_CHAIN = (f"setparams=range=tv,hwmap=derive_device=vulkan,libplacebo=w=1920:h=1080:upscaler=ewa_lanczos:"
-               f"custom_shader_path={SHADER},hwdownload,format=nv12")
+              "libplacebo=w=1920:h=1080:format=rgba,hwdownload,format=rgba,format=yuv420p")
+RGBA_END = "format=rgba,hwdownload,format=rgba,format=yuv420p"
+# the working VA-API path: decode on the GPU, download, upload to Vulkan, libplacebo to RGBA, download, CPU yuv420p
+HWDEC_CHAIN = (f"hwdownload,format=nv12,hwupload,libplacebo=w=1920:h=1080:upscaler=ewa_lanczos:"
+               f"custom_shader_path={SHADER}:{RGBA_END}")
+# the zero-copy path, tried once: it fails on this ANV with VK_ERROR_DEVICE_LOST
+ZEROCOPY_CHAIN = (f"setparams=range=tv,hwmap=derive_device=vulkan,libplacebo=w=1920:h=1080:upscaler=ewa_lanczos:"
+                  f"custom_shader_path={SHADER}:{RGBA_END}")
+STOCK = "/usr/lib/jellyfin-ffmpeg/ffmpeg"
+H264 = f"{OUT}/tears_1080p_h264.mkv"
+PREP = f"{STOCK} -hide_banner -nostdin -y -i /clips/tears_1080p.mkv -c:v libx264 -crf 12 -preset fast -an {OUT}/tears_1080p_h264.part.mkv"
+
+
+def hw_cmd(clip, chain, tail):
+    return (f"{FF} -hide_banner -nostdin -y -benchmark -stats -init_hw_device vaapi=va:{NODE} "
+            f"-init_hw_device vulkan=vk@va -hwaccel vaapi -hwaccel_output_format vaapi -filter_hw_device vk "
+            f"-i {clip} -vf {chain} -an {tail}")
 
 
 def run_cmd(clip, chain, out=None):
@@ -91,8 +107,8 @@ MUST = {
     6: ["NeuralMaxSourceHeight=480", "shader path"],
     7: ["ceil(8*scale^2)", "<=0.5", "<=16 in 99%", "control exactly 0"],
     8: ["panning cut >= bicubic", "not a blocker"],
-    9: ["-hwaccel vaapi", "hwmap=derive_device=vulkan", "Conversion failed!", ">=30% lower", ">=50dB"],
-    10: ["h264_qsv/hevc_qsv", "encoderSessions", "+-10 points"],
+    9: ["H.264", "-hwaccel vaapi", "hwmap=derive_device=vulkan", "Conversion failed!", ">=30% lower", ">=50dB"],
+    10: ["h264_qsv/hevc_qsv", "encoderSessions", "+-10 points", "visible to the bench pod"],
     11: ["fps>=36", "Plex hardware transcode"],
     12: ["target height", "QSV codec"],
     13: ["window.__jellyfinPlus.installed===true", "no stall over 2s"],
@@ -120,10 +136,10 @@ EXACT = [
                            f"-vf {FSR2_CHAIN},tblend=all_mode=difference,signalstats,"
                            f"metadata=print:key=lavfi.signalstats.YAVG:file={OUT}/still-fsr2.txt -an -f null -"),
     "plan: row 7 skip frames: 3x=72 2x=32 1.5x=18",
-    "plan: row 9 cmd: " + (f"{FF} -hide_banner -nostdin -y -benchmark -stats -init_hw_device vaapi=va:{NODE} "
-                           f"-init_hw_device vulkan=vk@va -hwaccel vaapi -hwaccel_output_format vaapi -filter_hw_device vk "
-                           f"-i /clips/tears_1080p.mkv -vf {HWDEC_CHAIN} -an -c:v ffv1 {OUT}/hwdec-on.mkv"),
-    "plan: row 9 cmd: " + run_cmd("/clips/tears_1080p.mkv", shader(1920, 1080), f"{OUT}/hwdec-off.mkv"),
+    "plan: row 9 prep cmd: " + PREP,
+    "plan: row 9 cmd: " + hw_cmd(H264, HWDEC_CHAIN, f"-c:v ffv1 {OUT}/hwdec-on.mkv"),
+    "plan: row 9 cmd: " + run_cmd(H264, shader(1920, 1080), f"{OUT}/hwdec-off.mkv"),
+    "plan: row 9 zero-copy cmd: " + hw_cmd(H264, ZEROCOPY_CHAIN, "-f null -"),
     "plan: row 13: MANUAL, the owner's browser check over a port-forward",
 ]
 
@@ -181,6 +197,10 @@ def plan_failures(text):
     for l in lines:
         if " cmd: " in l and re.search(r"nvenc|cuda|cuvid|nvdec", l, re.I):
             bad.append("nvidia-in-cmd")
+        # every libplacebo chain (not the ort ones, row 5) hands RGBA to the CPU: ANV's YUV output is green
+        if " cmd: " in l and "libplacebo" in l and "ort=" not in l and not re.search(
+                r"libplacebo=[^ ]*:format=rgba,hwdownload,format=rgba,format=yuv420p(,| |$)", l):
+            bad.append("yuv-libplacebo-output:" + l[-80:])
     if f"drm=dr:{NODE}" not in text:
         bad.append("no-drm-device")
     return bad
@@ -215,6 +235,13 @@ def test_plan_and_refusals(tmp):
     rc, out4, _ = run(BENCH, ["--dry-run"], env)
     check("env overrides reach the commands",
           "drm=dr:/dev/dri/renderD129" in out4 and "/data/anim_360p.mkv" in out4 and "renderD128" not in out4 and "/clips" not in out4)
+
+    clips = os.path.join(tmp, "plan-clips")
+    os.makedirs(clips)
+    open(os.path.join(clips, "tears_1080p_h264.mkv"), "w").close()
+    rc, out6, _ = run(BENCH, ["--dry-run", "--rows", "9"], clean_env({"BENCH_CLIPS": clips}))
+    check("an H.264 clip in the clips dir is the row 9 source and nothing is cut",
+          rc == 0 and "row 9 prep cmd" not in out6 and f"-i {clips}/tears_1080p_h264.mkv " in out6 and "tears_1080p.mkv " not in out6, out6)
 
     rc, out5, _ = run(BENCH, ["--list"])
     check("--list names 13 rows", rc == 0 and len(out5.splitlines()) == 13)
@@ -336,12 +363,37 @@ case "$*" in
     [ "${FAKE_XPSNR_FAIL:-}" = 1 ] && exit 1
     [ "${FAKE_XPSNR_HANG:-}" = 1 ] && exec sleep 4
     # real ffmpeg 9 prints two spaces after XPSNR and between the planes: `XPSNR  y: 14.4167  u: 30.1  v: 30.2`
-    case "$*" in *shader.mkv*) echo "[Parsed_xpsnr_0 @ 0x1] XPSNR  y: 40.0000  u: 40.0000  v: 40.0000" >&2;; *) echo "[Parsed_xpsnr_0 @ 0x1] XPSNR  y: 30.0000  u: 30.0000  v: 30.0000" >&2;; esac
+    # FAKE_XPSNR_SWAP=1: the candidates (shader, fsr2) score below their bicubic control, a negative delta
+    y=30
+    case "$*" in
+    *hwdec-on.mkv*) y=55;;
+    *shader.mkv* | *pan-fsr2.mkv*) [ "${FAKE_XPSNR_SWAP:-}" = 1 ] && y=30 || y=40;;
+    *) [ "${FAKE_XPSNR_SWAP:-}" = 1 ] && y=40 || y=30;;
+    esac
+    echo "[Parsed_xpsnr_0 @ 0x1] XPSNR  y: $y.0000  u: $y.0000  v: $y.0000" >&2
+    exit 0;;
+*libx264*)
+    # the H.264 cut of row 9: FAKE_PREP_FAIL=1 fails it, else it writes its last argument (the output)
+    [ "${FAKE_PREP_FAIL:-}" = 1 ] && { echo "tears_1080p.mkv: No such file or directory" >&2; exit 1; }
+    for a in "$@"; do last="$a"; done
+    : > "$last"
+    exit 0;;
+*hwmap=derive_device=vulkan*)
+    # the zero-copy attempt of row 9: FAKE_ZEROCOPY_FAIL=1 dies with the ANV device loss, =plain with a reason that has no VK_ code
+    case "${FAKE_ZEROCOPY_FAIL:-}" in
+    1) echo "[Parsed_libplacebo_2 @ 0x1] vkQueueSubmit failed: VK_ERROR_DEVICE_LOST (-4)" >&2; echo "Conversion failed!" >&2; exit 1;;
+    plain) echo "Error initializing filter 'libplacebo' with args 'w=1920'" >&2; echo "Conversion failed!" >&2; exit 1;;
+    esac
+    printf 'frame=  240 fps=120\rbench: utime=0.5s stime=0.1s rtime=2.0s\n' >&2
     exit 0;;
 *-benchmark*)
     [ "${FAKE_FFMPEG_FAIL:-}" = 1 ] && exit 1
     [ "${FAKE_FFMPEG_HANG:-}" = 1 ] && exec sleep 4
-    printf 'frame=  240 fps=120\rbench: utime=1.0s stime=0.1s rtime=2.0s\n' >&2;;
+    # the VA-API decode run uses half the CPU of the software one
+    case "$*" in
+    *-hwaccel*) printf 'frame=  240 fps=120\rbench: utime=0.5s stime=0.1s rtime=2.0s\n' >&2;;
+    *) printf 'frame=  240 fps=120\rbench: utime=1.0s stime=0.1s rtime=2.0s\n' >&2;;
+    esac;;
 *-loop*)
     [ "${FAKE_FFMPEG_HANG:-}" = 1 ] && exec sleep 4;;
 esac
@@ -377,7 +429,7 @@ DATE_STUB = ('#!/bin/sh\nfor a in "$@"; do\n  if [ "$a" = "+%H%M" ] && [ -n "${F
 # A fake Jellyfin: serves JSON by URL path from $FAKE_DIR/scenario.json, logs every call (argv, stdin,
 # POST body) to $FAKE_DIR/log.jsonl, and keeps the plugin configuration and started sessions in state.json.
 FAKE_CURL = r'''#!@PY@
-import json, os, re, sys, urllib.parse
+import json, os, re, sys, time, urllib.parse
 
 d = os.environ["FAKE_DIR"]
 argv = sys.argv[1:]
@@ -393,7 +445,7 @@ for i, a in enumerate(argv):
     if a in ("-d", "--data", "--data-binary") and argv[i + 1].startswith("@"):
         body = open(argv[i + 1][1:]).read()
 with open(os.path.join(d, "log.jsonl"), "a") as f:
-    f.write(json.dumps({"argv": argv, "stdin": stdin, "url": url, "body": body}) + "\n")
+    f.write(json.dumps({"argv": argv, "stdin": stdin, "url": url, "body": body, "t": time.time()}) + "\n")
 u = urllib.parse.urlparse(url)
 path, q = u.path, urllib.parse.parse_qs(u.query)
 
@@ -451,7 +503,21 @@ if path.startswith("/Plugins/") and path.endswith("/Configuration"):
 if path == "/JellyfinPlus/Status":
     out({"Gpu": {"Vendor": "intel", "RenderNode": "/dev/dri/renderD128"}})
 if path == "/JellyfinPlus/Gpu/Load":
-    out({"gpuBusyPercent": 12})
+    val = sc.get("load", 12)
+    if sc.get("load_needs_prime"):
+        # GpuLoadController.IntelLoadNow: a figure is computed over the time since the last computation and
+        # cached for 5 s. The first call has no baseline, and a call inside the window gets the cached figure.
+        tp = os.path.join(d, "loadt.json")
+        now = time.time()
+        last = json.load(open(tp)) if os.path.exists(tp) else None
+        if last is None:
+            json.dump({"t": now, "v": None}, open(tp, "w"))
+            val = None
+        elif now - last["t"] < 5:
+            val = last["v"]
+        else:
+            json.dump({"t": now, "v": val}, open(tp, "w"))
+    out({"gpuBusyPercent": val})
 if path == "/Items":
     if sc.get("items_status"):
         fail(sc["items_status"])
@@ -607,6 +673,10 @@ def test_mutants(tmp):
         ("skip-frames", "v = 8 * s * s", "v = 4 * s * s"),
         ("row-order", "ALL_ROWS=(1 2 3 4 5 6 7 8 9 10 11 12 13)", "ALL_ROWS=(2 1 3 4 5 6 7 8 9 10 11 12 13)"),
         ("title", '"Vendor record"', '"Vendor"'),
+        ("shader-yuv-end", 'custom_shader_path=$SHADER:$RGBA_END"; }', 'custom_shader_path=$SHADER,hwdownload,format=yuv420p"; }'),
+        ("fsr2-yuv-end", 'libplacebo=w=$1:h=$2:$RGBA_END"; }\n# chain_hwdec', 'libplacebo=w=$1:h=$2,hwdownload,format=yuv420p"; }\n# chain_hwdec'),
+        ("hwdec-no-download", 'echo "hwdownload,format=nv12,hwupload,libplacebo', 'echo "hwupload,libplacebo'),
+        ("hwdec-ffv1-plan", 'cmd_run_hw "$(hwdec_clip)" "$(chain_hwdec 1920 1080)"', 'cmd_run_hw "$(clip 1080)" "$(chain_hwdec 1920 1080)"'),
     ]:
         path = mutant_dir(tmp, name, old, new)
         rc, out, _ = run(path, ["--dry-run"])
@@ -630,6 +700,20 @@ def test_mutants(tmp):
         ("dims-nominal", "NF >= 2 && $1 > 0 && $2 > 0", "0", size_failures),
         ("no-timeout", 'timeout --kill-after=10 "$RUN_TIMEOUT" "${CMD[@]}"', '"${CMD[@]}"', timeout_failures),
         ("row5-full-length", "ORT_FRAMES=48", "ORT_FRAMES=", row5_budget_failures),
+        ("signed-dropped", 'printf "%+.2f\\n", c - b', 'printf "%.2f\\n", c - b', signed_failures),
+        ("signed-plus-prefix", 'printf "%+.2f\\n", c - b', 'printf "+%.2f\\n", c - b', signed_failures),
+        ("row9-ffv1-source", 'cmd_run_hw "$HWDEC_SRC" "$(chain_hwdec 1920 1080)"', 'cmd_run_hw "$(clip 1080)" "$(chain_hwdec 1920 1080)"', row9_failures),
+        ("row9-control-ffv1", 'cmd_run "$HWDEC_SRC" "$(chain_shader 1920 1080)"', 'cmd_run "$(clip 1080)" "$(chain_shader 1920 1080)"', row9_failures),
+        ("row9-cut-every-run", '[[ -f "$HWDEC_SRC" ]] && return 0', ':', row9_failures),
+        ("row9-no-zerocopy", 'zc=$(zerocopy_note)', 'zc=""', row9_failures),
+        ("row9-zerocopy-fatal", 'zc=$(zerocopy_note)', 'zc=$(zerocopy_note); [[ "$zc" != zerocopy=FAIL* ]] || status=FAIL', row9_failures),
+        ("row10-no-prime", 'sleep 2; api /JellyfinPlus/Gpu/Load >/dev/null 2>&1 || true', 'sleep 2', row10_prime_failures),
+        ("row10-short-wait", "LOAD_WAIT=5", "LOAD_WAIT=1", row10_prime_failures),
+        ("row10-fdinfo-none", 'fdnote="fdinfo=not visible from the bench pod"', 'fdnote="fdinfo_busy=none"', row10_prime_failures),
+        ("row10-stock-unmatched", "jellyfin-ffmpeg(-oidn)?/ffmpeg", "jellyfin-ffmpeg-oidn/ffmpeg",
+         lambda sc, t, g: row10_fdinfo_failures(sc, t, g, ("stock",))),
+        ("row10-oidn-unmatched", "jellyfin-ffmpeg(-oidn)?/ffmpeg", "jellyfin-ffmpeg/ffmpeg",
+         lambda sc, t, g: row10_fdinfo_failures(sc, t, g, ("oidn",))),
     ]:
         path = mutant_dir(tmp, name, old, new)
         check(f"mutant {name} is caught by its behaviour check", bool(fn(path, tmp, "mut-" + name)))
@@ -1325,6 +1409,155 @@ def item_failures(script, tmp, tag):
     return bad
 
 
+def signed_failures(script, tmp, tag):
+    """A delta is printed with its own sign: +10.00 or -10.00, never `+-10.00`."""
+    bad = []
+    w = World(tmp, tag + "-neg")
+    pan_clips(w)
+    rc, out, err = w.run(["--rows", "2,3,4,8"], script=script, FAKE_XPSNR_SWAP="1")
+    res = results(out)
+    for row in (2, 3, 4, 8):
+        st, detail = res.get(row, ("", ""))
+        if st != "FAIL" or "xpsnr_delta=-10.00dB" not in detail or "+-" in detail:
+            bad.append(f"neg-row{row}:{st}:{detail[:60]}")
+    if "+-" in out:
+        bad.append("plus-minus-in-log")
+    w = World(tmp, tag + "-pos")
+    pan_clips(w)
+    rc, out, err = w.run(["--rows", "2,3,4,8"], script=script)
+    res = results(out)
+    for row in (2, 3, 4):
+        st, detail = res.get(row, ("", ""))
+        if "xpsnr_delta=+10.00dB" not in detail:
+            bad.append(f"pos-row{row}:{st}:{detail[:60]}")
+    if "xpsnr_delta=+10.00dB" not in res.get(8, ("", ""))[1]:
+        bad.append(f"pos-row8:{res.get(8)}")
+    return bad
+
+
+def ffmpeg_log(w):
+    p = os.path.join(w.root, "ffmpeg.log")
+    return [l for l in open(p).read().splitlines() if "-filters" not in l] if os.path.exists(p) else []
+
+
+def row9_failures(script, tmp, tag):
+    """Row 9 reads an H.264 1080p clip (VA-API cannot decode the FFV1 masters): cut once from the lossless one with
+    the stock ffmpeg when missing, measure decode, download, upload, libplacebo to RGBA; the zero-copy hwmap path
+    is tried once and its failure is recorded, never the row's failure."""
+    bad = []
+    w = World(tmp, tag)
+    # a distinct stock binary: it logs what it is asked to run, then runs the shared stub
+    stock = os.path.join(w.root, "stock")
+    os.makedirs(stock)
+    os.symlink(os.path.join(w.stubs, "ffprobe"), os.path.join(stock, "ffprobe"))
+    open(os.path.join(stock, "ffmpeg"), "w").write(f'#!/bin/sh\necho "$*" >> {w.root}/stock.log\nexec {w.stubs}/ffmpeg "$@"\n')
+    os.chmod(os.path.join(stock, "ffmpeg"), 0o755)
+    w.env["BENCH_STOCK_FFMPEG"] = os.path.join(stock, "ffmpeg")
+    rc, out, err = w.run(["--rows", "9"], script=script)
+    st, detail = results(out).get(9, ("", ""))
+    runs = ffmpeg_log(w)
+    h264 = os.path.join(w.out, "tears_1080p_h264.mkv")
+    prep = [l for l in runs if "-c:v libx264" in l]
+    if st != "PASS" or "zerocopy=ok" not in detail:
+        bad.append(f"good:{st}:{detail[:90]}")
+    if len(prep) != 1 or "-crf 12 -preset fast -an" not in prep[0] or f"-i {w.clips}/tears_1080p.mkv " not in prep[0]:
+        bad.append(f"prep:{prep}")
+    stock_runs = open(os.path.join(w.root, "stock.log")).read().splitlines() if os.path.exists(os.path.join(w.root, "stock.log")) else []
+    if len(stock_runs) != 1 or "-c:v libx264" not in stock_runs[0]:
+        bad.append(f"prep-not-the-stock-binary:{stock_runs}")
+    if not os.path.exists(h264) or os.path.exists(os.path.join(w.out, "tears_1080p_h264.part.mkv")):
+        bad.append("h264-file-not-moved-into-place")
+    vf = [l for l in runs if " -vf " in l]
+    # three measured runs: the VA-API one, the software control and the zero-copy attempt: all read the H.264 clip
+    if len(vf) != 3 or any(f"-i {h264} " not in l for l in vf):
+        bad.append(f"sources:{[l[:200] for l in vf]}")
+    on = [l for l in vf if "-hwaccel vaapi -hwaccel_output_format vaapi" in l and "hwmap=" not in l]
+    if len(on) != 1 or "hwdownload,format=nv12,hwupload,libplacebo=" not in on[0] or not re.search(
+            r"libplacebo=[^ ]*:format=rgba,hwdownload,format=rgba,format=yuv420p ", on[0]):
+        bad.append(f"on:{on}")
+    zc = [l for l in vf if "hwmap=derive_device=vulkan" in l]
+    if len(zc) != 1 or " -f null -" not in zc[0] or not zc[0].endswith(" -f null -"):
+        bad.append(f"zerocopy-cmd:{zc}")
+    off = [l for l in vf if "-hwaccel" not in l]
+    if len(off) != 1 or "libplacebo=" not in off[0]:
+        bad.append(f"off:{off}")
+    # the second run reuses the cut: it is made once
+    w.run(["--rows", "9"], script=script)
+    if len([l for l in ffmpeg_log(w) if "-c:v libx264" in l]) != 1:
+        bad.append("cut-twice")
+
+    w = World(tmp, tag + "-devlost")
+    rc, out, err = w.run(["--rows", "9"], script=script, FAKE_ZEROCOPY_FAIL="1")
+    st, detail = results(out).get(9, ("", ""))
+    if st != "PASS" or "zerocopy=FAIL(VK_ERROR_DEVICE_LOST" not in detail or "cpu_gain=50.0%" not in detail:
+        bad.append(f"devlost:{st}:{detail[:120]}")
+    w = World(tmp, tag + "-plain")
+    rc, out, err = w.run(["--rows", "9"], script=script, FAKE_ZEROCOPY_FAIL="plain")
+    st, detail = results(out).get(9, ("", ""))
+    if st != "PASS" or "zerocopy=FAIL(Error initializing filter 'libplacebo'" not in detail:
+        bad.append(f"plain:{st}:{detail[:120]}")
+
+    w = World(tmp, tag + "-given")
+    given = os.path.join(w.clips, "tears_1080p_h264.mkv")
+    open(given, "w").close()
+    rc, out, err = w.run(["--rows", "9"], script=script)
+    runs = ffmpeg_log(w)
+    if any("-c:v libx264" in l for l in runs) or not all(f"-i {given} " in l for l in runs if " -vf " in l) or not any(" -vf " in l for l in runs):
+        bad.append("given-clip-not-used")
+
+    w = World(tmp, tag + "-prepfail")
+    rc, out, err = w.run(["--rows", "9"], script=script, FAKE_PREP_FAIL="1")
+    st, detail = results(out).get(9, ("", ""))
+    if st != "FAIL" or "H.264" not in detail or any(" -vf " in l for l in ffmpeg_log(w)) or [f for f in os.listdir(w.out) if "h264" in f]:
+        bad.append(f"prepfail:{st}:{detail[:100]}:{os.listdir(w.out)}")
+    return bad
+
+
+def fake_proc(w, name, argv0, pid="4242"):
+    """A stand-in /proc (BENCH_PROC) holding one process with a DRM client: the transcode of another pod is not in the
+    real /proc of the bench pod."""
+    root = os.path.join(w.root, name)
+    os.makedirs(os.path.join(root, pid, "fdinfo"))
+    open(os.path.join(root, pid, "cmdline"), "wb").write(argv0.encode() + b"\0-i\0clip.mkv\0")
+    open(os.path.join(root, pid, "fdinfo", "5"), "w").write("pos:\t0\ndrm-driver:\ti915\ndrm-client-id:\t7\ndrm-engine-render:\t1000 ns\n")
+    return root
+
+
+def row10_prime_failures(script, tmp, tag):
+    """Row 10 primes /Gpu/Load, waits >= 5 s and reads it again (the plugin caches a figure for 5 s and the first call has
+    no baseline); without a transcode visible to this pod it reports the plugin figure and says fdinfo is not visible."""
+    bad = []
+    w = World(tmp, tag, {"load_needs_prime": True}, {"BENCH_PROC": os.path.join(tmp, tag + "-emptyproc")})
+    os.makedirs(os.path.join(tmp, tag + "-emptyproc"))
+    rc, out, err = w.run(["--rows", "10"], script=script)
+    st, detail = results(out).get(10, ("", ""))
+    loads = [e["t"] for e in w.log() if e["url"].endswith("/JellyfinPlus/Gpu/Load")]
+    if len(loads) < 2 or loads[-1] - loads[0] < 5:
+        bad.append(f"calls:{len(loads)}:{[round(t - loads[0], 1) for t in loads]}")
+    if "gpuBusyPercent=12 " not in detail + " " or "gpuBusyPercent=none" in detail:
+        bad.append(f"load:{detail[:120]}")
+    if "fdinfo=not visible from the bench pod" not in detail or "none" in detail.replace("gpuBusyPercent", ""):
+        bad.append(f"fdinfo:{detail[:120]}")
+    if st != "MANUAL":
+        bad.append(f"status:{st}")
+    return bad
+
+
+def row10_fdinfo_failures(script, tmp, tag, which=("stock", "oidn")):
+    """The transcode is found whichever ffmpeg runs it: stock jellyfin-ffmpeg (a chain without a patched filter) or
+    jellyfin-ffmpeg-oidn; a process that is neither is not it."""
+    bad = []
+    names = {"stock": "/usr/lib/jellyfin-ffmpeg/ffmpeg", "oidn": "/usr/lib/jellyfin-ffmpeg-oidn/ffmpeg"}
+    for kind in which:
+        w = World(tmp, f"{tag}-{kind}", {"load": 5})
+        w.env["BENCH_PROC"] = fake_proc(w, "proc", names[kind])
+        rc, out, err = w.run(["--rows", "10"], script=script)
+        st, detail = results(out).get(10, ("", ""))
+        if st != "PASS" or "gpuBusyPercent=5" not in detail or "fdinfo_busy=0.0" not in detail:
+            bad.append(f"{kind}:{st}:{detail[:120]}")
+    return bad
+
+
 def test_gates_and_confirmation(tmp):
     bad = gate_failures(BENCH, tmp, "gates")
     check("the window and PSI gates read HHMM as decimal", not bad, str(bad))
@@ -1382,6 +1615,14 @@ def test_hermetic_api(tmp):
     check("row 5 runs once per clip and stops after 48 frames; other rows are not cut", not bad, str(bad))
     bad = item_failures(BENCH, tmp, "items")
     check("an item lookup HTTP error is its own FAIL, distinct from 'not in the library'", not bad, str(bad))
+    bad = signed_failures(BENCH, tmp, "signed")
+    check("rows 2, 3, 4 and 8 print a signed delta, +10.00 or -10.00, never +-", not bad, str(bad))
+    bad = row9_failures(BENCH, tmp, "row9")
+    check("row 9 reads an H.264 source, cuts it once with the stock ffmpeg, measures the download/upload path and records a zero-copy failure without failing on it", not bad, str(bad))
+    bad = row10_prime_failures(BENCH, tmp, "row10-prime")
+    check("row 10 primes /Gpu/Load, reads it again >= 5 s later and says fdinfo is not visible from the bench pod", not bad, str(bad))
+    bad = row10_fdinfo_failures(BENCH, tmp, "row10-fd")
+    check("row 10 finds the transcode of the stock and of the oidn ffmpeg", not bad, str(bad))
 
 
 def test_token_rejected(tmp):
