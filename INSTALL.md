@@ -53,6 +53,18 @@ sudo -u jellyfin /usr/lib/jellyfin-ffmpeg/ffmpeg -hide_banner -loglevel error \
 If that prints `OK`, the hard part of your environment is already right. If it fails on permissions,
 add the service user to the `video` and `render` groups.
 
+**On an Intel GPU** (Arc/ANV), libplacebo's multi-planar YUV output comes back green, so it outputs
+RGBA and the CPU converts to yuv420p. Name your render node in `render_node` and use the same chain
+with this tail and `hevc_qsv`:
+
+```bash
+sudo -u jellyfin /usr/lib/jellyfin-ffmpeg/ffmpeg -hide_banner -loglevel error \
+  -init_hw_device drm=dr:/dev/dri/renderD128 -init_hw_device vulkan=vk@dr -filter_hw_device vk \
+  -f lavfi -i testsrc=size=1280x720:rate=30 -t 2 \
+  -vf "format=yuv420p,hwupload,libplacebo=w=1920:h=1080:upscaler=ewa_lanczos:format=rgba,hwdownload,format=rgba,scale=out_color_matrix=bt709:out_range=tv,format=yuv420p" \
+  -c:v hevc_qsv -f null - && echo OK
+```
+
 ---
 
 ## 1. Install the shaders
@@ -211,6 +223,15 @@ Dashboard → Plugins → **Jellyfin Plus**. Sensible starting point:
 - `SrMinScaleFactor` = 1.60 — below this ratio the SR network is skipped, because fixed-2x networks
   measure at or below plain scaling there. Sharpening and denoise still run
 - `MaxConcurrent` = 2 to start, raise once you have watched real GPU load
+- `NeuralMaxSourceHeight` = 0 (the default). Only for an Intel GPU with the OpenVINO build of the ort
+  filter (docs/filters/NEURAL.md, "Building for Intel"): 480 sends sources of 480p and below to a
+  neural level and everything taller to the shader path. It is the recommended value and it is not
+  measured on any Intel GPU, so set `NeuralLevel` to `realesr-anime-x2`, watch the GPU, and leave it 0
+  until you have measured one
+- `IntelHardwareDecode` = off (the default). Experimental, Intel GPU only, and it needs the patched
+  ffmpeg build: decodes on the GPU instead of the CPU for 8-bit SDR h264 and hevc when the plan has no
+  CPU-side step, and falls back to software decode (with the reason in the session record) otherwise.
+  Not verified on an Intel card yet; leave it off unless you are testing it and can watch a served segment
 - `RequireClientOptIn` = true, so nothing is enhanced until a viewer asks
 - `ForceTranscodeForDirectPlay` = false until you have read what it costs
 
