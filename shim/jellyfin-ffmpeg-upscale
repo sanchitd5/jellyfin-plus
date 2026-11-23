@@ -54,6 +54,7 @@ REAL_FFPROBE = "/usr/lib/jellyfin-ffmpeg/ffprobe"
 CONFIG_PATH = "/etc/jellyfin-upscale.json"
 LOG_PATH = "/var/log/jellyfin-upscale.log"
 SLOT_DIR = "/run/jellyfin-upscale"
+DRM_ROOT = "/sys/class/drm"
 
 DEFAULTS = {
     "enabled": True,
@@ -453,7 +454,29 @@ def build_chain(cfg, tw, th, ratio):
     placebo = "libplacebo=w=%d:h=%d:upscaler=%s" % (tw, th, cfg["upscaler"])
     if files:
         placebo += ":custom_shader_path=%s" % compose_shader(cfg, files)
+    if render_node_is_intel(cfg):
+        # ANV returns green frames for libplacebo's multi-planar YUV output (UAVG/VAVG 0), so it
+        # outputs RGBA and the conversion to yuv420p happens on the CPU. The shim cannot see the
+        # source's tags, hence bt709/tv.
+        return ("format=yuv420p,hwupload,%s:format=rgba,hwdownload,format=rgba,"
+                "scale=out_color_matrix=bt709:out_range=tv,format=yuv420p" % placebo)
     return "format=yuv420p,hwupload,%s,hwdownload,format=yuv420p" % placebo
+
+
+def render_node_is_intel(cfg):
+    """True when render_node is a plain render node whose PCI vendor is Intel (0x8086).
+
+    The same sysfs file GpuVendor.cs reads. Anything unset, invalid or unreadable is not Intel,
+    so those keep the chain they always had.
+    """
+    node = cfg.get("render_node")
+    if not (isinstance(node, str) and re.fullmatch(r"/dev/dri/renderD[0-9]+", node)):
+        return False
+    try:
+        with open(os.path.join(DRM_ROOT, os.path.basename(node), "device", "vendor")) as fh:
+            return fh.read().strip().lower() == "0x8086"
+    except Exception:
+        return False
 
 
 def device_args(cfg):

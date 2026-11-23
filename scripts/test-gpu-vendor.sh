@@ -69,13 +69,17 @@ trap 'rm -rf "$OUT"' EXIT
 dotnet build "$HERE/gpu-vendor-harness/GpuVendorHarness.csproj" -c Release \
     -p:JellyfinBin="$(cd "$JFBIN" && pwd)" -o "$OUT" --nologo -v q || { echo "test-gpu-vendor: build failed" >&2; exit 2; }
 
-dotnet "$OUT/GpuVendorHarness.dll"
-status=$?
+# The harness prints one PASS line per check (1100+); show only failures and the count unless VERBOSE=1.
+dotnet "$OUT/GpuVendorHarness.dll" | { if [ -n "${VERBOSE:-}" ]; then cat; else grep -v '^PASS  '; fi; }
+status="${PIPESTATUS[0]}"
 
 if command -v python3 >/dev/null; then
     echo
     echo "shim device arguments (scripts/test-shim-device.py)"
     python3 -I "$HERE/test-shim-device.py" || status=1
+    echo
+    echo "shim filter chain per vendor (scripts/test_shim_chain.py)"
+    python3 -I "$HERE/test_shim_chain.py" || status=1
 else
     echo
     echo "test-gpu-vendor: python3 not found, so the shim device checks (scripts/test-shim-device.py) were NOT run"
