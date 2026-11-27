@@ -226,6 +226,28 @@ namespace Jellyfin.Plugin.Plus
             return JsonSerializer.Serialize(new { Ready = false, State = "unavailable", Libraries = Array.Empty<object>() });
         }
 
+        /// <summary>
+        /// The patcher's GPU capability record: vendor, whether it was detected, and the render
+        /// node. Null when the patcher is not loaded or predates the call (a half-applied deploy),
+        /// so a caller treats "unknown" as unknown, never as a vendor.
+        /// </summary>
+        public static JsonObject GpuRecord()
+        {
+            try
+            {
+                if (_host?.GetMethod("GpuJson", BindingFlags.Public | BindingFlags.Static)?.Invoke(null, null) is string json)
+                {
+                    return JsonNode.Parse(json) as JsonObject;
+                }
+            }
+            catch (Exception)
+            {
+                // fall through
+            }
+
+            return null;
+        }
+
         public static string StatusJson()
         {
             try

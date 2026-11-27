@@ -65,6 +65,19 @@ namespace Jellyfin.Plugin.Plus.Configuration
         public bool NeuralAllowed { get; set; } = true;
 
         /// <summary>
+        /// Use the ONNX neural levels only for small sources. 0, the default, is no routing: nothing
+        /// changes. Above 0, a source whose (upright) height is at or below this gets the neural
+        /// level (the session's, the dashboard's NeuralLevel, or, when neither names one and the
+        /// OpenVINO provider is installed and the patched ffmpeg lists the openvino device, on an
+        /// Intel server, the cheapest installed weight); a source above it does not, and the shader
+        /// path runs. Applies to the realesr-* levels, not to dlpp-* or vsr-rtcuda, and on every GPU
+        /// vendor, NVIDIA included. When the engine picks the level itself, Recent sessions shows the
+        /// requested level as off although a network ran, and NeuralRouting says why. 480 is the recommended value on Intel, not measured: see
+        /// docs/architecture/GPU_VENDORS.md 5.4 for the cost arithmetic.
+        /// </summary>
+        public int NeuralMaxSourceHeight { get; set; }
+
+        /// <summary>
         /// Game temporal upscaler applied by default: off, fsr2, dlss, dlaa. OFF, and it stays
         /// off: these are renderer algorithms fed inputs recorded video cannot supply. See the
         /// block above ShaderLibrary._gameFilters.
@@ -158,9 +171,23 @@ namespace Jellyfin.Plugin.Plus.Configuration
         /// <summary>
         /// Encoder used when this plugin forces a transcode. Blank or "auto" follows the codec the
         /// client negotiated. A named encoder applies only when ffmpeg has it and the session
-        /// declared that codec playable; otherwise the client-negotiated codec is used.
+        /// declared that codec playable; otherwise the client-negotiated codec is used. On an
+        /// Intel GPU an NVENC name (the default included) is treated as auto and the QSV encoder
+        /// for the codec is used.
         /// </summary>
         public string Encoder { get; set; } = "hevc_nvenc";
+
+        /// <summary>
+        /// Which GPU vendor the plugin treats this server as having: auto, nvidia, intel or none.
+        /// Auto detects it from /sys/class/drm/renderD*/device/vendor (0x10de NVIDIA, 0x8086 Intel),
+        /// with /proc/driver/nvidia or nvidia-smi as the tie-breaker, and picks NVIDIA first when
+        /// both are present, so an install that already works is unchanged. The value feeds the
+        /// GPU capability record shown on the dashboard, the probe and the session record, and,
+        /// when an Intel GPU is actually found, picks the QSV encoder and turns the GPU-resident
+        /// hand-off off. A vendor chosen and not found changes no command line. See
+        /// docs/architecture/GPU_VENDORS.md.
+        /// </summary>
+        public string GpuVendor { get; set; } = "auto";
 
         /// <summary>Turn a would-be video stream copy into a real transcode even without a session request.</summary>
         public bool ForceTranscode { get; set; }
